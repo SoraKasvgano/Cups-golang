@@ -17,6 +17,8 @@ type options struct {
 	deviceURI   string
 	description string
 	location    string
+	ppdFile     string
+	ppdName     string
 	deleteName  string
 	defaultName string
 	enable      bool
@@ -103,6 +105,16 @@ func parseArgs(args []string) options {
 				i++
 				opts.deleteName = args[i]
 			}
+		case "-P":
+			if i+1 < len(args) {
+				i++
+				opts.ppdFile = args[i]
+			}
+		case "-m":
+			if i+1 < len(args) {
+				i++
+				opts.ppdName = args[i]
+			}
 		case "-d":
 			if i+1 < len(args) {
 				i++
@@ -135,14 +147,25 @@ func addModifyPrinter(client *cupsclient.Client, opts options) error {
 	if opts.deviceURI != "" {
 		req.Printer.Add(goipp.MakeAttribute("device-uri", goipp.TagURI, goipp.String(opts.deviceURI)))
 	}
+	if opts.ppdName != "" {
+		req.Printer.Add(goipp.MakeAttribute("ppd-name", goipp.TagName, goipp.String(opts.ppdName)))
+	}
 	if opts.description != "" {
 		req.Printer.Add(goipp.MakeAttribute("printer-info", goipp.TagText, goipp.String(opts.description)))
 	}
 	if opts.location != "" {
 		req.Printer.Add(goipp.MakeAttribute("printer-location", goipp.TagText, goipp.String(opts.location)))
 	}
-
-	resp, err := client.Send(context.Background(), req, nil)
+	var payload *os.File
+	if opts.ppdFile != "" {
+		f, err := os.Open(opts.ppdFile)
+		if err != nil {
+			return err
+		}
+		payload = f
+		defer payload.Close()
+	}
+	resp, err := client.Send(context.Background(), req, payload)
 	if err != nil {
 		return err
 	}

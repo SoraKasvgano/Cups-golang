@@ -107,7 +107,7 @@ func (s *Server) handleIPPRequest(w http.ResponseWriter, r *http.Request) error 
 	case goipp.OpCupsGetPpd:
 		resp, payload, err = s.handleCupsGetPpd(ctx, r, &req)
 	case goipp.OpCupsAddModifyPrinter:
-		resp, err = s.handleCupsAddModifyPrinter(ctx, r, &req)
+		resp, err = s.handleCupsAddModifyPrinter(ctx, r, &req, buf)
 	case goipp.OpCupsMoveJob:
 		resp, err = s.handleCupsMoveJob(ctx, r, &req)
 	case goipp.OpCupsDeletePrinter:
@@ -579,7 +579,7 @@ func (s *Server) handleCupsMoveJob(ctx context.Context, r *http.Request, req *go
 	return resp, nil
 }
 
-func (s *Server) handleCupsAddModifyPrinter(ctx context.Context, r *http.Request, req *goipp.Message) (*goipp.Message, error) {
+func (s *Server) handleCupsAddModifyPrinter(ctx context.Context, r *http.Request, req *goipp.Message, payload *bytes.Buffer) (*goipp.Message, error) {
 	name := attrString(req.Operation, "printer-name")
 	if name == "" {
 		name = printerNameFromURI(attrString(req.Operation, "printer-uri"))
@@ -594,6 +594,7 @@ func (s *Server) handleCupsAddModifyPrinter(ctx context.Context, r *http.Request
 	if ppdName == "" {
 		ppdName = attrString(req.Operation, "ppd-name")
 	}
+	ppdName = strings.TrimSpace(ppdName)
 	geo := attrString(req.Printer, "printer-geo-location")
 	org := attrString(req.Printer, "printer-organization")
 	orgUnit := attrString(req.Printer, "printer-organizational-unit")
@@ -624,14 +625,30 @@ func (s *Server) handleCupsAddModifyPrinter(ctx context.Context, r *http.Request
 	if uri == "" {
 		uri = "file:///dev/null"
 	}
-	ppdName = strings.TrimSpace(ppdName)
-
 	var printer model.Printer
 	err := s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
 		var err error
 		printer, err = s.Store.UpsertPrinter(ctx, tx, name, uri, location, info, true)
 		if err != nil {
 			return err
+		}
+		// Optional inline PPD payload (only when ppd-name isn't explicitly set).
+		if ppdName == "" && payload != nil && payload.Len() > 0 {
+			ppdData, err := io.ReadAll(payload)
+			if err != nil {
+				return err
+			}
+			if len(ppdData) > 0 {
+				targetName := name + ".ppd"
+				ppdPath := safePPDPath(s.Config.PPDDir, targetName)
+				if err := os.MkdirAll(filepath.Dir(ppdPath), 0o755); err != nil {
+					return err
+				}
+				if err := os.WriteFile(ppdPath, ppdData, 0o644); err != nil {
+					return err
+				}
+				ppdName = filepath.Base(ppdPath)
+			}
 		}
 		if ppdName != "" {
 			if err := s.Store.UpdatePrinterPPDName(ctx, tx, printer.ID, ppdName); err != nil {
@@ -1367,6 +1384,9 @@ func (s *Server) handlePrintJob(ctx context.Context, r *http.Request, req *goipp
 	}
 
 	options := serializeJobOptions(req, printer)
+	if dest.IsClass {
+		options = addClassInternalOptions(options, dest.Class)
+	}
 	holdRequested := jobHoldRequested(options)
 	err = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
 		var err error
@@ -1445,6 +1465,9 @@ func (s *Server) handleCreateJob(ctx context.Context, r *http.Request, req *goip
 	}
 
 	options := serializeJobOptions(req, printer)
+	if dest.IsClass {
+		options = addClassInternalOptions(options, dest.Class)
+	}
 	holdRequested := jobHoldRequested(options)
 	err = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
 		var err error
@@ -3174,6 +3197,21 @@ func serializeJobOptions(req *goipp.Message, printer model.Printer) string {
 	ppd, _ := loadPPDForPrinter(printer)
 	opts = applyPPDDefaults(opts, ppd)
 	opts = applyPrinterDefaults(opts, printer)
+	b, _ := json.Marshal(opts)
+	return string(b)
+}
+
+func addClassInternalOptions(optionsJSON string, class model.Class) string {
+	defaults := parseJobOptions(class.DefaultOptions)
+	policy := strings.TrimSpace(defaults["printer-error-policy"])
+	if policy == "" {
+		return optionsJSON
+	}
+	opts := parseJobOptions(optionsJSON)
+	if opts == nil {
+		opts = map[string]string{}
+	}
+	opts["cups-error-policy"] = policy
 	b, _ := json.Marshal(opts)
 	return string(b)
 }

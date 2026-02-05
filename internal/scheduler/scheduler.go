@@ -151,6 +151,11 @@ func (s *Scheduler) processOnce(ctx context.Context) {
 
 		_ = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
 			if failed {
+				if handled, err := s.applyErrorPolicy(ctx, tx, job, printer, opts, failReason); err != nil {
+					return err
+				} else if handled {
+					return nil
+				}
 				if retried, err := s.scheduleRetry(ctx, tx, job, opts); err == nil && retried {
 					return nil
 				}
@@ -256,6 +261,76 @@ func (s *Scheduler) scheduleRetry(ctx context.Context, tx *sql.Tx, job model.Job
 		}
 	}
 	return true, nil
+}
+
+const (
+	defaultJobRetryLimit    = 5
+	defaultJobRetryInterval = 300
+)
+
+func (s *Scheduler) applyErrorPolicy(ctx context.Context, tx *sql.Tx, job model.Job, printer model.Printer, opts map[string]string, reason string) (bool, error) {
+	if reason != "job-stopped" {
+		return false, nil
+	}
+	policy := strings.ToLower(strings.TrimSpace(errorPolicyForJob(printer, opts)))
+	switch policy {
+	case "retry-current-job":
+		return true, s.Store.UpdateJobState(ctx, tx, job.ID, 3, "job-retry", nil)
+	case "retry-job":
+		return true, s.retryJobPolicy(ctx, tx, job, opts)
+	case "abort-job":
+		completed := time.Now().UTC()
+		return true, s.Store.UpdateJobState(ctx, tx, job.ID, 8, "aborted-by-system", &completed)
+	case "stop-printer":
+		_ = s.Store.UpdatePrinterState(ctx, tx, printer.ID, 5)
+		return true, s.Store.UpdateJobState(ctx, tx, job.ID, 3, "printer-stopped", nil)
+	default:
+		return false, nil
+	}
+}
+
+func errorPolicyForJob(printer model.Printer, opts map[string]string) string {
+	if opts != nil {
+		if v := strings.TrimSpace(opts["cups-error-policy"]); v != "" {
+			return v
+		}
+	}
+	defaults := parseOptionsJSON(printer.DefaultOptions)
+	if v := strings.TrimSpace(defaults["printer-error-policy"]); v != "" {
+		return v
+	}
+	return "stop-printer"
+}
+
+func (s *Scheduler) retryJobPolicy(ctx context.Context, tx *sql.Tx, job model.Job, opts map[string]string) error {
+	limit := optionInt(opts, "cups-retry-limit")
+	if limit <= 0 {
+		limit = defaultJobRetryLimit
+	}
+	interval := optionInt(opts, "cups-retry-interval")
+	if interval <= 0 {
+		interval = defaultJobRetryInterval
+	}
+	count := optionInt(opts, "cups-retry-count")
+	count++
+	if limit > 0 && count > limit {
+		completed := time.Now().UTC()
+		return s.Store.UpdateJobState(ctx, tx, job.ID, 8, "aborted-by-system", &completed)
+	}
+	opts["cups-retry-count"] = strconv.Itoa(count)
+	if interval > 0 {
+		opts["cups-retry-at"] = strconv.FormatInt(time.Now().Add(time.Duration(interval)*time.Second).Unix(), 10)
+	} else {
+		delete(opts, "cups-retry-at")
+	}
+	optionsJSON, err := marshalOptionsJSON(opts)
+	if err != nil {
+		return err
+	}
+	if err := s.Store.UpdateJobAttributes(ctx, tx, job.ID, nil, &optionsJSON); err != nil {
+		return err
+	}
+	return s.Store.UpdateJobState(ctx, tx, job.ID, 4, "job-retry", nil)
 }
 
 func (s *Scheduler) buildJobDocuments(ctx context.Context, job model.Job, printer model.Printer, docs []model.Document) ([]model.Document, error) {
@@ -689,6 +764,9 @@ func buildCupsOptions(optionsJSON string) string {
 	}
 	parts := make([]string, 0, len(opts))
 	for k, v := range opts {
+		if strings.HasPrefix(strings.ToLower(k), "cups-") {
+			continue
+		}
 		if v == "" {
 			continue
 		}
