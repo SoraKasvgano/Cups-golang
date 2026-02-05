@@ -1,0 +1,15 @@
+﻿body {
+  font-family: "Noto Sans SC", "Segoe UI", Arial, sans-serif;
+  margin: 24px;
+  color: #222;
+}
+#app {
+  max-width: 720px;
+}
+a {
+  color: #0a58ca;
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}

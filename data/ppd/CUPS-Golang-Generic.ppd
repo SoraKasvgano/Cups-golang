@@ -1,0 +1,22 @@
+*PPD-Adobe: "4.3"
+*FormatVersion: "4.3"
+*FileVersion: "1.0"
+*LanguageVersion: English
+*Manufacturer: "CUPS-Golang"
+*Product: "(CUPS-Golang Generic)"
+*ModelName: "CUPS-Golang Generic"
+*NickName: "CUPS-Golang Generic"
+*ShortNickName: "CUPS-Golang Generic"
+*ColorDevice: False
+*DefaultColorSpace: Gray
+*DefaultPageSize: A4
+*OpenUI *PageSize/Page Size: PickOne
+*PageSize A4/A4: "<</PageSize[595 842]>>setpagedevice"
+*PageSize Letter/US Letter: "<</PageSize[612 792]>>setpagedevice"
+*CloseUI: *PageSize
+*OpenUI *Duplex/Duplex: PickOne
+*DefaultDuplex: None
+*Duplex None/Off: "<</Duplex false>>setpagedevice"
+*Duplex DuplexNoTumble/Long Edge: "<</Duplex true /Tumble false>>setpagedevice"
+*Duplex DuplexTumble/Short Edge: "<</Duplex true /Tumble true>>setpagedevice"
+*CloseUI: *Duplex
