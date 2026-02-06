@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,6 +24,23 @@ import (
 func main() {
 	cfg := config.Load()
 	server.SetAppConfig(cfg)
+
+	var logFile *os.File
+	if cfg.ErrorLogPath != "" && !strings.EqualFold(cfg.ErrorLogPath, "syslog") {
+		if err := os.MkdirAll(filepath.Dir(cfg.ErrorLogPath), 0755); err != nil {
+			log.Printf("warning: failed to create log dir: %v", err)
+		} else {
+			if f, err := os.OpenFile(cfg.ErrorLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+				logFile = f
+				log.SetOutput(f)
+			} else {
+				log.Printf("warning: failed to open error log: %v", err)
+			}
+		}
+	}
+	if logFile != nil {
+		defer logFile.Close()
+	}
 
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
 		log.Fatalf("failed to create data dir: %v", err)
@@ -84,66 +102,81 @@ func main() {
 		}
 	}
 
-	baseLn, err := net.Listen("tcp", cfg.ListenAddr)
-	if err != nil {
-		log.Fatalf("listen error: %v", err)
-	}
-
 	var servers []*http.Server
 	var listeners []net.Listener
 
+	listenHTTP := append([]string{}, cfg.ListenHTTP...)
+	listenHTTPS := append([]string{}, cfg.ListenHTTPS...)
+	if len(listenHTTP) == 0 && len(listenHTTPS) == 0 && strings.TrimSpace(cfg.ListenAddr) != "" {
+		listenHTTP = []string{cfg.ListenAddr}
+	}
+	if cfg.TLSOnly {
+		if len(listenHTTPS) == 0 {
+			listenHTTPS = listenHTTP
+		}
+		listenHTTP = nil
+	}
+	listenHTTP = uniqueAddrs(listenHTTP)
+	listenHTTPS = uniqueAddrs(listenHTTPS)
+
+	var tlsConfig *tls.Config
 	if cfg.TLSEnabled {
 		hostname, _ := os.Hostname()
-		hosts := []string{"localhost", cfg.ServerName, hostname}
-		cert, err := tlsutil.EnsureCertificate(cfg.TLSCertPath, cfg.TLSKeyPath, hosts, cfg.TLSAutoGenerate)
+		hosts := uniqueAddrs(append([]string{"localhost", cfg.ServerName, hostname}, cfg.ServerAlias...))
+		certHosts := uniqueHosts(hosts)
+		cert, err := tlsutil.EnsureCertificate(cfg.TLSCertPath, cfg.TLSKeyPath, certHosts, cfg.TLSAutoGenerate)
 		if err != nil {
 			log.Fatalf("failed to load TLS certificate: %v", err)
 		}
-		tlsConfig := &tls.Config{
+		tlsConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
 		}
+	}
 
-		if cfg.TLSOnly {
-			tlsLn := tls.NewListener(baseLn, tlsConfig)
-			httpsSrv := newServer(cfg.ListenAddr)
-			servers = append(servers, httpsSrv)
-			listeners = append(listeners, tlsLn)
-			go func() {
-				log.Printf("CUPS-Golang HTTPS listening on %s", cfg.ListenAddr)
-				if err := httpsSrv.Serve(tlsLn); err != nil && err != http.ErrServerClosed {
-					log.Fatalf("listen error: %v", err)
-				}
-			}()
-		} else {
-			plainLn, tlsLn := tlsutil.SplitListener(baseLn, tlsConfig, true)
-			httpSrv := newServer(cfg.ListenAddr)
-			httpsSrv := newServer(cfg.ListenAddr)
-			servers = append(servers, httpSrv, httpsSrv)
-			listeners = append(listeners, plainLn, tlsLn, baseLn)
-			go func() {
-				log.Printf("CUPS-Golang HTTP listening on %s", cfg.ListenAddr)
-				if err := httpSrv.Serve(plainLn); err != nil && err != http.ErrServerClosed {
-					log.Fatalf("listen error: %v", err)
-				}
-			}()
-			go func() {
-				log.Printf("CUPS-Golang HTTPS listening on %s", cfg.ListenAddr)
-				if err := httpsSrv.Serve(tlsLn); err != nil && err != http.ErrServerClosed {
-					log.Fatalf("listen error: %v", err)
-				}
-			}()
-		}
-	} else {
-		httpSrv := newServer(cfg.ListenAddr)
-		servers = append(servers, httpSrv)
-		listeners = append(listeners, baseLn)
+	startServe := func(addr string, ln net.Listener, label string) {
+		srv := newServer(addr)
+		servers = append(servers, srv)
+		listeners = append(listeners, ln)
 		go func() {
-			log.Printf("CUPS-Golang HTTP listening on %s", cfg.ListenAddr)
-			if err := httpSrv.Serve(baseLn); err != nil && err != http.ErrServerClosed {
+			log.Printf("CUPS-Golang %s listening on %s", label, addr)
+			if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 				log.Fatalf("listen error: %v", err)
 			}
 		}()
+	}
+
+	splitTLS := cfg.TLSEnabled && !cfg.TLSOnly && len(listenHTTPS) == 0
+	if splitTLS {
+		for _, addr := range listenHTTP {
+			baseLn, err := net.Listen("tcp", addr)
+			if err != nil {
+				log.Fatalf("listen error on %s: %v", addr, err)
+			}
+			plainLn, tlsLn := tlsutil.SplitListener(baseLn, tlsConfig, true)
+			startServe(addr, plainLn, "HTTP")
+			startServe(addr, tlsLn, "HTTPS")
+			listeners = append(listeners, baseLn)
+		}
+	} else {
+		for _, addr := range listenHTTP {
+			ln, err := net.Listen("tcp", addr)
+			if err != nil {
+				log.Fatalf("listen error on %s: %v", addr, err)
+			}
+			startServe(addr, ln, "HTTP")
+		}
+		if cfg.TLSEnabled {
+			for _, addr := range listenHTTPS {
+				ln, err := net.Listen("tcp", addr)
+				if err != nil {
+					log.Fatalf("listen error on %s: %v", addr, err)
+				}
+				startServe(addr, tls.NewListener(ln, tlsConfig), "HTTPS")
+			}
+		} else if len(listenHTTPS) > 0 {
+			log.Printf("TLS disabled; skipping HTTPS listeners: %v", listenHTTPS)
+		}
 	}
 
 	sigs := make(chan os.Signal, 1)
@@ -158,4 +191,55 @@ func main() {
 	for _, ln := range listeners {
 		_ = ln.Close()
 	}
+}
+
+func uniqueAddrs(addrs []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		addr = strings.TrimSpace(addr)
+		if addr == "" {
+			continue
+		}
+		if seen[addr] {
+			continue
+		}
+		seen[addr] = true
+		out = append(out, addr)
+	}
+	return out
+}
+
+func uniqueHosts(hosts []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(hosts))
+	for _, host := range hosts {
+		host = stripPort(host)
+		if host == "" {
+			continue
+		}
+		if seen[host] {
+			continue
+		}
+		seen[host] = true
+		out = append(out, host)
+	}
+	return out
+}
+
+func stripPort(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	if strings.HasPrefix(host, "[") {
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			return strings.Trim(h, "[]")
+		}
+		return strings.Trim(host, "[]")
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
 }

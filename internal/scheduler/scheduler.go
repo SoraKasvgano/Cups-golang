@@ -305,11 +305,19 @@ func errorPolicyForJob(printer model.Printer, opts map[string]string) string {
 func (s *Scheduler) retryJobPolicy(ctx context.Context, tx *sql.Tx, job model.Job, opts map[string]string) error {
 	limit := optionInt(opts, "cups-retry-limit")
 	if limit <= 0 {
-		limit = defaultJobRetryLimit
+		if s != nil && s.Config.JobRetryLimit > 0 {
+			limit = s.Config.JobRetryLimit
+		} else {
+			limit = defaultJobRetryLimit
+		}
 	}
 	interval := optionInt(opts, "cups-retry-interval")
 	if interval <= 0 {
-		interval = defaultJobRetryInterval
+		if s != nil && s.Config.JobRetryInterval > 0 {
+			interval = s.Config.JobRetryInterval
+		} else {
+			interval = defaultJobRetryInterval
+		}
 	}
 	count := optionInt(opts, "cups-retry-count")
 	count++

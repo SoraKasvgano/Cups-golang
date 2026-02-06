@@ -21,6 +21,9 @@ type Server struct {
 
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.Config.MaxRequestSize > 0 {
+			r.Body = http.MaxBytesReader(w, r.Body, s.Config.MaxRequestSize)
+		}
 		remoteIP := r.RemoteAddr
 		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 			remoteIP = host

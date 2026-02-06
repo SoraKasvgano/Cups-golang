@@ -3,7 +3,9 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -26,6 +28,10 @@ type PPD struct {
 	OrderDependencies []PPDOrderDependency
 	Groups            []PPDGroup
 	OptionDetails     map[string]*PPDOption
+	PageSizes         map[string]PPDPageSize
+	HWMargins         [4]int
+	CustomMinSize     [2]int
+	CustomMaxSize     [2]int
 }
 
 type PPDGroup struct {
@@ -50,10 +56,24 @@ type PPDChoice struct {
 	Text   string
 }
 
+type PPDPageSize struct {
+	Name   string
+	Width  int
+	Length int
+	Left   int
+	Bottom int
+	Right  int
+	Top    int
+}
+
 type PPDCustomParam struct {
-	Name string
-	Text string
-	Type string
+	Name  string
+	Text  string
+	Type  string
+	Order int
+	Min   float64
+	Max   float64
+	Range bool
 }
 
 type PPDFilter struct {
@@ -87,12 +107,19 @@ func LoadPPD(path string) (*PPD, error) {
 		Options:       map[string][]string{},
 		Defaults:      map[string]string{},
 		OptionDetails: map[string]*PPDOption{},
+		PageSizes:     map[string]PPDPageSize{},
 	}
 	groupMap := map[string]*PPDGroup{}
 	var currentGroup *PPDGroup
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
+		if strings.HasPrefix(line, "*HWMargins:") {
+			if margins, ok := parsePPDHWMargins(line); ok {
+				ppd.HWMargins = margins
+			}
+			continue
+		}
 		if strings.HasPrefix(line, "*UIConstraints:") || strings.HasPrefix(line, "*NonUIConstraints:") {
 			if c, ok := parsePPDConstraint(line); ok {
 				ppd.Constraints = append(ppd.Constraints, c)
@@ -235,6 +262,32 @@ func LoadPPD(path string) (*PPD, error) {
 			ppd.OptionDetails[key] = opt
 			continue
 		}
+		if strings.HasPrefix(line, "*PageSize ") {
+			if size, ok := parsePPDPageSize(line); ok && size.Name != "" && size.Width > 0 && size.Length > 0 {
+				ppd.PageSizes[size.Name] = size
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "*ImageableArea ") {
+			if name, l, b, r, t, ok := parsePPDImageableArea(line); ok {
+				if size, exists := ppd.PageSizes[name]; exists {
+					size.Left = l
+					size.Bottom = b
+					size.Right = r
+					size.Top = t
+					ppd.PageSizes[name] = size
+				} else {
+					ppd.PageSizes[name] = PPDPageSize{
+						Name:   name,
+						Left:   l,
+						Bottom: b,
+						Right:  r,
+						Top:    t,
+					}
+				}
+			}
+			continue
+		}
 		if strings.HasPrefix(line, "*Default") {
 			parts := strings.SplitN(line, ":", 2)
 			if len(parts) == 2 {
@@ -252,6 +305,9 @@ func LoadPPD(path string) (*PPD, error) {
 				if opt, ok := ppd.OptionDetails[param.Option]; ok {
 					opt.Custom = true
 					opt.CustomParams = append(opt.CustomParams, param.Param)
+					if strings.EqualFold(param.Option, "PageSize") || strings.EqualFold(param.Option, "CustomPageSize") {
+						updateCustomSizeBounds(ppd, param.Param)
+					}
 				}
 			}
 			continue
@@ -401,14 +457,41 @@ func parsePPDCustomParam(line string) (ppdCustomParamParsed, bool) {
 		return ppdCustomParamParsed{}, false
 	}
 	paramType := "text"
+	order := 0
+	minVal := 0.0
+	maxVal := 0.0
+	hasRange := false
 	if right != "" {
 		tokens := strings.Fields(right)
 		if len(tokens) > 0 {
-			switch strings.ToLower(tokens[0]) {
-			case "4", "password":
-				paramType = "password"
-			default:
-				paramType = "text"
+			// CUPS PPD: "order type min max"
+			if len(tokens) >= 2 {
+				if n, err := strconv.Atoi(tokens[0]); err == nil {
+					order = n
+					paramType = normalizePPDCustomType(tokens[1])
+					if len(tokens) >= 4 {
+						if minParsed, err := strconv.ParseFloat(tokens[2], 64); err == nil {
+							if maxParsed, err2 := strconv.ParseFloat(tokens[3], 64); err2 == nil {
+								minVal = minParsed
+								maxVal = maxParsed
+								hasRange = true
+							}
+						}
+					}
+				} else {
+					paramType = normalizePPDCustomType(tokens[0])
+					if len(tokens) >= 3 {
+						if minParsed, err := strconv.ParseFloat(tokens[1], 64); err == nil {
+							if maxParsed, err2 := strconv.ParseFloat(tokens[2], 64); err2 == nil {
+								minVal = minParsed
+								maxVal = maxParsed
+								hasRange = true
+							}
+						}
+					}
+				}
+			} else {
+				paramType = normalizePPDCustomType(tokens[0])
 			}
 		}
 	}
@@ -418,11 +501,29 @@ func parsePPDCustomParam(line string) (ppdCustomParamParsed, bool) {
 	return ppdCustomParamParsed{
 		Option: option,
 		Param: PPDCustomParam{
-			Name: paramName,
-			Text: paramText,
-			Type: paramType,
+			Name:  paramName,
+			Text:  paramText,
+			Type:  paramType,
+			Order: order,
+			Min:   minVal,
+			Max:   maxVal,
+			Range: hasRange,
 		},
 	}, true
+}
+
+func normalizePPDCustomType(value string) string {
+	v := strings.ToLower(strings.TrimSpace(value))
+	switch v {
+	case "integer":
+		return "int"
+	case "float", "double":
+		return "real"
+	case "passcode":
+		return "password"
+	default:
+		return v
+	}
 }
 
 func parsePPDFilterLine(line string, isFilter2 bool) (PPDFilter, bool) {
@@ -515,6 +616,127 @@ func parsePPDOrderDependency(line string) (PPDOrderDependency, bool) {
 	section := fields[1]
 	option := strings.TrimPrefix(fields[2], "*")
 	return PPDOrderDependency{Order: order, Section: section, Option: option}, true
+}
+
+var pageSizeRe = regexp.MustCompile(`(?i)pagesize\s*\[\s*([0-9.]+)\s+([0-9.]+)\s*\]`)
+var imageableAreaRe = regexp.MustCompile(`(?i)^\\*ImageableArea\\s+([^:]+):\\s*\"?\\s*([0-9.]+)\\s+([0-9.]+)\\s+([0-9.]+)\\s+([0-9.]+)\\s*\"?`)
+var hwMarginsRe = regexp.MustCompile(`(?i)^\\*HWMargins:\\s*\"?\\s*([0-9.]+)\\s+([0-9.]+)\\s+([0-9.]+)\\s+([0-9.]+)\\s*\"?`)
+
+func parsePPDPageSize(line string) (PPDPageSize, bool) {
+	if !strings.HasPrefix(line, "*PageSize ") {
+		return PPDPageSize{}, false
+	}
+	parts := strings.SplitN(line, ":", 2)
+	if len(parts) != 2 {
+		return PPDPageSize{}, false
+	}
+	left := strings.TrimSpace(strings.TrimPrefix(parts[0], "*PageSize"))
+	if left == "" {
+		return PPDPageSize{}, false
+	}
+	left = strings.TrimSpace(strings.SplitN(left, "/", 2)[0])
+	if left == "" {
+		return PPDPageSize{}, false
+	}
+	raw := parts[1]
+	raw = strings.Trim(raw, " \"")
+	matches := pageSizeRe.FindStringSubmatch(raw)
+	if len(matches) < 3 {
+		return PPDPageSize{}, false
+	}
+	w, err1 := strconv.ParseFloat(matches[1], 64)
+	h, err2 := strconv.ParseFloat(matches[2], 64)
+	if err1 != nil || err2 != nil || w <= 0 || h <= 0 {
+		return PPDPageSize{}, false
+	}
+	return PPDPageSize{
+		Name:   left,
+		Width:  pointsToPWG(w),
+		Length: pointsToPWG(h),
+	}, true
+}
+
+func parsePPDImageableArea(line string) (string, int, int, int, int, bool) {
+	matches := imageableAreaRe.FindStringSubmatch(line)
+	if len(matches) < 6 {
+		return "", 0, 0, 0, 0, false
+	}
+	name := strings.TrimSpace(matches[1])
+	if name == "" {
+		return "", 0, 0, 0, 0, false
+	}
+	left, err1 := strconv.ParseFloat(matches[2], 64)
+	bottom, err2 := strconv.ParseFloat(matches[3], 64)
+	right, err3 := strconv.ParseFloat(matches[4], 64)
+	top, err4 := strconv.ParseFloat(matches[5], 64)
+	if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
+		return "", 0, 0, 0, 0, false
+	}
+	return name, pointsToPWG(left), pointsToPWG(bottom), pointsToPWG(right), pointsToPWG(top), true
+}
+
+func parsePPDHWMargins(line string) ([4]int, bool) {
+	var margins [4]int
+	matches := hwMarginsRe.FindStringSubmatch(line)
+	if len(matches) < 5 {
+		return margins, false
+	}
+	left, err1 := strconv.ParseFloat(matches[1], 64)
+	bottom, err2 := strconv.ParseFloat(matches[2], 64)
+	right, err3 := strconv.ParseFloat(matches[3], 64)
+	top, err4 := strconv.ParseFloat(matches[4], 64)
+	if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
+		return margins, false
+	}
+	margins[0] = pointsToPWG(left)
+	margins[1] = pointsToPWG(bottom)
+	margins[2] = pointsToPWG(right)
+	margins[3] = pointsToPWG(top)
+	return margins, true
+}
+
+func updateCustomSizeBounds(ppd *PPD, param PPDCustomParam) {
+	if ppd == nil {
+		return
+	}
+	name := strings.ToLower(strings.TrimSpace(param.Name))
+	if name == "" {
+		return
+	}
+	if name != "width" && name != "height" {
+		return
+	}
+	if !param.Range {
+		return
+	}
+	min := pointsToPWG(param.Min)
+	max := pointsToPWG(param.Max)
+	if max > 0 {
+		if name == "width" {
+			if ppd.CustomMaxSize[0] == 0 || max > ppd.CustomMaxSize[0] {
+				ppd.CustomMaxSize[0] = max
+			}
+		} else {
+			if ppd.CustomMaxSize[1] == 0 || max > ppd.CustomMaxSize[1] {
+				ppd.CustomMaxSize[1] = max
+			}
+		}
+	}
+	if min > 0 {
+		if name == "width" {
+			if ppd.CustomMinSize[0] == 0 || min < ppd.CustomMinSize[0] {
+				ppd.CustomMinSize[0] = min
+			}
+		} else {
+			if ppd.CustomMinSize[1] == 0 || min < ppd.CustomMinSize[1] {
+				ppd.CustomMinSize[1] = min
+			}
+		}
+	}
+}
+
+func pointsToPWG(points float64) int {
+	return int(math.Round(points * 2540.0 / 72.0))
 }
 
 func appendIfMissing(list []string, val string) []string {

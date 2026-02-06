@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"net/http"
 	"path"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"cupsgolang/internal/config"
 	"cupsgolang/internal/model"
@@ -939,7 +941,7 @@ func (s *Server) renderSetPrinterOptions(w http.ResponseWriter, r *http.Request,
 					paramTexts := make([]string, 0, len(opt.CustomParams))
 					paramValues := make([]string, 0, len(opt.CustomParams))
 					inputTypes := make([]string, 0, len(opt.CustomParams))
-					customDefaults := customParamDefaults(defaults, opt.Keyword)
+					customDefaults := customParamDefaults(defaults, opt)
 					unitHint := customUnitHint(selected)
 					for _, p := range opt.CustomParams {
 						paramNames = append(paramNames, p.Name)
@@ -1015,39 +1017,68 @@ func (s *Server) applyPrinterOptionsFromForm(r *http.Request) error {
 				if len(vals) == 0 {
 					continue
 				}
+				if opt.Custom && anyCustomSelected(vals) {
+					customValues := map[string]string{}
+					for _, p := range opt.CustomParams {
+						field := opt.Keyword + "." + p.Name
+						v, err := normalizeCustomParamValue(p, r.FormValue(field))
+						if err != nil {
+							return err
+						}
+						customValues[p.Name] = v
+						defaults["custom."+opt.Keyword+"."+p.Name] = v
+					}
+					if len(customValues) > 0 {
+						if customValue, err := buildCustomOptionValue(opt, customValues); err != nil {
+							return err
+						} else if customValue != "" {
+							replaced := false
+							for i, v := range vals {
+								if strings.HasPrefix(strings.ToLower(strings.TrimSpace(v)), "custom") {
+									vals[i] = customValue
+									replaced = true
+								}
+							}
+							if !replaced {
+								vals = append(vals, customValue)
+							}
+						}
+					}
+				}
 				val := strings.Join(vals, ",")
 				if jobKey := ppdOptionToJobKey(opt.Keyword); jobKey != "" {
 					defaults[jobKey] = normalizePPDChoice(jobKey, vals[0])
 				} else {
 					defaults[opt.Keyword] = val
 				}
-				if opt.Custom && anyCustomSelected(vals) {
-					for _, p := range opt.CustomParams {
-						field := opt.Keyword + "." + p.Name
-						v := strings.TrimSpace(r.FormValue(field))
-						if v != "" {
-							defaults["custom."+opt.Keyword+"."+p.Name] = v
-						}
-					}
-				}
 			} else {
 				val := strings.TrimSpace(r.FormValue(opt.Keyword))
 				if val == "" {
 					continue
 				}
+				if opt.Custom && strings.HasPrefix(strings.ToLower(val), "custom") {
+					customValues := map[string]string{}
+					for _, p := range opt.CustomParams {
+						field := opt.Keyword + "." + p.Name
+						v, err := normalizeCustomParamValue(p, r.FormValue(field))
+						if err != nil {
+							return err
+						}
+						customValues[p.Name] = v
+						defaults["custom."+opt.Keyword+"."+p.Name] = v
+					}
+					if len(customValues) > 0 {
+						if customValue, err := buildCustomOptionValue(opt, customValues); err != nil {
+							return err
+						} else if customValue != "" {
+							val = customValue
+						}
+					}
+				}
 				if jobKey := ppdOptionToJobKey(opt.Keyword); jobKey != "" {
 					defaults[jobKey] = normalizePPDChoice(jobKey, val)
 				} else {
 					defaults[opt.Keyword] = val
-				}
-				if opt.Custom && strings.HasPrefix(strings.ToLower(val), "custom") {
-					for _, p := range opt.CustomParams {
-						field := opt.Keyword + "." + p.Name
-						v := strings.TrimSpace(r.FormValue(field))
-						if v != "" {
-							defaults["custom."+opt.Keyword+"."+p.Name] = v
-						}
-					}
 				}
 			}
 		}
@@ -1513,7 +1544,18 @@ func ppdDefaultSelections(opt *config.PPDOption, choices []config.PPDChoice, def
 		return []string{choices[0].Choice}
 	}
 	if strings.Contains(desired, ",") {
-		return splitList(desired)
+		values := splitList(desired)
+		for i, v := range values {
+			v = strings.TrimSpace(v)
+			if strings.HasPrefix(strings.ToLower(v), "custom") || (strings.HasPrefix(v, "{") && strings.HasSuffix(v, "}")) {
+				values[i] = "Custom"
+			}
+		}
+		return values
+	}
+	trimmed := strings.TrimSpace(desired)
+	if strings.HasPrefix(strings.ToLower(trimmed), "custom") || (strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}")) {
+		return []string{"Custom"}
 	}
 	return []string{desired}
 }
@@ -1551,15 +1593,30 @@ func splitList(value string) []string {
 	return out
 }
 
-func customParamDefaults(defaults map[string]string, keyword string) map[string]string {
+func customParamDefaults(defaults map[string]string, opt *config.PPDOption) map[string]string {
 	out := map[string]string{}
-	prefix := "custom." + keyword + "."
+	if opt == nil {
+		return out
+	}
+	prefix := "custom." + opt.Keyword + "."
 	for k, v := range defaults {
 		if strings.HasPrefix(k, prefix) {
 			out[strings.TrimPrefix(k, prefix)] = v
 		}
 	}
-	return out
+	if len(out) > 0 {
+		return out
+	}
+	value := strings.TrimSpace(defaults[opt.Keyword])
+	if jobKey := ppdOptionToJobKey(opt.Keyword); jobKey != "" {
+		if v := strings.TrimSpace(defaults[jobKey]); v != "" {
+			value = v
+		}
+	}
+	if value == "" {
+		return out
+	}
+	return parseCustomOptionValue(opt, value)
 }
 
 func anyCustomSelected(values []string) bool {
@@ -1588,6 +1645,322 @@ func customUnitHint(selected []string) string {
 		}
 	}
 	return ""
+}
+
+func normalizeCustomParamValue(param config.PPDCustomParam, raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		if param.Range && param.Min == param.Max {
+			switch strings.ToLower(param.Type) {
+			case "int":
+				value = strconv.Itoa(int(param.Min))
+			case "real", "points":
+				value = strconv.FormatFloat(param.Min, 'f', -1, 64)
+			case "units":
+				value = "pt"
+			}
+		}
+		if value == "" {
+			return "", fmt.Errorf("missing custom parameter %s", param.Name)
+		}
+	}
+
+	switch strings.ToLower(param.Type) {
+	case "int":
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return "", fmt.Errorf("invalid integer for %s", param.Name)
+		}
+		if param.Range && (float64(n) < param.Min || float64(n) > param.Max) {
+			return "", fmt.Errorf("value for %s out of range", param.Name)
+		}
+	case "real", "points":
+		f, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return "", fmt.Errorf("invalid number for %s", param.Name)
+		}
+		if param.Range && (f < param.Min || f > param.Max) {
+			return "", fmt.Errorf("value for %s out of range", param.Name)
+		}
+	case "string", "password":
+		if param.Range {
+			l := utf8.RuneCountInString(value)
+			if l < int(param.Min) || l > int(param.Max) {
+				return "", fmt.Errorf("value for %s out of range", param.Name)
+			}
+		}
+	case "units":
+		switch strings.ToLower(value) {
+		case "pt", "mm", "cm", "in", "ft", "m":
+		default:
+			return "", fmt.Errorf("invalid units for %s", param.Name)
+		}
+	}
+	return value, nil
+}
+
+func buildCustomOptionValue(opt *config.PPDOption, values map[string]string) (string, error) {
+	if opt == nil || len(opt.CustomParams) == 0 {
+		return "", fmt.Errorf("custom parameters not defined")
+	}
+	params := orderedCustomParams(opt.CustomParams)
+	units := ""
+	for _, p := range params {
+		if strings.EqualFold(p.Name, "Units") || strings.EqualFold(p.Type, "units") {
+			units = strings.TrimSpace(values[p.Name])
+		}
+	}
+	if units == "" {
+		units = "pt"
+	}
+
+	if strings.EqualFold(opt.Keyword, "PageSize") {
+		width := strings.TrimSpace(values["Width"])
+		height := strings.TrimSpace(values["Height"])
+		if width == "" || height == "" {
+			return "", fmt.Errorf("missing custom page size")
+		}
+		wNum, err := strconv.ParseFloat(width, 64)
+		if err != nil {
+			return "", fmt.Errorf("invalid custom page size width")
+		}
+		hNum, err := strconv.ParseFloat(height, 64)
+		if err != nil {
+			return "", fmt.Errorf("invalid custom page size height")
+		}
+		return fmt.Sprintf("Custom.%sx%s%s", formatCustomNumber(wNum), formatCustomNumber(hNum), units), nil
+	}
+
+	nonUnits := make([]config.PPDCustomParam, 0, len(params))
+	for _, p := range params {
+		if strings.EqualFold(p.Name, "Units") || strings.EqualFold(p.Type, "units") {
+			continue
+		}
+		nonUnits = append(nonUnits, p)
+	}
+	if len(nonUnits) == 1 {
+		p := nonUnits[0]
+		val := strings.TrimSpace(values[p.Name])
+		if val == "" {
+			return "", fmt.Errorf("missing custom parameter %s", p.Name)
+		}
+		return "Custom." + formatCustomParamValue(p, val, units, false), nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString("{")
+	first := true
+	for _, p := range nonUnits {
+		val := strings.TrimSpace(values[p.Name])
+		if val == "" {
+			return "", fmt.Errorf("missing custom parameter %s", p.Name)
+		}
+		if !first {
+			sb.WriteString(" ")
+		}
+		first = false
+		sb.WriteString(p.Name)
+		sb.WriteString("=")
+		sb.WriteString(formatCustomParamValue(p, val, units, true))
+	}
+	sb.WriteString("}")
+	return sb.String(), nil
+}
+
+func orderedCustomParams(params []config.PPDCustomParam) []config.PPDCustomParam {
+	if len(params) == 0 {
+		return params
+	}
+	out := make([]config.PPDCustomParam, len(params))
+	copy(out, params)
+	hasOrder := false
+	for _, p := range out {
+		if p.Order > 0 {
+			hasOrder = true
+			break
+		}
+	}
+	if !hasOrder {
+		return out
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		oi, oj := out[i].Order, out[j].Order
+		if oi > 0 && oj > 0 {
+			return oi < oj
+		}
+		if oi > 0 && oj == 0 {
+			return true
+		}
+		if oi == 0 && oj > 0 {
+			return false
+		}
+		return false
+	})
+	return out
+}
+
+func formatCustomParamValue(param config.PPDCustomParam, value, units string, quoted bool) string {
+	switch strings.ToLower(param.Type) {
+	case "points":
+		return value + units
+	case "string", "password":
+		if !quoted {
+			return value
+		}
+		return `"` + escapeCustomString(value) + `"`
+	default:
+		return value
+	}
+}
+
+func escapeCustomString(value string) string {
+	var sb strings.Builder
+	for _, r := range value {
+		if r == '\\' || r == '"' {
+			sb.WriteByte('\\')
+		}
+		sb.WriteRune(r)
+	}
+	return sb.String()
+}
+
+func formatCustomNumber(val float64) string {
+	return strconv.FormatFloat(val, 'f', -1, 64)
+}
+
+var customPageSizeRe = regexp.MustCompile(`(?i)^custom\.([0-9.]+)x([0-9.]+)([a-z]+)?$`)
+
+func parseCustomOptionValue(opt *config.PPDOption, value string) map[string]string {
+	out := map[string]string{}
+	if opt == nil || strings.TrimSpace(value) == "" {
+		return out
+	}
+	raw := strings.TrimSpace(value)
+	lower := strings.ToLower(raw)
+	if strings.HasPrefix(lower, "custom.") {
+		if strings.EqualFold(opt.Keyword, "PageSize") {
+			if m := customPageSizeRe.FindStringSubmatch(raw); len(m) >= 3 {
+				out["Width"] = m[1]
+				out["Height"] = m[2]
+				if len(m) >= 4 && m[3] != "" {
+					out["Units"] = strings.ToLower(m[3])
+				}
+			}
+			return out
+		}
+		rest := raw[len("Custom."):]
+		rest = strings.TrimSpace(rest)
+		if len(opt.CustomParams) == 1 {
+			p := opt.CustomParams[0]
+			if strings.EqualFold(p.Type, "points") {
+				num, unit := splitNumericSuffix(rest)
+				if unit != "" {
+					out["Units"] = unit
+				}
+				out[p.Name] = num
+			} else {
+				out[p.Name] = rest
+			}
+			return out
+		}
+	}
+	if strings.HasPrefix(raw, "{") && strings.HasSuffix(raw, "}") {
+		inner := strings.TrimSpace(raw[1 : len(raw)-1])
+		parsed := parseCustomDict(inner)
+		for k, v := range parsed {
+			out[k] = v
+		}
+		for _, p := range opt.CustomParams {
+			if !strings.EqualFold(p.Type, "points") {
+				continue
+			}
+			if v, ok := out[p.Name]; ok {
+				if num, unit := splitNumericSuffix(v); num != "" {
+					out[p.Name] = num
+					if unit != "" {
+						out["Units"] = unit
+					}
+				}
+			}
+		}
+		return out
+	}
+	return out
+}
+
+func parseCustomDict(value string) map[string]string {
+	out := map[string]string{}
+	i := 0
+	for i < len(value) {
+		for i < len(value) && value[i] == ' ' {
+			i++
+		}
+		if i >= len(value) {
+			break
+		}
+		start := i
+		for i < len(value) && value[i] != '=' && value[i] != ' ' {
+			i++
+		}
+		if i >= len(value) || value[i] != '=' {
+			break
+		}
+		key := strings.TrimSpace(value[start:i])
+		i++
+		if i >= len(value) {
+			out[key] = ""
+			break
+		}
+		var val string
+		if value[i] == '"' {
+			i++
+			var sb strings.Builder
+			for i < len(value) {
+				if value[i] == '\\' && i+1 < len(value) {
+					i++
+					sb.WriteByte(value[i])
+					i++
+					continue
+				}
+				if value[i] == '"' {
+					i++
+					break
+				}
+				sb.WriteByte(value[i])
+				i++
+			}
+			val = sb.String()
+		} else {
+			startVal := i
+			for i < len(value) && value[i] != ' ' {
+				i++
+			}
+			val = strings.TrimSpace(value[startVal:i])
+		}
+		if key != "" {
+			out[key] = val
+		}
+	}
+	return out
+}
+
+func splitNumericSuffix(value string) (string, string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", ""
+	}
+	i := len(value)
+	for i > 0 {
+		r := value[i-1]
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			i--
+			continue
+		}
+		break
+	}
+	num := strings.TrimSpace(value[:i])
+	unit := strings.ToLower(strings.TrimSpace(value[i:]))
+	return num, unit
 }
 
 func jobSheetsPairFromDefault(value string) (string, string) {
