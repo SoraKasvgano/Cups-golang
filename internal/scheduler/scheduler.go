@@ -903,6 +903,8 @@ func jobHoldStatus(value string, submittedAt, now time.Time) (bool, time.Time) {
 		return false, time.Time{}
 	case "indefinite", "hold", "forever":
 		return true, time.Time{}
+	case "auth-info-required":
+		return true, time.Time{}
 	case "day-time":
 		return holdWindow(now.In(time.Local), 6, 18)
 	case "night":

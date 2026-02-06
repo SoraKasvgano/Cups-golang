@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -22,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	goipp "github.com/OpenPrinting/goipp"
 
@@ -37,6 +39,7 @@ var (
 	mimeTypes        []string
 	errPPDConstraint = errors.New("ppd-constraint-violation")
 	errUnsupported   = errors.New("unsupported-attribute-value")
+	errConflicting   = errors.New("conflicting-attributes")
 	policyNamesOnce  sync.Once
 	policyNames      []string
 	pwgMediaOnce     sync.Once
@@ -47,6 +50,80 @@ var (
 	errNotAuthorized = errors.New("not-authorized")
 	errNotPossible   = errors.New("not-possible")
 	errBadRequest    = errors.New("bad-request")
+)
+
+var readOnlyJobAttrs = map[string]bool{
+	"date-time-at-completed":       true,
+	"date-time-at-creation":        true,
+	"date-time-at-processing":      true,
+	"job-detailed-status-messages": true,
+	"job-document-access-errors":   true,
+	"job-id":                       true,
+	"job-impressions-completed":    true,
+	"job-k-octets-completed":       true,
+	"job-media-sheets-completed":   true,
+	"job-pages-completed":          true,
+	"job-printer-up-time":          true,
+	"job-printer-uri":              true,
+	"job-state":                    true,
+	"job-state-message":            true,
+	"job-state-reasons":            true,
+	"job-uri":                      true,
+	"number-of-documents":          true,
+	"number-of-intervening-jobs":   true,
+	"output-device-assigned":       true,
+	"time-at-completed":            true,
+	"time-at-creation":             true,
+	"time-at-processing":           true,
+}
+
+type ippHTTPError struct {
+	status   int
+	authType string
+	message  string
+}
+
+func (e *ippHTTPError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.message != "" {
+		return e.message
+	}
+	if e.status > 0 {
+		return http.StatusText(e.status)
+	}
+	return "http-error"
+}
+
+const (
+	cupsPTypeClass      = 0x0001
+	cupsPTypeRemote     = 0x0002
+	cupsPTypeBW         = 0x0004
+	cupsPTypeColor      = 0x0008
+	cupsPTypeDuplex     = 0x0010
+	cupsPTypeStaple     = 0x0020
+	cupsPTypeCopies     = 0x0040
+	cupsPTypeCollate    = 0x0080
+	cupsPTypePunch      = 0x0100
+	cupsPTypeCover      = 0x0200
+	cupsPTypeBind       = 0x0400
+	cupsPTypeSort       = 0x0800
+	cupsPTypeSmall      = 0x1000
+	cupsPTypeMedium     = 0x2000
+	cupsPTypeLarge      = 0x4000
+	cupsPTypeVariable   = 0x8000
+	cupsPTypeDefault    = 0x20000
+	cupsPTypeFax        = 0x40000
+	cupsPTypeRejecting  = 0x80000
+	cupsPTypeNotShared  = 0x200000
+	cupsPTypeAuth       = 0x400000
+	cupsPTypeCommands   = 0x800000
+	cupsPTypeDiscovered = 0x1000000
+	cupsPTypeScanner    = 0x2000000
+	cupsPTypeMFP        = 0x4000000
+	cupsPType3D         = 0x8000000
+	cupsPTypeFold       = 0x10000000
 )
 
 const supplyCacheTTL = 60 * time.Second
@@ -220,6 +297,18 @@ func (s *Server) handleIPPRequest(w http.ResponseWriter, r *http.Request) error 
 	}
 
 	if err != nil {
+		var httpErr *ippHTTPError
+		if errors.As(err, &httpErr) {
+			if httpErr.status == http.StatusUnauthorized {
+				setAuthChallenge(w, httpErr.authType)
+			}
+			msg := httpErr.message
+			if msg == "" {
+				msg = http.StatusText(httpErr.status)
+			}
+			http.Error(w, msg, httpErr.status)
+			return nil
+		}
 		resp = goipp.NewResponse(req.Version, goipp.StatusErrorInternal, req.RequestID)
 		addOperationDefaults(resp)
 	}
@@ -291,9 +380,11 @@ func (s *Server) handleGetPrinterAttributes(ctx context.Context, r *http.Request
 			members, err = s.Store.ListClassMembers(ctx, tx, dest.Class.ID)
 			return err
 		})
-		addClassAttributes(resp, dest.Class, members, r, req)
+		authInfo := authInfoRequiredForRequest(s, r)
+		addClassAttributes(ctx, resp, dest.Class, members, r, req, s.Store, authInfo)
 	} else {
-		addPrinterAttributes(ctx, resp, dest.Printer, r, req, s.Store)
+		authInfo := authInfoRequiredForRequest(s, r)
+		addPrinterAttributes(ctx, resp, dest.Printer, r, req, s.Store, authInfo)
 	}
 	return resp, nil
 }
@@ -376,7 +467,8 @@ func (s *Server) handleSetPrinterAttributes(ctx context.Context, r *http.Request
 	updated, _ := s.resolvePrinter(ctx, r, req)
 	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
 	addOperationDefaults(resp)
-	addPrinterAttributes(ctx, resp, updated, r, req, s.Store)
+	authInfo := authInfoRequiredForRequest(s, r)
+	addPrinterAttributes(ctx, resp, updated, r, req, s.Store, authInfo)
 	return resp, nil
 }
 
@@ -391,11 +483,58 @@ func (s *Server) handleCupsGetPrinters(ctx context.Context, r *http.Request, req
 		return nil, err
 	}
 
+	limit := int(attrInt(req.Operation, "limit"))
+	if limit <= 0 {
+		limit = 10000000
+	}
+	firstName, _ := attrValue(req.Operation, "first-printer-name")
+	printerID := int64(attrInt(req.Operation, "printer-id"))
+	printerType := int(attrInt(req.Operation, "printer-type"))
+	printerMask := int(attrInt(req.Operation, "printer-type-mask"))
+	location, _ := attrValue(req.Operation, "printer-location")
+	location = strings.TrimSpace(location)
+	username := requestUserForFilter(r, req)
+	local := isLocalRequest(r)
+	shareServer := sharingEnabled(r, s.Store)
+	start := 0
+	if firstName != "" {
+		for i, p := range printers {
+			if p.Name == firstName {
+				start = i
+				break
+			}
+		}
+	}
+
 	groups := make(goipp.Groups, 0, len(printers)+1)
 	groups = append(groups, goipp.Group{Tag: goipp.TagOperationGroup, Attrs: buildOperationDefaults()})
-	for _, p := range printers {
-		attrs := buildPrinterAttributes(ctx, p, r, req, s.Store)
+	count := 0
+	authInfo := authInfoRequiredForRequest(s, r)
+	for i := start; i < len(printers) && count < limit; i++ {
+		p := printers[i]
+		if !local && (!shareServer || !p.Shared) {
+			continue
+		}
+		if printerID != 0 && p.ID != printerID {
+			continue
+		}
+		if location != "" && !strings.EqualFold(strings.TrimSpace(p.Location), location) {
+			continue
+		}
+		if printerType != 0 || printerMask != 0 {
+			ppd, _ := loadPPDForPrinter(p)
+			caps := computePrinterCaps(ppd, parseJobOptions(p.DefaultOptions))
+			ptype := computePrinterType(p, caps, ppd, false, authInfo)
+			if (ptype & printerMask) != printerType {
+				continue
+			}
+		}
+		if username != "" && !s.userAllowedForPrinter(ctx, p, username) {
+			continue
+		}
+		attrs := buildPrinterAttributes(ctx, p, r, req, s.Store, authInfo)
 		groups = append(groups, goipp.Group{Tag: goipp.TagPrinterGroup, Attrs: attrs})
+		count++
 	}
 	resp := goipp.NewMessageWithGroups(req.Version, goipp.Code(goipp.StatusOk), req.RequestID, groups)
 	return resp, nil
@@ -423,11 +562,56 @@ func (s *Server) handleCupsGetClasses(ctx context.Context, r *http.Request, req 
 		return nil, err
 	}
 
+	limit := int(attrInt(req.Operation, "limit"))
+	if limit <= 0 {
+		limit = 10000000
+	}
+	firstName, _ := attrValue(req.Operation, "first-printer-name")
+	classID := int64(attrInt(req.Operation, "printer-id"))
+	printerType := int(attrInt(req.Operation, "printer-type"))
+	printerMask := int(attrInt(req.Operation, "printer-type-mask"))
+	location, _ := attrValue(req.Operation, "printer-location")
+	location = strings.TrimSpace(location)
+	username := requestUserForFilter(r, req)
+	local := isLocalRequest(r)
+	shareServer := sharingEnabled(r, s.Store)
+	start := 0
+	if firstName != "" {
+		for i, c := range classes {
+			if c.Name == firstName {
+				start = i
+				break
+			}
+		}
+	}
+
 	groups := make(goipp.Groups, 0, len(classes)+1)
 	groups = append(groups, goipp.Group{Tag: goipp.TagOperationGroup, Attrs: buildOperationDefaults()})
-	for _, c := range classes {
-		attrs := classAttributesWithMembers(c, memberMap[c.ID], r, req)
+	count := 0
+	authInfo := authInfoRequiredForRequest(s, r)
+	for i := start; i < len(classes) && count < limit; i++ {
+		c := classes[i]
+		if !local && !shareServer {
+			continue
+		}
+		if classID != 0 && c.ID != classID {
+			continue
+		}
+		if location != "" && !strings.EqualFold(strings.TrimSpace(c.Location), location) {
+			continue
+		}
+		if printerType != 0 || printerMask != 0 {
+			ptype := computeClassType(c, shareServer, authInfo)
+			if (ptype & printerMask) != printerType {
+				continue
+			}
+		}
+		if username != "" && !s.userAllowedForClass(ctx, c, username) {
+			continue
+		}
+		attrs := classAttributesWithMembers(ctx, c, memberMap[c.ID], r, req, s.Store, authInfo)
 		groups = append(groups, goipp.Group{Tag: goipp.TagPrinterGroup, Attrs: attrs})
+		count++
 	}
 	resp := goipp.NewMessageWithGroups(req.Version, goipp.Code(goipp.StatusOk), req.RequestID, groups)
 	return resp, nil
@@ -585,7 +769,7 @@ func (s *Server) handleCupsMoveJob(ctx context.Context, r *http.Request, req *go
 
 	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
 	addOperationDefaults(resp)
-	addJobAttributes(resp, job, target, r, model.Document{}, req)
+	addJobAttributes(resp, job, target, r, model.Document{}, 0, req)
 	return resp, nil
 }
 
@@ -700,7 +884,8 @@ func (s *Server) handleCupsAddModifyPrinter(ctx context.Context, r *http.Request
 	}
 	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
 	addOperationDefaults(resp)
-	addPrinterAttributes(ctx, resp, printer, r, req, s.Store)
+	authInfo := authInfoRequiredForRequest(s, r)
+	addPrinterAttributes(ctx, resp, printer, r, req, s.Store, authInfo)
 	return resp, nil
 }
 
@@ -833,7 +1018,8 @@ func (s *Server) handleCupsAddModifyClass(ctx context.Context, r *http.Request, 
 		members, err = s.Store.ListClassMembers(ctx, tx, class.ID)
 		return err
 	})
-	addClassAttributes(resp, class, members, r, req)
+	authInfo := authInfoRequiredForRequest(s, r)
+	addClassAttributes(ctx, resp, class, members, r, req, s.Store, authInfo)
 	return resp, nil
 }
 
@@ -879,9 +1065,11 @@ func (s *Server) handleCupsGetDefault(ctx context.Context, r *http.Request, req 
 			members, err = s.Store.ListClassMembers(ctx, tx, dest.Class.ID)
 			return err
 		})
-		addClassAttributes(resp, dest.Class, members, r, req)
+		authInfo := authInfoRequiredForRequest(s, r)
+		addClassAttributes(ctx, resp, dest.Class, members, r, req, s.Store, authInfo)
 	} else {
-		addPrinterAttributes(ctx, resp, dest.Printer, r, req, s.Store)
+		authInfo := authInfoRequiredForRequest(s, r)
+		addPrinterAttributes(ctx, resp, dest.Printer, r, req, s.Store, authInfo)
 	}
 	return resp, nil
 }
@@ -1344,10 +1532,7 @@ func (s *Server) handleCancelSubscription(ctx context.Context, r *http.Request, 
 }
 
 func (s *Server) handlePrintJob(ctx context.Context, r *http.Request, req *goipp.Message, docReader io.Reader) (*goipp.Message, error) {
-	jobName := attrString(req.Operation, "job-name")
-	if jobName == "" {
-		jobName = "Untitled"
-	}
+	jobName := sanitizeJobName(req)
 	userName := attrString(req.Operation, "requesting-user-name")
 	if userName == "" {
 		userName = "anonymous"
@@ -1376,6 +1561,11 @@ func (s *Server) handlePrintJob(ctx context.Context, r *http.Request, req *goipp
 	if !s.userAllowedForPrinter(ctx, printer, userName) {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorNotAuthorized, req.RequestID), nil
 	}
+	if err := s.enforceAuthInfo(r, req, goipp.OpPrintJob); err != nil {
+		return nil, err
+	}
+	stripReadOnlyJobAttributes(req)
+	originHost := jobOriginatingHostFromRequest(r, req)
 	documentFormat := attrString(req.Operation, "document-format")
 	if documentFormat == "" {
 		documentFormat = "application/octet-stream"
@@ -1390,7 +1580,21 @@ func (s *Server) handlePrintJob(ctx context.Context, r *http.Request, req *goipp
 		if errors.Is(err, errBadRequest) {
 			return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
 		}
+		if errors.Is(err, errConflicting) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorConflicting, req.RequestID), nil
+		}
 		if errors.Is(err, errPPDConstraint) || errors.Is(err, errUnsupported) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorAttributesOrValues, req.RequestID), nil
+		}
+		return nil, err
+	}
+
+	compression, err := compressionFromRequest(req)
+	if err != nil {
+		if errors.Is(err, errBadRequest) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+		}
+		if errors.Is(err, errUnsupported) {
 			return goipp.NewResponse(req.Version, goipp.StatusErrorAttributesOrValues, req.RequestID), nil
 		}
 		return nil, err
@@ -1401,14 +1605,23 @@ func (s *Server) handlePrintJob(ctx context.Context, r *http.Request, req *goipp
 		options = addClassInternalOptions(options, dest.Class)
 	}
 	holdRequested := jobHoldRequested(options)
+	reader := docReader
+	if compression == "gzip" {
+		gz, err := gzip.NewReader(docReader)
+		if err != nil {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorDocumentUnprintable, req.RequestID), nil
+		}
+		defer gz.Close()
+		reader = gz
+	}
 	err = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
 		var err error
-		job, err = s.Store.CreateJob(ctx, tx, printer.ID, jobName, userName, options)
+		job, err = s.Store.CreateJob(ctx, tx, printer.ID, jobName, userName, originHost, options)
 		if err != nil {
 			return err
 		}
 		sp := spool.Spool{Dir: s.Spool.Dir, OutputDir: s.Spool.OutputDir}
-		path, size, err := sp.Save(job.ID, jobName, docReader)
+		path, size, err := sp.Save(job.ID, jobName, reader)
 		if err != nil {
 			return err
 		}
@@ -1431,15 +1644,12 @@ func (s *Server) handlePrintJob(ctx context.Context, r *http.Request, req *goipp
 
 	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
 	addOperationDefaults(resp)
-	addJobAttributes(resp, job, printer, r, doc, req)
+	addJobAttributes(resp, job, printer, r, doc, 1, req)
 	return resp, nil
 }
 
 func (s *Server) handleCreateJob(ctx context.Context, r *http.Request, req *goipp.Message) (*goipp.Message, error) {
-	jobName := attrString(req.Operation, "job-name")
-	if jobName == "" {
-		jobName = "Untitled"
-	}
+	jobName := sanitizeJobName(req)
 	userName := attrString(req.Operation, "requesting-user-name")
 	if userName == "" {
 		userName = "anonymous"
@@ -1468,11 +1678,19 @@ func (s *Server) handleCreateJob(ctx context.Context, r *http.Request, req *goip
 	if !s.userAllowedForPrinter(ctx, printer, userName) {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorNotAuthorized, req.RequestID), nil
 	}
+	if err := s.enforceAuthInfo(r, req, goipp.OpCreateJob); err != nil {
+		return nil, err
+	}
+	stripReadOnlyJobAttributes(req)
+	originHost := jobOriginatingHostFromRequest(r, req)
 
 	var job model.Job
 	if err := validateRequestOptions(req, printer); err != nil {
 		if errors.Is(err, errBadRequest) {
 			return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+		}
+		if errors.Is(err, errConflicting) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorConflicting, req.RequestID), nil
 		}
 		if errors.Is(err, errPPDConstraint) || errors.Is(err, errUnsupported) {
 			return goipp.NewResponse(req.Version, goipp.StatusErrorAttributesOrValues, req.RequestID), nil
@@ -1487,7 +1705,7 @@ func (s *Server) handleCreateJob(ctx context.Context, r *http.Request, req *goip
 	holdRequested := jobHoldRequested(options)
 	err = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
 		var err error
-		job, err = s.Store.CreateJob(ctx, tx, printer.ID, jobName, userName, options)
+		job, err = s.Store.CreateJob(ctx, tx, printer.ID, jobName, userName, originHost, options)
 		if err != nil {
 			return err
 		}
@@ -1506,7 +1724,7 @@ func (s *Server) handleCreateJob(ctx context.Context, r *http.Request, req *goip
 
 	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
 	addOperationDefaults(resp)
-	addJobAttributes(resp, job, printer, r, model.Document{}, req)
+	addJobAttributes(resp, job, printer, r, model.Document{}, 0, req)
 	return resp, nil
 }
 
@@ -1517,6 +1735,21 @@ func (s *Server) handleSendDocument(ctx context.Context, r *http.Request, req *g
 	}
 	if jobID == 0 {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+	}
+
+	lastDoc, lastDocPresent := attrBoolPresent(req.Operation, "last-document")
+	if !lastDocPresent {
+		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+	}
+	compression, err := compressionFromRequest(req)
+	if err != nil {
+		if errors.Is(err, errBadRequest) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+		}
+		if errors.Is(err, errUnsupported) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorAttributesOrValues, req.RequestID), nil
+		}
+		return nil, err
 	}
 
 	documentFormat := attrString(req.Operation, "document-format")
@@ -1530,7 +1763,8 @@ func (s *Server) handleSendDocument(ctx context.Context, r *http.Request, req *g
 	var job model.Job
 	var printer model.Printer
 	var doc model.Document
-	err := s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
+	var docs []model.Document
+	err = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
 		var err error
 		job, err = s.Store.GetJob(ctx, tx, jobID)
 		if err != nil {
@@ -1540,13 +1774,11 @@ func (s *Server) handleSendDocument(ctx context.Context, r *http.Request, req *g
 		if err != nil {
 			return err
 		}
-		sp := spool.Spool{Dir: s.Spool.Dir, OutputDir: s.Spool.OutputDir}
-		path, size, err := sp.Save(job.ID, job.Name, docReader)
+		docs, err = s.Store.ListDocumentsByJob(ctx, tx, job.ID)
 		if err != nil {
 			return err
 		}
-		doc, err = s.Store.AddDocument(ctx, tx, job.ID, job.Name, documentFormat, path, size)
-		return err
+		return nil
 	})
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1555,9 +1787,53 @@ func (s *Server) handleSendDocument(ctx context.Context, r *http.Request, req *g
 		return nil, err
 	}
 
+	authType := s.authTypeForRequest(r, goipp.OpSendDocument.String())
+	if !s.canManageJob(ctx, r, req, authType, job, false) {
+		return goipp.NewResponse(req.Version, goipp.StatusErrorNotAuthorized, req.RequestID), nil
+	}
+	if job.State >= 7 {
+		return goipp.NewResponse(req.Version, goipp.StatusErrorNotPossible, req.RequestID), nil
+	}
+
+	if buf, ok := docReader.(*bytes.Buffer); ok && buf.Len() == 0 {
+		if lastDoc && len(docs) > 0 {
+			resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
+			addOperationDefaults(resp)
+			addJobAttributes(resp, job, printer, r, model.Document{}, len(docs), req)
+			return resp, nil
+		}
+		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+	}
+
+	reader := docReader
+	if compression == "gzip" {
+		gz, err := gzip.NewReader(docReader)
+		if err != nil {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorDocumentUnprintable, req.RequestID), nil
+		}
+		defer gz.Close()
+		reader = gz
+	}
+
+	err = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
+		sp := spool.Spool{Dir: s.Spool.Dir, OutputDir: s.Spool.OutputDir}
+		path, size, err := sp.Save(job.ID, job.Name, reader)
+		if err != nil {
+			return err
+		}
+		doc, err = s.Store.AddDocument(ctx, tx, job.ID, job.Name, documentFormat, path, size)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
 	addOperationDefaults(resp)
-	addJobAttributes(resp, job, printer, r, doc, req)
+	addJobAttributes(resp, job, printer, r, doc, len(docs)+1, req)
 	return resp, nil
 }
 
@@ -1603,11 +1879,28 @@ func (s *Server) handleGetJobs(ctx context.Context, r *http.Request, req *goipp.
 		jobs = jobs[:limit]
 	}
 
+	docStats := map[int64]store.DocumentStats{}
+	if len(jobs) > 0 {
+		jobIDs := make([]int64, 0, len(jobs))
+		for _, job := range jobs {
+			jobIDs = append(jobIDs, job.ID)
+		}
+		if err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
+			var err error
+			docStats, err = s.Store.ListDocumentStatsByJobIDs(ctx, tx, jobIDs)
+			return err
+		}); err != nil {
+			return nil, err
+		}
+	}
+
 	groups := make(goipp.Groups, 0, len(jobs)+1)
 	groups = append(groups, goipp.Group{Tag: goipp.TagOperationGroup, Attrs: buildOperationDefaults()})
 	for _, job := range jobs {
 		printer := printerMap[job.PrinterID]
-		attrs := buildJobAttributes(job, printer, r, model.Document{}, req)
+		stat := docStats[job.ID]
+		docAgg := model.Document{SizeBytes: stat.SizeBytes, MimeType: stat.MimeType}
+		attrs := buildJobAttributes(job, printer, r, docAgg, stat.Count, req)
 		groups = append(groups, goipp.Group{Tag: goipp.TagJobGroup, Attrs: attrs})
 	}
 	resp := goipp.NewMessageWithGroups(req.Version, goipp.Code(goipp.StatusOk), req.RequestID, groups)
@@ -1625,6 +1918,7 @@ func (s *Server) handleGetJobAttributes(ctx context.Context, r *http.Request, re
 
 	var job model.Job
 	var printer model.Printer
+	var docs []model.Document
 	err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
 		var err error
 		job, err = s.Store.GetJob(ctx, tx, jobID)
@@ -1632,6 +1926,10 @@ func (s *Server) handleGetJobAttributes(ctx context.Context, r *http.Request, re
 			return err
 		}
 		printer, err = s.Store.GetPrinterByID(ctx, tx, job.PrinterID)
+		if err != nil {
+			return err
+		}
+		docs, err = s.Store.ListDocumentsByJob(ctx, tx, job.ID)
 		return err
 	})
 	if err != nil {
@@ -1641,9 +1939,20 @@ func (s *Server) handleGetJobAttributes(ctx context.Context, r *http.Request, re
 		return nil, err
 	}
 
+	var docAgg model.Document
+	if len(docs) == 1 {
+		docAgg = docs[0]
+	} else {
+		var totalSize int64
+		for _, d := range docs {
+			totalSize += d.SizeBytes
+		}
+		docAgg = model.Document{SizeBytes: totalSize}
+	}
+
 	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
 	addOperationDefaults(resp)
-	addJobAttributes(resp, job, printer, r, model.Document{}, req)
+	addJobAttributes(resp, job, printer, r, docAgg, len(docs), req)
 	return resp, nil
 }
 
@@ -1908,7 +2217,7 @@ func (s *Server) handleSetJobAttributes(ctx context.Context, r *http.Request, re
 
 	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
 	addOperationDefaults(resp)
-	addJobAttributes(resp, job, printer, r, model.Document{}, req)
+	addJobAttributes(resp, job, printer, r, model.Document{}, 0, req)
 	return resp, nil
 }
 
@@ -2043,9 +2352,17 @@ func (s *Server) handleValidateJob(ctx context.Context, r *http.Request, req *go
 		}
 		printer = applyClassDefaultsToPrinter(printer, dest.Class)
 	}
+	if err := s.enforceAuthInfo(r, req, goipp.OpValidateJob); err != nil {
+		return nil, err
+	}
+	stripReadOnlyJobAttributes(req)
+	_ = sanitizeJobName(req)
 	if err := validateRequestOptions(req, printer); err != nil {
 		if errors.Is(err, errBadRequest) {
 			return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+		}
+		if errors.Is(err, errConflicting) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorConflicting, req.RequestID), nil
 		}
 		if errors.Is(err, errPPDConstraint) || errors.Is(err, errUnsupported) {
 			return goipp.NewResponse(req.Version, goipp.StatusErrorAttributesOrValues, req.RequestID), nil
@@ -2075,17 +2392,60 @@ func (s *Server) handleCupsAuthenticateJob(ctx context.Context, r *http.Request,
 	if jobID == 0 {
 		jobID = jobIDFromURI(attrString(req.Operation, "job-uri"))
 	}
-	if jobID != 0 {
-		err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
-			_, err := s.Store.GetJob(ctx, tx, jobID)
-			return err
-		})
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
-			}
-			return nil, err
+	if jobID == 0 {
+		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+	}
+
+	authInfo := authInfoFromRequest(req)
+	if len(authInfo) > 0 && r != nil && r.TLS == nil && !isLocalRequest(r) {
+		return nil, &ippHTTPError{status: http.StatusUpgradeRequired}
+	}
+
+	var job model.Job
+	err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
+		var err error
+		job, err = s.Store.GetJob(ctx, tx, jobID)
+		return err
+	})
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
 		}
+		return nil, err
+	}
+
+	authType := s.authTypeForRequest(r, goipp.OpCupsAuthenticateJob.String())
+	if !s.canManageJob(ctx, r, req, authType, job, false) {
+		return goipp.NewResponse(req.Version, goipp.StatusErrorNotAuthorized, req.RequestID), nil
+	}
+	if job.State != 4 {
+		return goipp.NewResponse(req.Version, goipp.StatusErrorNotPossible, req.RequestID), nil
+	}
+
+	if len(authInfo) == 0 {
+		if _, ok := s.authenticate(r, ""); !ok {
+			required := authInfoRequiredForRequest(s, r)
+			if len(required) == 1 && strings.EqualFold(required[0], "negotiate") {
+				return nil, &ippHTTPError{
+					status:   http.StatusUnauthorized,
+					authType: authType,
+				}
+			}
+			return goipp.NewResponse(req.Version, goipp.StatusErrorNotAuthorized, req.RequestID), nil
+		}
+	}
+
+	options := mergeJobOptions(job.Options, map[string]string{
+		"job-hold-until": "no-hold",
+	})
+	err = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
+		if err := s.Store.UpdateJobAttributes(ctx, tx, job.ID, nil, &options); err != nil {
+			return err
+		}
+		return s.Store.UpdateJobState(ctx, tx, job.ID, 3, "job-incoming", nil)
+	})
+	if err != nil {
+		return nil, err
 	}
 	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
 	addOperationDefaults(resp)
@@ -2220,7 +2580,7 @@ func (s *Server) handleCloseJob(ctx context.Context, r *http.Request, req *goipp
 
 	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
 	addOperationDefaults(resp)
-	addJobAttributes(resp, job, printer, r, model.Document{}, req)
+	addJobAttributes(resp, job, printer, r, model.Document{}, 0, req)
 	return resp, nil
 }
 
@@ -2503,19 +2863,19 @@ func buildOperationDefaults() goipp.Attributes {
 	return attrs
 }
 
-func addPrinterAttributes(ctx context.Context, resp *goipp.Message, printer model.Printer, r *http.Request, req *goipp.Message, st *store.Store) {
-	for _, attr := range buildPrinterAttributes(ctx, printer, r, req, st) {
+func addPrinterAttributes(ctx context.Context, resp *goipp.Message, printer model.Printer, r *http.Request, req *goipp.Message, st *store.Store, authInfo []string) {
+	for _, attr := range buildPrinterAttributes(ctx, printer, r, req, st, authInfo) {
 		resp.Printer.Add(attr)
 	}
 }
 
-func addClassAttributes(resp *goipp.Message, class model.Class, members []model.Printer, r *http.Request, req *goipp.Message) {
-	for _, attr := range classAttributesWithMembers(class, members, r, req) {
+func addClassAttributes(ctx context.Context, resp *goipp.Message, class model.Class, members []model.Printer, r *http.Request, req *goipp.Message, st *store.Store, authInfo []string) {
+	for _, attr := range classAttributesWithMembers(ctx, class, members, r, req, st, authInfo) {
 		resp.Printer.Add(attr)
 	}
 }
 
-func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.Request, req *goipp.Message, st *store.Store) goipp.Attributes {
+func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.Request, req *goipp.Message, st *store.Store, authInfo []string) goipp.Attributes {
 	uri := printerURIFor(printer, r)
 	attrs := goipp.Attributes{}
 	ppd, _ := loadPPDForPrinter(printer)
@@ -2541,7 +2901,43 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	if !intInList(finishingsDefault, finishingsSupported) && len(finishingsSupported) > 0 {
 		finishingsDefault = finishingsSupported[0]
 	}
-	finishingsTemplates := finishingsTemplatesFromEnums(finishingsSupported)
+	finishingsTemplates := caps.finishingTemplates
+	if len(finishingsTemplates) == 0 {
+		finishingsTemplates = finishingsTemplatesFromEnums(finishingsSupported)
+	}
+	templateDefault := ""
+	if len(caps.finishingTemplates) > 0 {
+		templateDefault = strings.TrimSpace(caps.finishingTemplateDefault)
+		if templateDefault == "" || !stringInList(templateDefault, finishingsTemplates) {
+			if len(finishingsTemplates) > 0 {
+				templateDefault = finishingsTemplates[0]
+			}
+		}
+	} else {
+		templateDefault = finishingsEnumToName(finishingsDefault)
+		if templateDefault == "" && len(finishingsTemplates) > 0 {
+			templateDefault = finishingsTemplates[0]
+		}
+	}
+	if templateDefault == "" {
+		templateDefault = "none"
+	}
+	printQualityDefault := 4
+	qualityValue := strings.TrimSpace(defaultOpts["print-quality"])
+	if qualityValue == "" && ppd != nil {
+		qualityValue = strings.TrimSpace(ppd.Defaults["OutputMode"])
+		if qualityValue == "" {
+			qualityValue = strings.TrimSpace(ppd.Defaults["cupsPrintQuality"])
+		}
+	}
+	if qualityValue != "" {
+		if n, ok := parsePrintQualityValue(qualityValue); ok {
+			printQualityDefault = n
+		}
+	}
+	if len(caps.printQualitySupported) > 0 && !intInList(printQualityDefault, caps.printQualitySupported) {
+		printQualityDefault = caps.printQualitySupported[0]
+	}
 	ppdName := strings.TrimSpace(printer.PPDName)
 	if ppdName == "" {
 		ppdName = model.DefaultPPDName
@@ -2563,6 +2959,11 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	attrs.Add(goipp.MakeAttribute("printer-state", goipp.TagEnum, goipp.Integer(printer.State)))
 	attrs.Add(goipp.MakeAttribute("printer-is-accepting-jobs", goipp.TagBoolean, goipp.Boolean(printer.Accepting)))
 	attrs.Add(goipp.MakeAttribute("printer-state-reasons", goipp.TagKeyword, goipp.String(printerStateReason(printer))))
+	stateChange := printer.UpdatedAt
+	if stateChange.IsZero() {
+		stateChange = time.Now()
+	}
+	attrs.Add(goipp.MakeAttribute("printer-state-change-time", goipp.TagInteger, goipp.Integer(stateChange.Unix())))
 	if printer.Location != "" {
 		attrs.Add(goipp.MakeAttribute("printer-location", goipp.TagText, goipp.String(printer.Location)))
 	}
@@ -2571,6 +2972,15 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	}
 	attrs.Add(goipp.MakeAttribute("ppd-name", goipp.TagName, goipp.String(ppdName)))
 	attrs.Add(goipp.MakeAttribute("printer-make-and-model", goipp.TagText, goipp.String(modelName)))
+	attrs.Add(goipp.MakeAttribute("printer-type", goipp.TagInteger, goipp.Integer(computePrinterType(printer, caps, ppd, false, authInfo))))
+	colorSupported := false
+	for _, mode := range caps.colorModes {
+		if strings.EqualFold(mode, "color") {
+			colorSupported = true
+			break
+		}
+	}
+	attrs.Add(goipp.MakeAttribute("color-supported", goipp.TagBoolean, goipp.Boolean(colorSupported)))
 	attrs.Add(makeMimeTypesAttr("document-format-supported", documentFormats))
 	attrs.Add(goipp.MakeAttribute("document-format-default", goipp.TagMimeType, goipp.String("application/octet-stream")))
 	attrs.Add(goipp.MakeAttribute("document-format-preferred", goipp.TagMimeType, goipp.String("application/octet-stream")))
@@ -2609,7 +3019,11 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	attrs.Add(goipp.MakeAttribute("printer-organization", goipp.TagText, goipp.String(org)))
 	attrs.Add(goipp.MakeAttribute("printer-organizational-unit", goipp.TagText, goipp.String(orgUnit)))
 	attrs.Add(goipp.MakeAttribute("printer-strings-languages-supported", goipp.TagLanguage, goipp.String("en-US")))
-	attrs.Add(goipp.MakeAttribute("printer-device-id", goipp.TagText, goipp.String("MFG:CUPS-Golang;MDL:Generic;")))
+	deviceID := "MFG:CUPS-Golang;MDL:Generic;"
+	if ppd != nil && strings.TrimSpace(ppd.DeviceID) != "" {
+		deviceID = strings.TrimSpace(ppd.DeviceID)
+	}
+	attrs.Add(goipp.MakeAttribute("printer-device-id", goipp.TagText, goipp.String(deviceID)))
 	attrs.Add(goipp.MakeAttribute("device-uri", goipp.TagURI, goipp.String(printer.URI)))
 	attrs.Add(goipp.MakeAttribute("destination-uri", goipp.TagURI, goipp.String(uri)))
 	attrs.Add(goipp.MakeAttribute("multiple-destination-uris-supported", goipp.TagBoolean, goipp.Boolean(false)))
@@ -2627,7 +3041,31 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	attrs.Add(goipp.MakeAttribute("job-ids-supported", goipp.TagBoolean, goipp.Boolean(true)))
 	attrs.Add(goipp.MakeAttribute("job-priority-supported", goipp.TagInteger, goipp.Integer(100)))
 	attrs.Add(goipp.MakeAttribute("job-priority-default", goipp.TagInteger, goipp.Integer(50)))
-	attrs.Add(goipp.MakeAttribute("job-account-id-supported", goipp.TagBoolean, goipp.Boolean(false)))
+	accountSupported := ppd != nil && ppd.JobAccountID
+	accountingUserSupported := ppd != nil && ppd.JobAccountingUser
+	attrs.Add(goipp.MakeAttribute("job-account-id-supported", goipp.TagBoolean, goipp.Boolean(accountSupported)))
+	attrs.Add(goipp.MakeAttribute("job-accounting-user-id-supported", goipp.TagBoolean, goipp.Boolean(accountingUserSupported)))
+	if accountSupported {
+		if v := strings.TrimSpace(defaultOpts["job-account-id"]); v != "" {
+			attrs.Add(goipp.MakeAttribute("job-account-id-default", goipp.TagName, goipp.String(v)))
+		} else {
+			attrs.Add(goipp.MakeAttribute("job-account-id-default", goipp.TagNoValue, goipp.Void{}))
+		}
+	}
+	if accountingUserSupported {
+		if v := strings.TrimSpace(defaultOpts["job-accounting-user-id"]); v != "" {
+			attrs.Add(goipp.MakeAttribute("job-accounting-user-id-default", goipp.TagName, goipp.String(v)))
+		} else {
+			attrs.Add(goipp.MakeAttribute("job-accounting-user-id-default", goipp.TagNoValue, goipp.Void{}))
+		}
+	}
+	if ppd != nil && strings.TrimSpace(ppd.ChargeInfoURI) != "" {
+		attrs.Add(goipp.MakeAttribute("printer-charge-info-uri", goipp.TagURI, goipp.String(ppd.ChargeInfoURI)))
+	}
+	if ppd != nil && strings.TrimSpace(ppd.JobPassword) != "" {
+		attrs.Add(goipp.MakeAttribute("job-password-encryption-supported", goipp.TagKeyword, goipp.String("none")))
+		attrs.Add(goipp.MakeAttribute("job-password-supported", goipp.TagInteger, goipp.Integer(len(ppd.JobPassword))))
+	}
 	attrs.Add(goipp.MakeAttribute("job-k-octets-supported", goipp.TagRange, goipp.Range{Lower: 0, Upper: 2147483647}))
 	attrs.Add(goipp.MakeAttribute("pdf-k-octets-supported", goipp.TagRange, goipp.Range{Lower: 0, Upper: 2147483647}))
 	attrs.Add(makeKeywordsAttr("pdf-versions-supported", []string{
@@ -2655,8 +3093,15 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	attrs.Add(makeKeywordsAttr("printer-get-attributes-supported", []string{"document-format"}))
 	attrs.Add(goipp.MakeAttribute("multiple-operation-time-out", goipp.TagInteger, goipp.Integer(60)))
 	attrs.Add(goipp.MakeAttribute("multiple-operation-time-out-action", goipp.TagKeyword, goipp.String("process-job")))
-	attrs.Add(goipp.MakeAttribute("copies-supported", goipp.TagRange, goipp.Range{Lower: 1, Upper: 999}))
+	maxCopies := caps.maxCopies
+	if maxCopies <= 0 {
+		maxCopies = 9999
+	}
+	attrs.Add(goipp.MakeAttribute("copies-supported", goipp.TagRange, goipp.Range{Lower: 1, Upper: maxCopies}))
 	attrs.Add(goipp.MakeAttribute("copies-default", goipp.TagInteger, goipp.Integer(1)))
+	attrs.Add(goipp.MakeAttribute("job-quota-period", goipp.TagInteger, goipp.Integer(0)))
+	attrs.Add(goipp.MakeAttribute("job-k-limit", goipp.TagInteger, goipp.Integer(0)))
+	attrs.Add(goipp.MakeAttribute("job-page-limit", goipp.TagInteger, goipp.Integer(0)))
 	attrs.Add(makeKeywordsAttr("job-sheets-supported", jobSheetsSupported()))
 	attrs.Add(makeJobSheetsAttr("job-sheets-default", jobSheetsDefault))
 	attrs.Add(makeKeywordsAttr("job-sheets-col-supported", []string{"job-sheets", "media", "media-col"}))
@@ -2670,15 +3115,19 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	attrs.Add(makeKeywordsAttr("page-delivery-supported", []string{"reverse-order", "same-order"}))
 	attrs.Add(makeKeywordsAttr("print-scaling-supported", []string{"auto", "auto-fit", "fill", "fit", "none"}))
 	attrs.Add(makeEnumsAttr("print-quality-supported", caps.printQualitySupported))
-	attrs.Add(goipp.MakeAttribute("print-quality-default", goipp.TagEnum, goipp.Integer(4)))
+	attrs.Add(goipp.MakeAttribute("print-quality-default", goipp.TagEnum, goipp.Integer(printQualityDefault)))
 	attrs.Add(goipp.MakeAttribute("page-ranges-supported", goipp.TagBoolean, goipp.Boolean(true)))
 	attrs.Add(makeEnumsAttr("finishings-supported", finishingsSupported))
 	attrs.Add(goipp.MakeAttribute("finishings-default", goipp.TagEnum, goipp.Integer(finishingsDefault)))
-	attrs.Add(goipp.MakeAttribute("finishings-ready", goipp.TagEnum, goipp.Integer(finishingsDefault)))
+	finishingsReady := uniqueInts(finishingsSupported)
+	if len(finishingsReady) == 0 {
+		finishingsReady = []int{3}
+	}
+	attrs.Add(makeEnumsAttr("finishings-ready", finishingsReady))
 	attrs.Add(makeKeywordsAttr("finishing-template-supported", finishingsTemplates))
 	attrs.Add(makeKeywordsAttr("finishings-col-supported", []string{"finishing-template"}))
-	attrs.Add(makeFinishingsColAttr("finishings-col-default", []int{finishingsDefault}))
-	attrs.Add(makeFinishingsColAttr("finishings-col-ready", []int{finishingsDefault}))
+	attrs.Add(makeFinishingsColAttrWithTemplate("finishings-col-default", templateDefault))
+	attrs.Add(makeFinishingsColDatabaseFromTemplates("finishings-col-ready", finishingsTemplates))
 	attrs.Add(makeIntsAttr("number-up-supported", []int{1, 2, 4, 6, 9, 16}))
 	attrs.Add(goipp.MakeAttribute("number-up-default", goipp.TagInteger, goipp.Integer(1)))
 	attrs.Add(makeKeywordsAttr("number-up-layout-supported", []string{
@@ -2707,6 +3156,25 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 		"output-bin", "page-delivery", "page-ranges", "print-color-mode", "print-quality",
 		"print-scaling", "printer-resolution", "sides",
 	}))
+	if ppd != nil && len(ppd.Mandatory) > 0 {
+		mandatory := make([]string, 0, len(ppd.Mandatory))
+		seen := map[string]bool{}
+		for _, m := range ppd.Mandatory {
+			m = strings.TrimSpace(m)
+			if m == "" {
+				continue
+			}
+			key := strings.ToLower(m)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			mandatory = append(mandatory, m)
+		}
+		if len(mandatory) > 0 {
+			attrs.Add(makeKeywordsAttr("printer-mandatory-job-attributes", mandatory))
+		}
+	}
 	attrs.Add(makeKeywordsAttr("printer-settable-attributes-supported", []string{
 		"printer-geo-location", "printer-info", "printer-location", "printer-organization",
 		"printer-organizational-unit",
@@ -2723,6 +3191,15 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	attrs.Add(goipp.MakeAttribute("printer-op-policy", goipp.TagName, goipp.String(opPolicyDefault)))
 	attrs.Add(makeNamesAttr("port-monitor-supported", portMonitors))
 	attrs.Add(goipp.MakeAttribute("port-monitor", goipp.TagName, goipp.String(portMonitorDefault)))
+	allowed, denied := loadUserAccessLists(ctx, st, "printer."+strconv.FormatInt(printer.ID, 10))
+	if len(allowed) > 0 {
+		attrs.Add(makeNamesAttr("requesting-user-name-allowed", allowed))
+	} else if len(denied) > 0 {
+		attrs.Add(makeNamesAttr("requesting-user-name-denied", denied))
+	}
+	if len(authInfo) > 0 {
+		attrs.Add(makeKeywordsAttr("auth-info-required", authInfo))
+	}
 	attrs.Add(goipp.MakeAttribute("job-cancel-after-supported", goipp.TagRange, goipp.Range{Lower: 0, Upper: 2147483647}))
 	attrs.Add(goipp.MakeAttribute("job-cancel-after-default", goipp.TagInteger, goipp.Integer(0)))
 	attrs.Add(goipp.MakeAttribute("jpeg-k-octets-supported", goipp.TagRange, goipp.Range{Lower: 0, Upper: 2147483647}))
@@ -2737,7 +3214,17 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	attrs.Add(makeTextsAttr("marker-message", []string{markerMsg}))
 	attrs.Add(makeStringsAttr("printer-supply", supplyVals))
 	attrs.Add(makeTextsAttr("printer-supply-description", supplyDesc))
-	attrs.Add(makeJobPresetsSupportedAttr())
+	if presetAttr, ok := makeJobPresetsSupportedAttr(ppd); ok {
+		attrs.Add(presetAttr)
+	}
+	ppm := 1
+	if ppd != nil && ppd.Throughput > 0 {
+		ppm = ppd.Throughput
+	}
+	attrs.Add(goipp.MakeAttribute("pages-per-minute", goipp.TagInteger, goipp.Integer(ppm)))
+	if (ppd != nil && ppd.ColorDevice) || (ppd == nil && colorSupported) {
+		attrs.Add(goipp.MakeAttribute("pages-per-minute-color", goipp.TagInteger, goipp.Integer(ppm)))
+	}
 	attrs.Add(makeKeywordsAttr("which-jobs-supported", []string{
 		"completed", "not-completed", "aborted", "all", "canceled", "pending", "pending-held",
 		"processing", "processing-stopped",
@@ -2803,29 +3290,59 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	attrs.Add(goipp.MakeAttribute("printer-resolution-default", goipp.TagResolution, resDefault))
 	attrs.Add(makeKeywordsAttr("output-bin-supported", outputBins))
 	attrs.Add(goipp.MakeAttribute("output-bin-default", goipp.TagKeyword, goipp.String(outputBinDefault)))
-	attrs.Add(makeFinishingsColDatabaseAttr("finishings-col-database", finishingsSupported))
+	if len(caps.finishingTemplates) > 0 {
+		attrs.Add(makeFinishingsColDatabaseFromTemplates("finishings-col-database", caps.finishingTemplates))
+	} else {
+		attrs.Add(makeFinishingsColDatabaseAttr("finishings-col-database", finishingsSupported))
+	}
 	attrs.Add(makeKeywordsAttr("urf-supported", urfSupported(resolutions, colorModes, sidesSupported, finishingsSupported, caps.printQualitySupported)))
 	return filterAttributesForRequest(attrs, req)
 }
 
-func buildClassAttributes(class model.Class, r *http.Request) goipp.Attributes {
+func buildClassAttributes(ctx context.Context, class model.Class, r *http.Request, st *store.Store, authInfo []string) goipp.Attributes {
 	uri := classURIFor(class, r)
 	attrs := goipp.Attributes{}
 	attrs.Add(goipp.MakeAttribute("printer-name", goipp.TagName, goipp.String(class.Name)))
 	attrs.Add(goipp.MakeAttribute("printer-uri-supported", goipp.TagURI, goipp.String(uri)))
 	attrs.Add(goipp.MakeAttribute("printer-state", goipp.TagEnum, goipp.Integer(class.State)))
 	attrs.Add(goipp.MakeAttribute("printer-is-accepting-jobs", goipp.TagBoolean, goipp.Boolean(class.Accepting)))
-	attrs.Add(goipp.MakeAttribute("printer-state-reasons", goipp.TagKeyword, goipp.String(printerStateReason(model.Printer{Accepting: class.Accepting}))))
+	stateReason := printerStateReason(model.Printer{Accepting: class.Accepting})
+	attrs.Add(goipp.MakeAttribute("printer-state-reasons", goipp.TagKeyword, goipp.String(stateReason)))
+	attrs.Add(goipp.MakeAttribute("printer-state-message", goipp.TagText, goipp.String(stateReason)))
+	stateChange := class.UpdatedAt
+	if stateChange.IsZero() {
+		stateChange = time.Now()
+	}
+	attrs.Add(goipp.MakeAttribute("printer-state-change-time", goipp.TagInteger, goipp.Integer(stateChange.Unix())))
 	if class.Location != "" {
 		attrs.Add(goipp.MakeAttribute("printer-location", goipp.TagText, goipp.String(class.Location)))
 	}
 	if class.Info != "" {
 		attrs.Add(goipp.MakeAttribute("printer-info", goipp.TagText, goipp.String(class.Info)))
 	}
+	attrs.Add(goipp.MakeAttribute("document-charset-default", goipp.TagCharset, goipp.String("utf-8")))
+	attrs.Add(makeCharsetsAttr("document-charset-supported", []string{"us-ascii", "utf-8"}))
+	attrs.Add(goipp.MakeAttribute("document-natural-language-default", goipp.TagLanguage, goipp.String("en")))
+	attrs.Add(goipp.MakeAttribute("document-natural-language-supported", goipp.TagLanguage, goipp.String("en")))
+	attrs.Add(goipp.MakeAttribute("charset-configured", goipp.TagCharset, goipp.String("utf-8")))
 	attrs.Add(makeCharsetsAttr("charset-supported", []string{"us-ascii", "utf-8"}))
+	attrs.Add(goipp.MakeAttribute("natural-language-configured", goipp.TagLanguage, goipp.String("en-US")))
 	attrs.Add(goipp.MakeAttribute("natural-language-supported", goipp.TagLanguage, goipp.String("en-US")))
 	attrs.Add(makeMimeTypesAttr("document-format-supported", supportedDocumentFormats()))
-	attrs.Add(goipp.MakeAttribute("printer-make-and-model", goipp.TagText, goipp.String("CUPS-Golang")))
+	attrs.Add(goipp.MakeAttribute("document-format-default", goipp.TagMimeType, goipp.String("application/octet-stream")))
+	attrs.Add(goipp.MakeAttribute("document-format-preferred", goipp.TagMimeType, goipp.String("application/octet-stream")))
+	attrs.Add(makeKeywordsAttr("ipp-versions-supported", []string{"1.0", "1.1", "2.0", "2.1"}))
+	shareServer := sharingEnabled(r, st)
+	attrs.Add(goipp.MakeAttribute("printer-make-and-model", goipp.TagText, goipp.String("Local Printer Class")))
+	attrs.Add(goipp.MakeAttribute("printer-type", goipp.TagInteger, goipp.Integer(computeClassType(class, shareServer, authInfo))))
+	attrs.Add(goipp.MakeAttribute("printer-is-shared", goipp.TagBoolean, goipp.Boolean(shareServer)))
+	attrs.Add(goipp.MakeAttribute("server-is-sharing-printers", goipp.TagBoolean, goipp.Boolean(shareServer)))
+	attrs.Add(goipp.MakeAttribute("device-uri", goipp.TagURI, goipp.String("file:///dev/null")))
+	attrs.Add(goipp.MakeAttribute("printer-up-time", goipp.TagInteger, goipp.Integer(time.Now().Unix())))
+	attrs.Add(goipp.MakeAttribute("queued-job-count", goipp.TagInteger, goipp.Integer(0)))
+	attrs.Add(goipp.MakeAttribute("printer-uuid", goipp.TagURI, goipp.String("urn:uuid:00000000-0000-0000-0000-000000000000")))
+	attrs.Add(goipp.MakeAttribute("printer-id", goipp.TagInteger, goipp.Integer(class.ID)))
+	attrs.Add(goipp.MakeAttribute("cups-version", goipp.TagText, goipp.String("2.4.16")))
 	attrs.Add(makeEnumsAttr("operations-supported", supportedOperations()))
 	defaultOpts := parseJobOptions(class.DefaultOptions)
 	errorPolicies := printerErrorPolicySupported(true)
@@ -2844,6 +3361,18 @@ func buildClassAttributes(class model.Class, r *http.Request) goipp.Attributes {
 	if jobSheetsDefault == "" {
 		jobSheetsDefault = "none"
 	}
+	allowed, denied := loadUserAccessLists(ctx, st, "class."+strconv.FormatInt(class.ID, 10))
+	if len(allowed) > 0 {
+		attrs.Add(makeNamesAttr("requesting-user-name-allowed", allowed))
+	} else if len(denied) > 0 {
+		attrs.Add(makeNamesAttr("requesting-user-name-denied", denied))
+	}
+	if len(authInfo) > 0 {
+		attrs.Add(makeKeywordsAttr("auth-info-required", authInfo))
+	}
+	attrs.Add(goipp.MakeAttribute("job-quota-period", goipp.TagInteger, goipp.Integer(0)))
+	attrs.Add(goipp.MakeAttribute("job-k-limit", goipp.TagInteger, goipp.Integer(0)))
+	attrs.Add(goipp.MakeAttribute("job-page-limit", goipp.TagInteger, goipp.Integer(0)))
 	attrs.Add(makeKeywordsAttr("job-sheets-supported", jobSheetsSupported()))
 	attrs.Add(makeJobSheetsAttr("job-sheets-default", jobSheetsDefault))
 	attrs.Add(makeKeywordsAttr("job-sheets-col-supported", []string{"job-sheets", "media", "media-col"}))
@@ -2851,8 +3380,8 @@ func buildClassAttributes(class model.Class, r *http.Request) goipp.Attributes {
 	return attrs
 }
 
-func classAttributesWithMembers(class model.Class, members []model.Printer, r *http.Request, req *goipp.Message) goipp.Attributes {
-	attrs := buildClassAttributes(class, r)
+func classAttributesWithMembers(ctx context.Context, class model.Class, members []model.Printer, r *http.Request, req *goipp.Message, st *store.Store, authInfo []string) goipp.Attributes {
+	attrs := buildClassAttributes(ctx, class, r, st, authInfo)
 	if len(members) > 0 {
 		names := make([]string, 0, len(members))
 		uris := make([]string, 0, len(members))
@@ -2924,13 +3453,13 @@ func buildSubscriptionAttributes(sub model.Subscription, r *http.Request, s *Ser
 	return filterAttributesForRequest(attrs, req)
 }
 
-func addJobAttributes(resp *goipp.Message, job model.Job, printer model.Printer, r *http.Request, doc model.Document, req *goipp.Message) {
-	for _, attr := range buildJobAttributes(job, printer, r, doc, req) {
+func addJobAttributes(resp *goipp.Message, job model.Job, printer model.Printer, r *http.Request, doc model.Document, docCount int, req *goipp.Message) {
+	for _, attr := range buildJobAttributes(job, printer, r, doc, docCount, req) {
 		resp.Job.Add(attr)
 	}
 }
 
-func buildJobAttributes(job model.Job, printer model.Printer, r *http.Request, doc model.Document, req *goipp.Message) goipp.Attributes {
+func buildJobAttributes(job model.Job, printer model.Printer, r *http.Request, doc model.Document, docCount int, req *goipp.Message) goipp.Attributes {
 	jobURI := jobURIFor(job, r)
 	attrs := goipp.Attributes{}
 	attrs.Add(goipp.MakeAttribute("job-id", goipp.TagInteger, goipp.Integer(job.ID)))
@@ -2944,21 +3473,55 @@ func buildJobAttributes(job model.Job, printer model.Printer, r *http.Request, d
 	attrs.Add(goipp.MakeAttribute("job-state-reasons", goipp.TagKeyword, goipp.String(stateReason)))
 	attrs.Add(goipp.MakeAttribute("job-state-message", goipp.TagText, goipp.String(stateReason)))
 	attrs.Add(goipp.MakeAttribute("job-originating-user-name", goipp.TagName, goipp.String(job.UserName)))
-	if r != nil && r.RemoteAddr != "" {
-		host := r.RemoteAddr
-		if h, _, err := net.SplitHostPort(host); err == nil {
-			host = h
-		}
+	if strings.TrimSpace(job.UserName) != "" {
+		attrs.Add(goipp.MakeAttribute("job-originating-user-uri", goipp.TagURI, goipp.String("urn:sub:"+job.UserName)))
+	} else {
+		attrs.Add(goipp.MakeAttribute("job-originating-user-uri", goipp.TagURI, goipp.String("urn:sub:anonymous")))
+	}
+	host := strings.TrimSpace(job.OriginHost)
+	if host == "" {
+		host = requestHost(r)
+	}
+	if host != "" {
 		attrs.Add(goipp.MakeAttribute("job-originating-host-name", goipp.TagName, goipp.String(host)))
 	}
 	attrs.Add(goipp.MakeAttribute("job-printer-uri", goipp.TagURI, goipp.String(printerURIFor(printer, r))))
 	attrs.Add(goipp.MakeAttribute("job-printer-name", goipp.TagName, goipp.String(printer.Name)))
+	attrs.Add(goipp.MakeAttribute("job-printer-up-time", goipp.TagInteger, goipp.Integer(time.Now().Unix())))
 	attrs.Add(goipp.MakeAttribute("time-at-creation", goipp.TagInteger, goipp.Integer(job.SubmittedAt.Unix())))
-	attrs.Add(goipp.MakeAttribute("time-at-processing", goipp.TagInteger, goipp.Integer(job.SubmittedAt.Unix())))
+	attrs.Add(goipp.MakeAttribute("date-time-at-creation", goipp.TagDateTime, goipp.Time{job.SubmittedAt}))
+	if job.State >= 5 && job.ProcessingAt != nil {
+		attrs.Add(goipp.MakeAttribute("date-time-at-processing", goipp.TagDateTime, goipp.Time{*job.ProcessingAt}))
+		attrs.Add(goipp.MakeAttribute("time-at-processing", goipp.TagInteger, goipp.Integer(job.ProcessingAt.Unix())))
+	} else {
+		attrs.Add(goipp.MakeAttribute("date-time-at-processing", goipp.TagNoValue, goipp.Void{}))
+		attrs.Add(goipp.MakeAttribute("time-at-processing", goipp.TagNoValue, goipp.Void{}))
+	}
 	attrs.Add(goipp.MakeAttribute("job-impressions", goipp.TagInteger, goipp.Integer(job.Impressions)))
 	attrs.Add(goipp.MakeAttribute("job-impressions-completed", goipp.TagInteger, goipp.Integer(job.Impressions)))
 	if job.CompletedAt != nil {
+		attrs.Add(goipp.MakeAttribute("date-time-at-completed", goipp.TagDateTime, goipp.Time{*job.CompletedAt}))
 		attrs.Add(goipp.MakeAttribute("time-at-completed", goipp.TagInteger, goipp.Integer(job.CompletedAt.Unix())))
+	} else {
+		attrs.Add(goipp.MakeAttribute("date-time-at-completed", goipp.TagNoValue, goipp.Void{}))
+		attrs.Add(goipp.MakeAttribute("time-at-completed", goipp.TagNoValue, goipp.Void{}))
+	}
+	kOctets := int64(0)
+	if doc.SizeBytes > 0 {
+		kOctets = (doc.SizeBytes + 1023) / 1024
+	}
+	attrs.Add(goipp.MakeAttribute("job-k-octets", goipp.TagInteger, goipp.Integer(kOctets)))
+	if job.CompletedAt != nil || job.State >= 7 {
+		attrs.Add(goipp.MakeAttribute("job-k-octets-completed", goipp.TagInteger, goipp.Integer(kOctets)))
+	} else {
+		attrs.Add(goipp.MakeAttribute("job-k-octets-completed", goipp.TagInteger, goipp.Integer(0)))
+	}
+	if job.CompletedAt != nil || job.State >= 5 {
+		attrs.Add(goipp.MakeAttribute("job-pages-completed", goipp.TagInteger, goipp.Integer(job.Impressions)))
+		attrs.Add(goipp.MakeAttribute("job-media-sheets-completed", goipp.TagInteger, goipp.Integer(job.Impressions)))
+	} else {
+		attrs.Add(goipp.MakeAttribute("job-pages-completed", goipp.TagInteger, goipp.Integer(0)))
+		attrs.Add(goipp.MakeAttribute("job-media-sheets-completed", goipp.TagInteger, goipp.Integer(0)))
 	}
 	if priority := getJobOption(job.Options, "job-priority"); priority != "" {
 		if n, err := strconv.Atoi(priority); err == nil {
@@ -2969,6 +3532,9 @@ func buildJobAttributes(job model.Job, printer model.Printer, r *http.Request, d
 	}
 	if account := getJobOption(job.Options, "job-account-id"); account != "" {
 		attrs.Add(goipp.MakeAttribute("job-account-id", goipp.TagName, goipp.String(account)))
+	}
+	if accountUser := getJobOption(job.Options, "job-accounting-user-id"); accountUser != "" {
+		attrs.Add(goipp.MakeAttribute("job-accounting-user-id", goipp.TagName, goipp.String(accountUser)))
 	}
 	if holdUntil := getJobOption(job.Options, "job-hold-until"); holdUntil != "" {
 		attrs.Add(goipp.MakeAttribute("job-hold-until", goipp.TagKeyword, goipp.String(holdUntil)))
@@ -3069,8 +3635,8 @@ func buildJobAttributes(job model.Job, printer model.Printer, r *http.Request, d
 		attrs.Add(goipp.MakeAttribute("output-bin", goipp.TagKeyword, goipp.String(bin)))
 	}
 	if ranges := getJobOption(job.Options, "page-ranges"); ranges != "" {
-		if r, ok := parsePageRanges(ranges); ok {
-			attrs.Add(goipp.MakeAttribute("page-ranges", goipp.TagRange, r))
+		if parsed, ok := parsePageRangesList(ranges); ok {
+			attrs.Add(makePageRangesAttr("page-ranges", parsed))
 		}
 	}
 	if colorMode := getJobOption(job.Options, "print-color-mode"); colorMode != "" {
@@ -3079,11 +3645,10 @@ func buildJobAttributes(job model.Job, printer model.Printer, r *http.Request, d
 	if raster := getJobOption(job.Options, "print-as-raster"); raster != "" {
 		attrs.Add(goipp.MakeAttribute("print-as-raster", goipp.TagBoolean, goipp.Boolean(isTruthy(raster))))
 	}
-	if doc.ID != 0 {
-		attrs.Add(goipp.MakeAttribute("number-of-documents", goipp.TagInteger, goipp.Integer(1)))
-		attrs.Add(goipp.MakeAttribute("document-format", goipp.TagMimeType, goipp.String(doc.MimeType)))
-		if doc.SizeBytes > 0 {
-			attrs.Add(goipp.MakeAttribute("job-k-octets", goipp.TagInteger, goipp.Integer((doc.SizeBytes+1023)/1024)))
+	attrs.Add(goipp.MakeAttribute("number-of-documents", goipp.TagInteger, goipp.Integer(docCount)))
+	if docCount <= 1 {
+		if mime := strings.TrimSpace(doc.MimeType); mime != "" {
+			attrs.Add(goipp.MakeAttribute("document-format", goipp.TagMimeType, goipp.String(mime)))
 		}
 	}
 	return filterAttributesForRequest(attrs, req)
@@ -3337,6 +3902,237 @@ func requestingUserName(req *goipp.Message, r *http.Request) string {
 	return name
 }
 
+func requestUserForFilter(r *http.Request, req *goipp.Message) string {
+	if r != nil {
+		if user, _, ok := r.BasicAuth(); ok && strings.TrimSpace(user) != "" {
+			return strings.TrimSpace(user)
+		}
+	}
+	if req != nil {
+		if val, ok := attrValue(req.Operation, "requesting-user-name"); ok {
+			return strings.TrimSpace(val)
+		}
+	}
+	return ""
+}
+
+func authInfoRequiredForRequest(s *Server, r *http.Request) []string {
+	if s == nil || r == nil {
+		return nil
+	}
+	authType := s.authTypeForRequest(r, goipp.OpPrintJob.String())
+	if authType == "" {
+		authType = s.authTypeForRequest(r, goipp.OpCreateJob.String())
+	}
+	return authInfoRequiredFromAuthType(authType)
+}
+
+func authInfoRequiredFromAuthType(authType string) []string {
+	switch strings.ToLower(strings.TrimSpace(authType)) {
+	case "", "none":
+		return nil
+	case "negotiate", "kerberos":
+		return []string{"negotiate"}
+	case "domain":
+		return []string{"domain", "username", "password"}
+	case "basic", "digest":
+		return []string{"username", "password"}
+	default:
+		return []string{"username", "password"}
+	}
+}
+
+func authInfoFromRequest(req *goipp.Message) []string {
+	if req == nil {
+		return nil
+	}
+	if vals := attrStrings(req.Job, "auth-info"); len(vals) > 0 {
+		return vals
+	}
+	if vals := attrStrings(req.Operation, "auth-info"); len(vals) > 0 {
+		return vals
+	}
+	if vals := attrStrings(req.Printer, "auth-info"); len(vals) > 0 {
+		return vals
+	}
+	if vals := attrStrings(req.Subscription, "auth-info"); len(vals) > 0 {
+		return vals
+	}
+	return nil
+}
+
+func stripReadOnlyJobAttributes(req *goipp.Message) {
+	if req == nil {
+		return
+	}
+	filter := func(attrs goipp.Attributes) goipp.Attributes {
+		if len(attrs) == 0 {
+			return attrs
+		}
+		out := make(goipp.Attributes, 0, len(attrs))
+		for _, attr := range attrs {
+			if readOnlyJobAttrs[strings.ToLower(attr.Name)] {
+				continue
+			}
+			out = append(out, attr)
+		}
+		return out
+	}
+	req.Job = filter(req.Job)
+	req.Operation = filter(req.Operation)
+}
+
+func sanitizeJobName(req *goipp.Message) string {
+	if req == nil {
+		return "Untitled"
+	}
+	if name, found, valid := jobNameFromGroup(&req.Job); found {
+		if valid {
+			return name
+		}
+		return "Untitled"
+	}
+	if name, found, valid := jobNameFromGroup(&req.Operation); found {
+		if valid {
+			return name
+		}
+		return "Untitled"
+	}
+	return "Untitled"
+}
+
+func jobNameFromGroup(attrs *goipp.Attributes) (string, bool, bool) {
+	if attrs == nil {
+		return "", false, false
+	}
+	for i, attr := range *attrs {
+		if !strings.EqualFold(attr.Name, "job-name") {
+			continue
+		}
+		if len(attr.Values) != 1 {
+			*attrs = append((*attrs)[:i], (*attrs)[i+1:]...)
+			return "", true, false
+		}
+		tag := attr.Values[0].T
+		if tag != goipp.TagName && tag != goipp.TagNameLang {
+			*attrs = append((*attrs)[:i], (*attrs)[i+1:]...)
+			return "", true, false
+		}
+		name := strings.TrimSpace(attr.Values[0].V.String())
+		if name == "" || !utf8.ValidString(name) {
+			*attrs = append((*attrs)[:i], (*attrs)[i+1:]...)
+			return "", true, false
+		}
+		return name, true, true
+	}
+	return "", false, false
+}
+
+func jobOriginatingHostFromRequest(r *http.Request, req *goipp.Message) string {
+	host := requestHost(r)
+	local := isLocalRequest(r)
+	if req == nil {
+		return host
+	}
+	if value, found, valid := jobOriginatingHostFromGroup(&req.Job, local); found {
+		if valid {
+			return value
+		}
+		return host
+	}
+	if value, found, valid := jobOriginatingHostFromGroup(&req.Operation, local); found {
+		if valid {
+			return value
+		}
+		return host
+	}
+	return host
+}
+
+func jobOriginatingHostFromGroup(attrs *goipp.Attributes, local bool) (string, bool, bool) {
+	if attrs == nil {
+		return "", false, false
+	}
+	for i, attr := range *attrs {
+		if !strings.EqualFold(attr.Name, "job-originating-host-name") {
+			continue
+		}
+		*attrs = append((*attrs)[:i], (*attrs)[i+1:]...)
+		if len(attr.Values) != 1 || attr.Values[0].T != goipp.TagName || !local {
+			return "", true, false
+		}
+		value := strings.TrimSpace(attr.Values[0].V.String())
+		if value == "" || !utf8.ValidString(value) {
+			return "", true, false
+		}
+		return value, true, true
+	}
+	return "", false, false
+}
+
+func requestHost(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if isLocalRequest(r) {
+		return "localhost"
+	}
+	return strings.TrimSpace(host)
+}
+
+func compressionFromRequest(req *goipp.Message) (string, error) {
+	if req == nil {
+		return "", nil
+	}
+	for _, group := range []goipp.Attributes{req.Operation, req.Job} {
+		for _, attr := range group {
+			if !strings.EqualFold(attr.Name, "compression") {
+				continue
+			}
+			if len(attr.Values) == 0 {
+				return "", errBadRequest
+			}
+			if len(attr.Values) > 1 {
+				return "", errBadRequest
+			}
+			value := strings.ToLower(strings.TrimSpace(attr.Values[0].V.String()))
+			switch value {
+			case "", "none":
+				return "none", nil
+			case "gzip":
+				return "gzip", nil
+			default:
+				return "", errUnsupported
+			}
+		}
+	}
+	return "", nil
+}
+
+func (s *Server) enforceAuthInfo(r *http.Request, req *goipp.Message, op goipp.Op) error {
+	if s == nil || r == nil || req == nil {
+		return nil
+	}
+	authInfo := authInfoFromRequest(req)
+	if len(authInfo) > 0 && r.TLS == nil && !isLocalRequest(r) {
+		return &ippHTTPError{status: http.StatusUpgradeRequired}
+	}
+	required := authInfoRequiredForRequest(s, r)
+	if len(required) == 1 && strings.EqualFold(required[0], "negotiate") {
+		if _, ok := s.authenticate(r, ""); !ok {
+			return &ippHTTPError{
+				status:   http.StatusUnauthorized,
+				authType: s.authTypeForRequest(r, op.String()),
+			}
+		}
+	}
+	return nil
+}
+
 func serializeJobOptions(req *goipp.Message, printer model.Printer) string {
 	opts := collectJobOptions(req)
 	ppd, _ := loadPPDForPrinter(printer)
@@ -3419,6 +4215,14 @@ func collectJobOptions(req *goipp.Message) map[string]string {
 			}
 			if attr.Name == "print-as-raster" {
 				opts["print-as-raster"] = attr.Values[0].V.String()
+				continue
+			}
+			if attr.Name == "print-quality" {
+				if n, ok := parsePrintQualityValue(attr.Values[0].V.String()); ok {
+					opts["print-quality"] = strconv.Itoa(n)
+				} else {
+					opts["print-quality"] = attr.Values[0].V.String()
+				}
 				continue
 			}
 			if allowAll || strings.HasPrefix(attr.Name, "job-") || attr.Name == "sides" || attr.Name == "media" ||
@@ -3521,18 +4325,32 @@ func collectJobOptionUpdates(req *goipp.Message) (map[string]string, *string) {
 						updates["media-source"] = v
 					}
 				}
-			case "page-ranges":
-				if r, ok := attr.Values[0].V.(goipp.Range); ok {
-					if r.Lower > 0 {
-						if r.Upper > r.Lower {
-							updates["page-ranges"] = fmt.Sprintf("%d-%d", r.Lower, r.Upper)
-						} else {
-							updates["page-ranges"] = fmt.Sprintf("%d", r.Lower)
-						}
+		case "page-ranges":
+			if len(attr.Values) == 0 {
+				break
+			}
+			if _, ok := attr.Values[0].V.(goipp.Range); ok {
+				parts := []string{}
+				for _, v := range attr.Values {
+					r, ok := v.V.(goipp.Range)
+					if !ok {
+						continue
 					}
-				} else {
-					updates["page-ranges"] = attr.Values[0].V.String()
+					if r.Lower <= 0 {
+						continue
+					}
+					if r.Upper > r.Lower {
+						parts = append(parts, fmt.Sprintf("%d-%d", r.Lower, r.Upper))
+					} else {
+						parts = append(parts, fmt.Sprintf("%d", r.Lower))
+					}
 				}
+				if len(parts) > 0 {
+					updates["page-ranges"] = strings.Join(parts, ",")
+				}
+			} else {
+				updates["page-ranges"] = attr.Values[0].V.String()
+			}
 			default:
 				switch attr.Name {
 				case "copies", "finishings", "job-hold-until", "job-priority", "media", "media-type", "media-source", "multiple-document-handling",
@@ -3739,6 +4557,9 @@ type printerCaps struct {
 	jobHoldUntilSupported             []string
 	multipleDocumentHandlingSupported []string
 	jobSheetsSupported                []string
+	maxCopies                         int
+	finishingTemplates                []string
+	finishingTemplateDefault          string
 }
 
 type mediaSize struct {
@@ -3880,7 +4701,7 @@ func computePrinterCaps(ppd *config.PPD, defaultOpts map[string]string) printerC
 		outputBins:                        []string{"face-up"},
 		outputBinDefault:                  "face-up",
 		finishingsSupported:               []int{3},
-		printQualitySupported:             []int{3, 4, 5},
+		printQualitySupported:             []int{4},
 		numberUpSupported:                 []int{1, 2, 4, 6, 9, 16},
 		orientationSupported:              []int{3, 4, 5, 6},
 		pageDeliverySupported:             []string{"reverse-order", "same-order"},
@@ -3888,6 +4709,7 @@ func computePrinterCaps(ppd *config.PPD, defaultOpts map[string]string) printerC
 		jobHoldUntilSupported:             []string{"no-hold", "indefinite", "day-time", "evening", "night", "second-shift", "third-shift", "weekend"},
 		multipleDocumentHandlingSupported: []string{"separate-documents-uncollated-copies", "separate-documents-collated-copies"},
 		jobSheetsSupported:                jobSheetsSupported(),
+		maxCopies:                         9999,
 	}
 	defaultOpts = mapJobOptionsToPWG(defaultOpts, ppd)
 	caps.resDefault = caps.resolutions[0]
@@ -3895,8 +4717,15 @@ func computePrinterCaps(ppd *config.PPD, defaultOpts map[string]string) printerC
 	if len(caps.finishingsSupported) == 0 {
 		caps.finishingsSupported = []int{3}
 	}
+	caps.finishingTemplates, caps.finishingTemplateDefault = finishingsTemplatesFromPPD(ppd)
+	caps.printQualitySupported = printQualitySupportedFromPPD(ppd)
 
 	if ppd != nil {
+		if ppd.MaxCopies > 0 {
+			caps.maxCopies = ppd.MaxCopies
+		} else if ppd.ManualCopies {
+			caps.maxCopies = 1
+		}
 		if opts, ok := ppd.Options["PageSize"]; ok && len(opts) > 0 {
 			mapped := make([]string, 0, len(opts))
 			seen := map[string]bool{}
@@ -4031,7 +4860,13 @@ func computePrinterCaps(ppd *config.PPD, defaultOpts map[string]string) printerC
 		}
 		if ppd.ColorDevice || hasColorOptions(ppd) {
 			caps.colorModes = []string{"monochrome", "color"}
-			if ppd.DefaultColorSpace != "" && !strings.Contains(strings.ToLower(ppd.DefaultColorSpace), "gray") {
+			if ppd.DefaultColorSpace != "" {
+				if !strings.Contains(strings.ToLower(ppd.DefaultColorSpace), "gray") {
+					caps.colorDefault = "color"
+				} else {
+					caps.colorDefault = "monochrome"
+				}
+			} else if ppd.ColorDevice {
 				caps.colorDefault = "color"
 			}
 			caps.rasterTypes = []string{"black_1", "sgray_8", "srgb_8"}
@@ -4104,6 +4939,24 @@ func computePrinterCaps(ppd *config.PPD, defaultOpts map[string]string) printerC
 		}
 	}
 
+	if isCustomSizeName(caps.mediaDefault) {
+		key := strings.ToLower(strings.TrimSpace(caps.mediaDefault))
+		if key != "" {
+			if _, ok := caps.mediaSizes[key]; !ok {
+				if size, ok := parseCustomMediaSize(caps.mediaDefault); ok {
+					caps.mediaSizes[key] = mediaSize{
+						X:      size.X,
+						Y:      size.Y,
+						Left:   caps.mediaCustomRange.Margins[0],
+						Bottom: caps.mediaCustomRange.Margins[1],
+						Right:  caps.mediaCustomRange.Margins[2],
+						Top:    caps.mediaCustomRange.Margins[3],
+					}
+				}
+			}
+		}
+	}
+
 	caps.mediaSupported = ensureStringInList(caps.mediaSupported, caps.mediaDefault)
 	caps.mediaSources = ensureStringInList(caps.mediaSources, caps.mediaSourceDefault)
 	caps.mediaTypes = ensureStringInList(caps.mediaTypes, caps.mediaTypeDefault)
@@ -4126,6 +4979,160 @@ func ensureStringInList(values []string, value string) []string {
 		}
 	}
 	return append(values, value)
+}
+
+func computePrinterType(printer model.Printer, caps printerCaps, ppd *config.PPD, isClass bool, authInfo []string) int {
+	typ := 0
+	if isClass {
+		typ |= cupsPTypeClass
+	} else {
+		typ |= cupsPTypeBW
+		if isColorModeSupported(caps.colorModes) {
+			typ |= cupsPTypeColor
+		}
+		if supportsDuplex(caps.sidesSupported) {
+			typ |= cupsPTypeDuplex
+		}
+		if ppd == nil || !ppd.ManualCopies {
+			if caps.maxCopies > 1 {
+				typ |= cupsPTypeCopies
+			}
+		}
+		if caps.mediaCustomRange.MinW > 0 || caps.mediaCustomRange.MaxW > 0 {
+			typ |= cupsPTypeVariable
+		}
+		if sizeBits := mediaSizeBits(caps.mediaSizes); sizeBits != 0 {
+			typ |= sizeBits
+		}
+		if finishingsHasPrefix(caps.finishingsSupported, "staple") {
+			typ |= cupsPTypeStaple
+		}
+		if finishingsHasPrefix(caps.finishingsSupported, "punch") {
+			typ |= cupsPTypePunch
+		}
+		if finishingsHasPrefix(caps.finishingsSupported, "cover") {
+			typ |= cupsPTypeCover
+		}
+		if finishingsHasPrefix(caps.finishingsSupported, "bind") {
+			typ |= cupsPTypeBind
+		}
+		if finishingsHasPrefix(caps.finishingsSupported, "fold") {
+			typ |= cupsPTypeFold
+		}
+		if ppd != nil {
+			if hasCommandFilter(ppd.Filters) {
+				typ |= cupsPTypeCommands
+			}
+			if ppd.APICADriver {
+				if ppd.APScannerOnly {
+					typ |= cupsPTypeScanner
+				} else {
+					typ |= cupsPTypeMFP
+				}
+			}
+		}
+	}
+	if printer.IsDefault {
+		typ |= cupsPTypeDefault
+	}
+	if !printer.Accepting {
+		typ |= cupsPTypeRejecting
+	}
+	if !isClass && !printer.Shared {
+		typ |= cupsPTypeNotShared
+	}
+	if len(authInfo) > 0 && !(len(authInfo) == 1 && strings.EqualFold(authInfo[0], "none")) {
+		typ |= cupsPTypeAuth
+	}
+	return typ
+}
+
+func computeClassType(class model.Class, shared bool, authInfo []string) int {
+	typ := cupsPTypeClass | cupsPTypeBW
+	if class.IsDefault {
+		typ |= cupsPTypeDefault
+	}
+	if !class.Accepting {
+		typ |= cupsPTypeRejecting
+	}
+	if !shared {
+		typ |= cupsPTypeNotShared
+	}
+	if len(authInfo) > 0 && !(len(authInfo) == 1 && strings.EqualFold(authInfo[0], "none")) {
+		typ |= cupsPTypeAuth
+	}
+	return typ
+}
+
+func isColorModeSupported(modes []string) bool {
+	for _, m := range modes {
+		if strings.EqualFold(m, "color") {
+			return true
+		}
+	}
+	return false
+}
+
+func supportsDuplex(sides []string) bool {
+	for _, s := range sides {
+		if strings.EqualFold(s, "two-sided-long-edge") || strings.EqualFold(s, "two-sided-short-edge") {
+			return true
+		}
+	}
+	return false
+}
+
+func finishingsHasPrefix(values []int, prefix string) bool {
+	for _, v := range values {
+		if name := finishingsEnumToName(v); name != "" && strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func mediaSizeBits(sizes map[string]mediaSize) int {
+	if len(sizes) == 0 {
+		return cupsPTypeSmall
+	}
+	const mediumLen = 35560 // 14 inches in PWG units (1/100 mm)
+	const largeLen = 60960  // 24 inches in PWG units
+	small := false
+	medium := false
+	large := false
+	for _, size := range sizes {
+		length := size.Y
+		if size.X > length {
+			length = size.X
+		}
+		if length > largeLen {
+			large = true
+		} else if length > mediumLen {
+			medium = true
+		} else {
+			small = true
+		}
+	}
+	bits := 0
+	if small {
+		bits |= cupsPTypeSmall
+	}
+	if medium {
+		bits |= cupsPTypeMedium
+	}
+	if large {
+		bits |= cupsPTypeLarge
+	}
+	return bits
+}
+
+func hasCommandFilter(filters []config.PPDFilter) bool {
+	for _, filter := range filters {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(filter.Source)), "application/vnd.cups-command") {
+			return true
+		}
+	}
+	return false
 }
 
 func applyClassDefaultsToPrinter(printer model.Printer, class model.Class) model.Printer {
@@ -4362,7 +5369,7 @@ func validateIppOptions(req *goipp.Message, printer model.Printer) error {
 	}
 	hasAttr := func(attrs goipp.Attributes, name string) bool {
 		for _, attr := range attrs {
-			if attr.Name == name {
+			if strings.EqualFold(attr.Name, name) {
 				return true
 			}
 		}
@@ -4378,12 +5385,32 @@ func validateIppOptions(req *goipp.Message, printer model.Printer) error {
 	if hasFinishings && hasFinishingsCol {
 		return errBadRequest
 	}
+	if _, err := compressionFromRequest(req); err != nil {
+		return err
+	}
 
 	ppd, _ := loadPPDForPrinter(printer)
 	defaultOpts := parseJobOptions(printer.DefaultOptions)
 	caps := computePrinterCaps(ppd, defaultOpts)
-	finishingsTemplates := finishingsTemplatesFromEnums(caps.finishingsSupported)
+	finishingsTemplates := caps.finishingTemplates
+	if len(finishingsTemplates) == 0 {
+		finishingsTemplates = finishingsTemplatesFromEnums(caps.finishingsSupported)
+	}
 	allowCustomMedia := supportsCustomPageSize(ppd)
+	accountSupported := ppd != nil && ppd.JobAccountID
+	accountingUserSupported := ppd != nil && ppd.JobAccountingUser
+	passwordSupported := ppd != nil && strings.TrimSpace(ppd.JobPassword) != ""
+	numberUpLayouts := numberUpLayoutSupported()
+	if ppd != nil && len(ppd.Mandatory) > 0 {
+		for _, mandatory := range ppd.Mandatory {
+			if strings.TrimSpace(mandatory) == "" {
+				continue
+			}
+			if !hasAttr(req.Job, mandatory) && !hasAttr(req.Operation, mandatory) {
+				return errConflicting
+			}
+		}
+	}
 	var sourceMap map[string]string
 	var typeMap map[string]string
 	var binMap map[string]string
@@ -4404,7 +5431,11 @@ func validateIppOptions(req *goipp.Message, printer model.Printer) error {
 			}
 		case "copies":
 			if n, ok := valueInt(attr.Values[0].V); ok {
-				if n < 1 || n > 999 {
+				maxCopies := caps.maxCopies
+				if maxCopies <= 0 {
+					maxCopies = 9999
+				}
+				if n < 1 || n > maxCopies {
 					return errUnsupported
 				}
 			}
@@ -4414,7 +5445,26 @@ func validateIppOptions(req *goipp.Message, printer model.Printer) error {
 					return errUnsupported
 				}
 			}
+		case "job-account-id":
+			if !accountSupported {
+				return errUnsupported
+			}
+		case "job-accounting-user-id":
+			if !accountingUserSupported {
+				return errUnsupported
+			}
+		case "job-password":
+			if !passwordSupported {
+				return errUnsupported
+			}
 		case "job-hold-until":
+			if len(attr.Values) != 1 {
+				return errUnsupported
+			}
+			tag := attr.Values[0].T
+			if tag != goipp.TagKeyword && tag != goipp.TagName && tag != goipp.TagNameLang {
+				return errUnsupported
+			}
 			hold := strings.TrimSpace(attr.Values[0].V.String())
 			if strings.EqualFold(hold, "resume") || strings.EqualFold(hold, "none") {
 				return nil
@@ -4563,6 +5613,12 @@ func validateIppOptions(req *goipp.Message, printer model.Printer) error {
 				if !intInList(n, caps.printQualitySupported) {
 					return errUnsupported
 				}
+			} else if n, ok := parsePrintQualityValue(attr.Values[0].V.String()); ok {
+				if !intInList(n, caps.printQualitySupported) {
+					return errUnsupported
+				}
+			} else {
+				return errUnsupported
 			}
 		case "number-up":
 			if n, ok := valueInt(attr.Values[0].V); ok {
@@ -4570,11 +5626,19 @@ func validateIppOptions(req *goipp.Message, printer model.Printer) error {
 					return errUnsupported
 				}
 			}
+		case "number-up-layout":
+			if !stringInList(attr.Values[0].V.String(), numberUpLayouts) {
+				return errUnsupported
+			}
 		case "orientation-requested":
 			if n, ok := valueInt(attr.Values[0].V); ok {
 				if !intInList(n, caps.orientationSupported) {
 					return errUnsupported
 				}
+			}
+		case "print-as-raster":
+			if !boolStringValid(attr.Values[0].V.String()) {
+				return errUnsupported
 			}
 		case "page-delivery":
 			if !stringInList(attr.Values[0].V.String(), caps.pageDeliverySupported) {
@@ -4589,11 +5653,27 @@ func validateIppOptions(req *goipp.Message, printer model.Printer) error {
 				return errUnsupported
 			}
 		case "page-ranges":
-			if _, ok := attr.Values[0].V.(goipp.Range); ok {
+			ranges := []goipp.Range{}
+			if len(attr.Values) == 0 {
 				return nil
 			}
-			if _, ok := parseRangeValue(attr.Values[0].V.String()); !ok {
-				return errUnsupported
+			if _, ok := attr.Values[0].V.(goipp.Range); ok {
+				for _, v := range attr.Values {
+					r, ok := v.V.(goipp.Range)
+					if !ok {
+						return errUnsupported
+					}
+					ranges = append(ranges, r)
+				}
+			} else {
+				parsed, ok := parsePageRangesList(attr.Values[0].V.String())
+				if !ok {
+					return errUnsupported
+				}
+				ranges = parsed
+			}
+			if !validatePageRanges(ranges) {
+				return errBadRequest
 			}
 		case "number-of-retries", "retry-interval", "retry-time-out", "job-cancel-after":
 			if n, ok := valueInt(attr.Values[0].V); ok {
@@ -4643,6 +5723,15 @@ func validateMediaCol(col goipp.Collection, caps printerCaps, ppd *config.PPD, a
 		y := collectionInt(sizeCol, "y-dimension")
 		if x <= 0 || y <= 0 {
 			return errUnsupported
+		}
+		if matchDimsToSizes(x, y, caps.mediaSizes) == "" && allowCustom {
+			if caps.mediaCustomRange.MinW > 0 && caps.mediaCustomRange.MaxW > 0 &&
+				caps.mediaCustomRange.MinL > 0 && caps.mediaCustomRange.MaxL > 0 {
+				if x < caps.mediaCustomRange.MinW || x > caps.mediaCustomRange.MaxW ||
+					y < caps.mediaCustomRange.MinL || y > caps.mediaCustomRange.MaxL {
+					return errUnsupported
+				}
+			}
 		}
 	}
 	if name := mediaSizeNameFromCollection(col, caps.mediaSizes); name != "" {
@@ -4773,6 +5862,8 @@ func ppdOptionToJobKey(option string) string {
 		return "printer-resolution"
 	case "colormodel", "colormode", "colorspace":
 		return "print-color-mode"
+	case "outputmode", "cupsprintquality":
+		return "print-quality"
 	default:
 		return ""
 	}
@@ -4802,6 +5893,15 @@ func normalizePPDChoice(optionKey, choice string) string {
 			return "monochrome"
 		}
 		return "color"
+	case "print-quality":
+		switch strings.ToLower(c) {
+		case "draft", "fast", "low":
+			return "3"
+		case "high", "best":
+			return "5"
+		case "normal":
+			return "4"
+		}
 	}
 	return c
 }
@@ -4834,17 +5934,42 @@ func validatePPDOptionValues(ppd *config.PPD, opt *config.PPDOption, attr goipp.
 		allowed[strings.ToLower(c)] = true
 	}
 	isPickMany := strings.EqualFold(opt.UI, "pickmany")
-	if !isPickMany && len(attr.Values) > 1 {
-		return errUnsupported
-	}
+	values := []string{}
 	for _, v := range attr.Values {
 		val := strings.TrimSpace(v.V.String())
 		if val == "" {
 			continue
 		}
+		if isPickMany {
+			if looksLikeCustomDict(val) {
+				values = append(values, val)
+				continue
+			}
+			if strings.ContainsAny(val, ",; \t\n\r") {
+				values = append(values, splitList(val)...)
+				continue
+			}
+		}
+		values = append(values, val)
+	}
+	if !isPickMany {
+		if len(attr.Values) > 1 || len(values) > 1 {
+			return errUnsupported
+		}
+	}
+	for _, val := range values {
+		if val == "" {
+			continue
+		}
 		if opt.Custom {
 			lower := strings.ToLower(val)
-			if strings.HasPrefix(lower, "custom") || (strings.HasPrefix(val, "{") && strings.HasSuffix(val, "}")) {
+			if strings.HasPrefix(lower, "custom") || looksLikeCustomDict(val) {
+				if err := validateCustomOptionValue(opt, val); err != nil {
+					return errUnsupported
+				}
+				continue
+			}
+			if strings.EqualFold(val, "custom") {
 				continue
 			}
 		}
@@ -4855,6 +5980,138 @@ func validatePPDOptionValues(ppd *config.PPD, opt *config.PPDOption, attr goipp.
 		}
 	}
 	return nil
+}
+
+func validateCustomOptionValue(opt *config.PPDOption, raw string) error {
+	if opt == nil {
+		return nil
+	}
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return nil
+	}
+	lower := strings.ToLower(value)
+	if strings.EqualFold(lower, "custom") {
+		return nil
+	}
+	isDict := looksLikeCustomDict(value)
+	if !strings.HasPrefix(lower, "custom.") && !isDict {
+		return errUnsupported
+	}
+	if len(opt.CustomParams) == 0 {
+		return errUnsupported
+	}
+	params := parseCustomOptionValue(opt, value)
+	units := strings.TrimSpace(params["Units"])
+	if units == "" {
+		units = "pt"
+	}
+	nonUnits := make([]config.PPDCustomParam, 0, len(opt.CustomParams))
+	for _, p := range opt.CustomParams {
+		if isUnitsParam(p) {
+			continue
+		}
+		nonUnits = append(nonUnits, p)
+	}
+	for _, p := range opt.CustomParams {
+		if isUnitsParam(p) {
+			unitVal := strings.TrimSpace(params[p.Name])
+			if unitVal == "" {
+				unitVal = units
+			}
+			if _, err := normalizeCustomParamValue(p, unitVal); err != nil {
+				return errUnsupported
+			}
+			continue
+		}
+		val := strings.TrimSpace(params[p.Name])
+		if val == "" {
+			if isDict {
+				return errUnsupported
+			}
+			if strings.HasPrefix(lower, "custom.") && len(nonUnits) == 1 {
+				return errUnsupported
+			}
+			continue
+		}
+		if err := validateCustomParamValue(p, val, units); err != nil {
+			return errUnsupported
+		}
+	}
+	return nil
+}
+
+func validateCustomParamValue(param config.PPDCustomParam, raw, units string) error {
+	value := strings.TrimSpace(raw)
+	switch strings.ToLower(param.Type) {
+	case "points":
+		f, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return errUnsupported
+		}
+		points := f
+		if units == "" {
+			units = "pt"
+		}
+		if !strings.EqualFold(units, "pt") {
+			converted, ok := customUnitsToPoints(f, units)
+			if !ok {
+				return errUnsupported
+			}
+			points = converted
+		}
+		if param.Range && (points < param.Min || points > param.Max) {
+			return errUnsupported
+		}
+	case "real", "curve", "invcurve":
+		f, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return errUnsupported
+		}
+		if param.Range && (f < param.Min || f > param.Max) {
+			return errUnsupported
+		}
+	case "int":
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return errUnsupported
+		}
+		if param.Range && (float64(n) < param.Min || float64(n) > param.Max) {
+			return errUnsupported
+		}
+	case "string", "password":
+		if param.Range {
+			l := utf8.RuneCountInString(value)
+			if l < int(param.Min) || l > int(param.Max) {
+				return errUnsupported
+			}
+		}
+	}
+	return nil
+}
+
+func customUnitsToPoints(value float64, units string) (float64, bool) {
+	if units == "" {
+		return value, true
+	}
+	if strings.EqualFold(units, "pt") {
+		return value, true
+	}
+	scale, ok := unitsToHundredthMM(units)
+	if !ok {
+		return 0, false
+	}
+	mm := value * scale / 100.0
+	return mm / 25.4 * 72.0, true
+}
+
+func isUnitsParam(param config.PPDCustomParam) bool {
+	return strings.EqualFold(param.Name, "Units") || strings.EqualFold(param.Type, "units")
+}
+
+func looksLikeCustomDict(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	return strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}")
 }
 
 func ppdOptionValues(ppd *config.PPD, opt *config.PPDOption) []string {
@@ -4904,6 +6161,28 @@ func sharingEnabled(r *http.Request, st *store.Store) bool {
 		return nil
 	})
 	return enabled
+}
+
+func isLocalRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false
+	}
+	if i := strings.Index(host, "%"); i != -1 {
+		host = host[:i]
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback()
 }
 
 func (s *Server) userAllowedForPrinter(ctx context.Context, printer model.Printer, user string) bool {
@@ -5022,6 +6301,24 @@ func userInList(user string, list []string) bool {
 		}
 	}
 	return false
+}
+
+func loadUserAccessLists(ctx context.Context, st *store.Store, keyPrefix string) ([]string, []string) {
+	if st == nil || keyPrefix == "" {
+		return nil, nil
+	}
+	allowed := ""
+	denied := ""
+	_ = st.WithTx(ctx, true, func(tx *sql.Tx) error {
+		var err error
+		allowed, err = st.GetSetting(ctx, tx, keyPrefix+".allowed_users", "")
+		if err != nil {
+			return err
+		}
+		denied, err = st.GetSetting(ctx, tx, keyPrefix+".denied_users", "")
+		return err
+	})
+	return splitUserList(allowed), splitUserList(denied)
 }
 
 func makeCharsetsAttr(name string, values []string) goipp.Attribute {
@@ -5335,7 +6632,7 @@ func makeMediaColAttrWithOptions(name, media, mediaType, mediaSource string, siz
 		media = "A4"
 	}
 	col.Add(goipp.MakeAttribute("media-size", goipp.TagBeginCollection, mediaSizeCollectionFor(media, sizes)))
-	col.Add(goipp.MakeAttribute("media-size-name", goipp.TagKeyword, goipp.String(media)))
+	addMediaMargins(&col, media, sizes)
 	if strings.TrimSpace(mediaType) != "" {
 		col.Add(goipp.MakeAttribute("media-type", goipp.TagKeyword, goipp.String(mediaType)))
 	}
@@ -5356,7 +6653,7 @@ func makeMediaColReadyAttr(name string, mediaReady []string, mediaType string, s
 		}
 		col := goipp.Collection{}
 		col.Add(goipp.MakeAttribute("media-size", goipp.TagBeginCollection, mediaSizeCollectionFor(m, sizes)))
-		col.Add(goipp.MakeAttribute("media-size-name", goipp.TagKeyword, goipp.String(m)))
+		addMediaMargins(&col, m, sizes)
 		source := "auto"
 		if i > 0 {
 			source = fmt.Sprintf("auto.%d", i+1)
@@ -5370,7 +6667,7 @@ func makeMediaColReadyAttr(name string, mediaReady []string, mediaType string, s
 	if len(cols) == 0 {
 		col := goipp.Collection{}
 		col.Add(goipp.MakeAttribute("media-size", goipp.TagBeginCollection, mediaSizeCollectionFor("A4", sizes)))
-		col.Add(goipp.MakeAttribute("media-size-name", goipp.TagKeyword, goipp.String("A4")))
+		addMediaMargins(&col, "A4", sizes)
 		col.Add(goipp.MakeAttribute("media-source", goipp.TagKeyword, goipp.String("auto")))
 		cols = append(cols, col)
 	}
@@ -5385,7 +6682,7 @@ func makeMediaColDatabaseAttr(name string, media []string, sizes map[string]medi
 			continue
 		}
 		col.Add(goipp.MakeAttribute("media-size", goipp.TagBeginCollection, mediaSizeCollectionFor(m, sizes)))
-		col.Add(goipp.MakeAttribute("media-size-name", goipp.TagKeyword, goipp.String(m)))
+		addMediaMargins(&col, m, sizes)
 		cols = append(cols, col)
 	}
 	if custom.MinW > 0 && custom.MaxW > 0 && custom.MinL > 0 && custom.MaxL > 0 {
@@ -5403,10 +6700,22 @@ func makeMediaColDatabaseAttr(name string, media []string, sizes map[string]medi
 	if len(cols) == 0 {
 		col := goipp.Collection{}
 		col.Add(goipp.MakeAttribute("media-size", goipp.TagBeginCollection, mediaSizeCollectionFor("A4", sizes)))
-		col.Add(goipp.MakeAttribute("media-size-name", goipp.TagKeyword, goipp.String("A4")))
+		addMediaMargins(&col, "A4", sizes)
 		cols = append(cols, col)
 	}
 	return goipp.MakeAttr(name, goipp.TagBeginCollection, cols[0], cols[1:]...)
+}
+
+func addMediaMargins(col *goipp.Collection, media string, sizes map[string]mediaSize) {
+	if col == nil {
+		return
+	}
+	if size, ok := mediaSizeLookup(media, sizes); ok {
+		col.Add(goipp.MakeAttribute("media-bottom-margin", goipp.TagInteger, goipp.Integer(size.Bottom)))
+		col.Add(goipp.MakeAttribute("media-left-margin", goipp.TagInteger, goipp.Integer(size.Left)))
+		col.Add(goipp.MakeAttribute("media-right-margin", goipp.TagInteger, goipp.Integer(size.Right)))
+		col.Add(goipp.MakeAttribute("media-top-margin", goipp.TagInteger, goipp.Integer(size.Top)))
+	}
 }
 
 func makeMediaSizeSupportedAttr(name string, media []string, sizes map[string]mediaSize, custom mediaCustomRange) goipp.Attribute {
@@ -5476,12 +6785,36 @@ func makeFinishingsColDatabaseAttr(name string, finishings []int) goipp.Attribut
 	return goipp.MakeAttr(name, goipp.TagBeginCollection, cols[0], cols[1:]...)
 }
 
+func makeFinishingsColDatabaseFromTemplates(name string, templates []string) goipp.Attribute {
+	templates = normalizeFinishingsTemplates(templates)
+	cols := make([]goipp.Value, 0, len(templates))
+	for _, template := range templates {
+		if strings.TrimSpace(template) == "" {
+			continue
+		}
+		col := goipp.Collection{}
+		col.Add(goipp.MakeAttribute("finishing-template", goipp.TagKeyword, goipp.String(template)))
+		cols = append(cols, col)
+	}
+	if len(cols) == 0 {
+		col := goipp.Collection{}
+		col.Add(goipp.MakeAttribute("finishing-template", goipp.TagKeyword, goipp.String("none")))
+		cols = append(cols, col)
+	}
+	return goipp.MakeAttr(name, goipp.TagBeginCollection, cols[0], cols[1:]...)
+}
+
 func makeFinishingsColAttr(name string, finishings []int) goipp.Attribute {
 	col := goipp.Collection{}
-	templates := finishingsTemplatesFromEnums(finishings)
-	template := "none"
-	if len(templates) > 0 {
-		template = templates[0]
+	template := finishingsTemplateForValues(finishings)
+	col.Add(goipp.MakeAttribute("finishing-template", goipp.TagKeyword, goipp.String(template)))
+	return goipp.MakeAttribute(name, goipp.TagBeginCollection, col)
+}
+
+func makeFinishingsColAttrWithTemplate(name, template string) goipp.Attribute {
+	col := goipp.Collection{}
+	if strings.TrimSpace(template) == "" {
+		template = "none"
 	}
 	col.Add(goipp.MakeAttribute("finishing-template", goipp.TagKeyword, goipp.String(template)))
 	return goipp.MakeAttribute(name, goipp.TagBeginCollection, col)
@@ -5607,6 +6940,12 @@ func mediaSizeNameFromCollection(col goipp.Collection, sizes map[string]mediaSiz
 		}
 	}
 	return ""
+}
+
+func numberUpLayoutSupported() []string {
+	return []string{
+		"btlr", "btrl", "lrbt", "lrtb", "rlbt", "rltb", "tblr", "tbrl",
+	}
 }
 
 var pwgCustomSizeRe = regexp.MustCompile(`(?i)^custom_([0-9.]+)x([0-9.]+)(mm|cm|in|ft|m)?$`)
@@ -5878,7 +7217,7 @@ func pwgFormatSizeName(prefix, name string, width, length int, units string) str
 
 func pwgFormatInches(val int) string {
 	integer := val / 2540
-	fraction := ((val % 2540) * 1000 + 1270) / 2540
+	fraction := ((val%2540)*1000 + 1270) / 2540
 	if fraction >= 1000 {
 		integer++
 		fraction -= 1000
@@ -6046,6 +7385,16 @@ func pwgMediaSourceFromPPD(choice, text string) string {
 	}
 }
 
+func pwgMediaSourceFromPPDValue(value string) string {
+	if value == "" {
+		return ""
+	}
+	if mapped := pwgMediaSourceFromPPD(value, value); mapped != "" {
+		return mapped
+	}
+	return pwgUnppdizeName(value, "_")
+}
+
 type pwgMediaTypeMatch struct {
 	ppd      string
 	matchLen int
@@ -6119,6 +7468,21 @@ func pwgMediaTypeChoices(ppd *config.PPD) ([]string, map[string]string) {
 	return mapped, mapping
 }
 
+func pwgMediaTypeFromPPD(ppd *config.PPD, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if ppd != nil {
+		if _, mapping := pwgMediaTypeChoices(ppd); len(mapping) > 0 {
+			if mapped := mappedPPDChoice(mapping, value); mapped != "" {
+				return mapped
+			}
+		}
+	}
+	return pwgUnppdizeName(value, "_")
+}
+
 func matchPPDType(choice, ppd string, matchLen int) bool {
 	choice = strings.TrimSpace(choice)
 	ppd = strings.TrimSpace(ppd)
@@ -6155,6 +7519,21 @@ func pwgOutputBinChoices(ppd *config.PPD) ([]string, map[string]string) {
 		}
 	}
 	return mapped, mapping
+}
+
+func pwgOutputBinFromPPD(ppd *config.PPD, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if ppd != nil {
+		if _, mapping := pwgOutputBinChoices(ppd); len(mapping) > 0 {
+			if mapped := mappedPPDChoice(mapping, value); mapped != "" {
+				return mapped
+			}
+		}
+	}
+	return pwgUnppdizeName(value, "_")
 }
 
 func mediaSizeLookup(name string, sizes map[string]mediaSize) (mediaSize, bool) {
@@ -6450,6 +7829,94 @@ func finishingsSupportedFromPPD(ppd *config.PPD) []int {
 	return values
 }
 
+func finishingsTemplatesFromPPD(ppd *config.PPD) ([]string, string) {
+	if ppd == nil || len(ppd.OptionDetails) == 0 {
+		return nil, ""
+	}
+	var opt *config.PPDOption
+	for key, o := range ppd.OptionDetails {
+		if strings.EqualFold(key, "cupsFinishingTemplate") {
+			opt = o
+			break
+		}
+	}
+	if opt == nil {
+		return nil, ""
+	}
+	templates := []string{}
+	appendTemplate := func(val string) {
+		val = strings.TrimSpace(val)
+		if val == "" {
+			return
+		}
+		templates = append(templates, val)
+	}
+	if len(opt.Choices) > 0 {
+		for _, c := range opt.Choices {
+			appendTemplate(c.Choice)
+		}
+	} else if vals, ok := ppd.Options[opt.Keyword]; ok {
+		for _, v := range vals {
+			appendTemplate(v)
+		}
+	}
+	def := strings.TrimSpace(opt.Default)
+	if def == "" {
+		def = strings.TrimSpace(ppd.Defaults[opt.Keyword])
+	}
+	return normalizeFinishingsTemplates(templates), def
+}
+
+func printQualitySupportedFromPPD(ppd *config.PPD) []int {
+	if ppd == nil {
+		return []int{4}
+	}
+	if opts, ok := ppd.Options["OutputMode"]; ok && len(opts) > 0 {
+		return printQualityFromOptions(opts)
+	}
+	if opts, ok := ppd.Options["cupsPrintQuality"]; ok && len(opts) > 0 {
+		return printQualityFromOptions(opts)
+	}
+	if len(ppd.Presets) > 0 {
+		qualities := []int{}
+		hasDraft := false
+		for _, preset := range ppd.Presets {
+			if strings.Contains(strings.ToLower(preset.Name), "draft") {
+				hasDraft = true
+				break
+			}
+		}
+		if hasDraft {
+			qualities = append(qualities, 3)
+		}
+		qualities = append(qualities, 4, 5)
+		return qualities
+	}
+	return []int{4}
+}
+
+func printQualityFromOptions(opts []string) []int {
+	qualities := []int{}
+	hasDraft := false
+	hasHigh := false
+	for _, opt := range opts {
+		switch strings.ToLower(strings.TrimSpace(opt)) {
+		case "draft", "fast":
+			hasDraft = true
+		case "high", "best":
+			hasHigh = true
+		}
+	}
+	if hasDraft {
+		qualities = append(qualities, 3)
+	}
+	qualities = append(qualities, 4)
+	if hasHigh {
+		qualities = append(qualities, 5)
+	}
+	return qualities
+}
+
 func finishingsForPPDOption(option string, choices []string) []int {
 	if len(choices) == 0 {
 		return nil
@@ -6662,6 +8129,27 @@ func parseFinishingsList(value string) []int {
 	return out
 }
 
+func parsePrintQualityValue(value string) (int, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	if n, err := strconv.Atoi(value); err == nil {
+		if n == 3 || n == 4 || n == 5 {
+			return n, true
+		}
+	}
+	switch strings.ToLower(value) {
+	case "draft", "low", "fast":
+		return 3, true
+	case "high", "best":
+		return 5, true
+	case "normal":
+		return 4, true
+	}
+	return 0, false
+}
+
 func finishingsNameToEnum(name string) int {
 	lookupFinishings()
 	key := strings.ToLower(strings.TrimSpace(name))
@@ -6671,6 +8159,30 @@ func finishingsNameToEnum(name string) int {
 		}
 	}
 	return 0
+}
+
+func finishingsEnumFromPPD(value string) int {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if n := finishingsNameToEnum(value); n > 0 {
+		return n
+	}
+	if n := finishingsNameToEnum(pwgUnppdizeName(value, "_")); n > 0 {
+		return n
+	}
+	return 0
+}
+
+func hasUpperASCII(value string) bool {
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if ch >= 'A' && ch <= 'Z' {
+			return true
+		}
+	}
+	return false
 }
 
 func finishingsEnumToName(value int) string {
@@ -6683,20 +8195,52 @@ func finishingsEnumToName(value int) string {
 
 func finishingsTemplatesFromEnums(finishings []int) []string {
 	templates := []string{}
-	seen := map[string]struct{}{}
 	for _, v := range finishings {
 		if name := finishingsEnumToName(v); name != "" {
-			if _, ok := seen[name]; ok {
-				continue
-			}
-			seen[name] = struct{}{}
 			templates = append(templates, name)
 		}
 	}
-	if _, ok := seen["none"]; !ok {
-		templates = append(templates, "none")
+	return normalizeFinishingsTemplates(templates)
+}
+
+func finishingsTemplateForValues(finishings []int) string {
+	template := ""
+	for _, v := range finishings {
+		if name := finishingsEnumToName(v); name != "" {
+			if !strings.EqualFold(name, "none") {
+				return name
+			}
+			if template == "" {
+				template = name
+			}
+		}
 	}
-	return templates
+	if template == "" {
+		template = "none"
+	}
+	return template
+}
+
+func normalizeFinishingsTemplates(templates []string) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	add := func(val string) {
+		val = strings.TrimSpace(val)
+		if val == "" {
+			return
+		}
+		key := strings.ToLower(val)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, val)
+	}
+	add("none")
+	for _, t := range templates {
+		add(t)
+	}
+	return out
 }
 
 func lookupFinishings() {
@@ -6708,20 +8252,150 @@ func lookupFinishings() {
 	})
 }
 
-func makeJobPresetsSupportedAttr() goipp.Attribute {
-	defaultCol := goipp.Collection{}
-	defaultCol.Add(goipp.MakeAttribute("preset-name", goipp.TagName, goipp.String("Default")))
-	defaultCol.Add(goipp.MakeAttribute("print-quality", goipp.TagEnum, goipp.Integer(4)))
-	defaultCol.Add(goipp.MakeAttribute("sides", goipp.TagKeyword, goipp.String("one-sided")))
-	defaultCol.Add(goipp.MakeAttribute("print-color-mode", goipp.TagKeyword, goipp.String("monochrome")))
+func makeJobPresetsSupportedAttr(ppd *config.PPD) (goipp.Attribute, bool) {
+	presets := jobPresetsSupportedFromPPD(ppd)
+	if len(presets) == 0 {
+		return goipp.Attribute{}, false
+	}
+	vals := make([]goipp.Value, 0, len(presets))
+	for _, col := range presets {
+		vals = append(vals, col)
+	}
+	return goipp.MakeAttr("job-presets-supported", goipp.TagBeginCollection, vals[0], vals[1:]...), true
+}
 
-	highCol := goipp.Collection{}
-	highCol.Add(goipp.MakeAttribute("preset-name", goipp.TagName, goipp.String("High Quality")))
-	highCol.Add(goipp.MakeAttribute("print-quality", goipp.TagEnum, goipp.Integer(5)))
-	highCol.Add(goipp.MakeAttribute("sides", goipp.TagKeyword, goipp.String("one-sided")))
-	highCol.Add(goipp.MakeAttribute("print-color-mode", goipp.TagKeyword, goipp.String("color")))
+func jobPresetsSupportedFromPPD(ppd *config.PPD) []goipp.Collection {
+	if ppd == nil || len(ppd.Presets) == 0 {
+		return nil
+	}
+	out := make([]goipp.Collection, 0, len(ppd.Presets))
+	for _, preset := range ppd.Presets {
+		name := strings.TrimSpace(preset.Name)
+		if name == "" {
+			continue
+		}
+		col := goipp.Collection{}
+		col.Add(goipp.MakeAttribute("preset-name", goipp.TagName, goipp.String(name)))
 
-	return goipp.MakeAttr("job-presets-supported", goipp.TagBeginCollection, defaultCol, highCol)
+		var finishings []int
+		var mediaName string
+		var presetMediaSize mediaSize
+		var hasMediaSize bool
+		var mediaSource string
+		var mediaType string
+
+		for _, opt := range preset.Options {
+			key := strings.TrimSpace(opt.Option)
+			value := strings.TrimSpace(opt.Value)
+			if key == "" {
+				continue
+			}
+			switch key {
+			case "*Booklet":
+				if n := finishingsNameToEnum("booklet-maker"); n > 0 {
+					finishings = append(finishings, n)
+				}
+			case "*ColorModel":
+				if strings.EqualFold(value, "Gray") {
+					col.Add(goipp.MakeAttribute("print-color-mode", goipp.TagKeyword, goipp.String("monochrome")))
+				} else if value != "" {
+					col.Add(goipp.MakeAttribute("print-color-mode", goipp.TagKeyword, goipp.String("color")))
+				}
+			case "*FoldType", "*PunchMedia", "*StapleLocation":
+				if n := finishingsEnumFromPPD(value); n > 0 {
+					finishings = append(finishings, n)
+				}
+			case "*cupsFinishingTemplate":
+				if value != "" {
+					finishingsCol := goipp.Collection{}
+					tag := goipp.TagKeyword
+					if strings.Contains(value, " ") || hasUpperASCII(value) {
+						tag = goipp.TagName
+					}
+					finishingsCol.Add(goipp.MakeAttribute("finishing-template", tag, goipp.String(value)))
+					col.Add(goipp.MakeAttribute("finishings-col", goipp.TagBeginCollection, finishingsCol))
+				}
+			case "*OutputBin":
+				if mapped := pwgOutputBinFromPPD(ppd, value); mapped != "" {
+					col.Add(goipp.MakeAttribute("output-bin", goipp.TagKeyword, goipp.String(mapped)))
+				}
+			case "*InputSlot":
+				mediaSource = pwgMediaSourceFromPPDValue(value)
+			case "*MediaType":
+				mediaType = pwgMediaTypeFromPPD(ppd, value)
+			case "*PageSize":
+				if value != "" {
+					if mapped := ppdMediaToPWG(ppd, value); mapped != "" {
+						mediaName = mapped
+					} else {
+						mediaName = pwgUnppdizeName(value, "_.")
+					}
+					if size, ok := ppdPageSizeForName(ppd, value); ok && size.Width > 0 && size.Length > 0 {
+						presetMediaSize = mediaSize{X: size.Width, Y: size.Length}
+						hasMediaSize = true
+					} else if mediaName != "" {
+						if size, ok := lookupMediaSize(mediaName); ok && size.X > 0 && size.Y > 0 {
+							presetMediaSize = size
+							hasMediaSize = true
+						}
+					}
+				}
+			case "*cupsPrintQuality":
+				if value != "" {
+					switch strings.ToLower(value) {
+					case "draft":
+						col.Add(goipp.MakeAttribute("print-quality", goipp.TagEnum, goipp.Integer(3)))
+					case "high":
+						col.Add(goipp.MakeAttribute("print-quality", goipp.TagEnum, goipp.Integer(5)))
+					default:
+						col.Add(goipp.MakeAttribute("print-quality", goipp.TagEnum, goipp.Integer(4)))
+					}
+				}
+			case "*Duplex":
+				switch strings.ToLower(value) {
+				case "none":
+					col.Add(goipp.MakeAttribute("sides", goipp.TagKeyword, goipp.String("one-sided")))
+				case "duplexnotumble":
+					col.Add(goipp.MakeAttribute("sides", goipp.TagKeyword, goipp.String("two-sided-long-edge")))
+				case "duplextumble":
+					col.Add(goipp.MakeAttribute("sides", goipp.TagKeyword, goipp.String("two-sided-short-edge")))
+				}
+			default:
+				key = strings.TrimPrefix(key, "*")
+				if key != "" && value != "" {
+					col.Add(goipp.MakeAttribute(key, goipp.TagKeyword, goipp.String(value)))
+				}
+			}
+		}
+
+		if len(finishings) > 0 {
+			col.Add(makeEnumsAttr("finishings", finishings))
+		}
+
+		if mediaName != "" || mediaSource != "" || mediaType != "" {
+			if mediaName != "" && mediaSource == "" && mediaType == "" {
+				col.Add(goipp.MakeAttribute("media", goipp.TagKeyword, goipp.String(mediaName)))
+			} else if hasMediaSize {
+				mediaCol := goipp.Collection{}
+				sizeCol := goipp.Collection{}
+				sizeCol.Add(goipp.MakeAttribute("x-dimension", goipp.TagInteger, goipp.Integer(presetMediaSize.X)))
+				sizeCol.Add(goipp.MakeAttribute("y-dimension", goipp.TagInteger, goipp.Integer(presetMediaSize.Y)))
+				mediaCol.Add(goipp.MakeAttribute("media-size", goipp.TagBeginCollection, sizeCol))
+				if mediaSource != "" {
+					mediaCol.Add(goipp.MakeAttribute("media-source", goipp.TagKeyword, goipp.String(mediaSource)))
+				}
+				if mediaType != "" {
+					mediaCol.Add(goipp.MakeAttribute("media-type", goipp.TagKeyword, goipp.String(mediaType)))
+				}
+				col.Add(goipp.MakeAttribute("media-col", goipp.TagBeginCollection, mediaCol))
+			} else if mediaName != "" {
+				col.Add(goipp.MakeAttribute("media", goipp.TagKeyword, goipp.String(mediaName)))
+			}
+		}
+
+		out = append(out, col)
+	}
+	return out
 }
 
 func supportedDocumentFormats() []string {
@@ -6869,11 +8543,14 @@ var (
 	jobDescriptionAttrs = map[string]bool{
 		"job-id": true, "job-uri": true, "job-name": true, "job-state": true,
 		"job-state-reasons": true, "job-state-message": true, "job-originating-user-name": true,
+		"job-originating-user-uri":  true,
 		"job-originating-host-name": true, "job-printer-uri": true, "job-printer-name": true,
 		"time-at-creation": true, "time-at-processing": true, "time-at-completed": true,
+		"date-time-at-creation": true, "date-time-at-processing": true, "date-time-at-completed": true,
 		"job-impressions": true, "job-impressions-completed": true, "job-priority": true,
-		"job-account-id": true, "job-hold-until": true, "job-k-octets": true,
-		"number-of-documents": true, "document-format": true,
+		"job-account-id": true, "job-accounting-user-id": true, "job-hold-until": true,
+		"job-k-octets": true, "job-k-octets-completed": true, "job-pages-completed": true,
+		"job-media-sheets-completed": true, "number-of-documents": true, "document-format": true,
 	}
 	jobTemplateAttrs = map[string]bool{
 		"copies": true, "finishings": true, "finishings-col": true, "job-hold-until": true,
@@ -6888,8 +8565,9 @@ var (
 	}
 	jobStatusAttrs = map[string]bool{
 		"job-state": true, "job-state-reasons": true, "job-state-message": true,
-		"time-at-processing": true, "time-at-completed": true,
-		"job-impressions": true, "job-impressions-completed": true,
+		"time-at-processing": true, "time-at-completed": true, "job-printer-up-time": true,
+		"job-impressions": true, "job-impressions-completed": true, "job-k-octets-completed": true,
+		"job-pages-completed": true, "job-media-sheets-completed": true,
 	}
 	documentDescriptionAttrs = map[string]bool{
 		"document-number": true, "document-uri": true, "document-printer-uri": true,
@@ -6914,7 +8592,8 @@ var (
 	printerStatusAttrs = map[string]bool{
 		"printer-state": true, "printer-state-reasons": true, "printer-state-message": true,
 		"printer-is-accepting-jobs": true, "printer-up-time": true, "queued-job-count": true,
-		"marker-message": true, "printer-supply": true, "printer-supply-description": true,
+		"printer-state-change-time": true,
+		"marker-message":            true, "printer-supply": true, "printer-supply-description": true,
 	}
 	printerDefaultsAttrs = map[string]bool{
 		"copies-default": true, "document-format-default": true, "finishings-default": true,
@@ -6927,6 +8606,8 @@ var (
 	printerConfigurationAttrs = map[string]bool{
 		"printer-is-shared": true, "device-uri": true, "ppd-name": true,
 		"printer-error-policy": true, "printer-op-policy": true, "port-monitor": true,
+		"requesting-user-name-allowed": true, "requesting-user-name-denied": true,
+		"auth-info-required":             true,
 		"printer-error-policy-supported": true, "printer-op-policy-supported": true,
 		"port-monitor-supported": true, "printer-settable-attributes-supported": true,
 		"job-settable-attributes-supported": true, "job-creation-attributes-supported": true,
@@ -6936,7 +8617,9 @@ var (
 		"printer-name": true, "printer-uri-supported": true, "printer-state": true,
 		"printer-is-accepting-jobs": true, "printer-state-reasons": true,
 		"printer-location": true, "printer-info": true, "ppd-name": true,
-		"printer-make-and-model": true, "document-format-supported": true,
+		"printer-make-and-model": true, "printer-type": true, "document-format-supported": true,
+		"member-names": true, "member-uris": true,
+		"color-supported":         true,
 		"document-format-default": true, "document-format-preferred": true,
 		"document-charset-default": true, "document-charset-supported": true,
 		"document-natural-language-default": true, "document-natural-language-supported": true,
@@ -6945,13 +8628,16 @@ var (
 		"queued-job-count": true, "printer-uuid": true, "cups-version": true,
 		"generated-natural-language-supported": true, "printer-id": true, "printer-geo-location": true,
 		"printer-organization": true, "printer-organizational-unit": true,
-		"printer-strings-languages-supported": true, "printer-device-id": true, "device-uri": true,
+		"printer-strings-languages-supported": true, "printer-device-id": true,
+		"pages-per-minute": true, "pages-per-minute-color": true, "device-uri": true,
 		"destination-uri": true, "multiple-destination-uris-supported": true,
 		"uri-security-supported": true, "uri-authentication-supported": true,
 		"operations-supported": true, "printer-is-shared": true, "printer-state-message": true,
 		"multiple-document-handling-supported": true, "multiple-document-jobs-supported": true,
 		"compression-supported": true, "ippget-event-life": true, "job-ids-supported": true,
 		"job-priority-supported": true, "job-priority-default": true, "job-account-id-supported": true,
+		"job-accounting-user-id-supported": true, "job-account-id-default": true, "job-accounting-user-id-default": true,
+		"job-password-encryption-supported": true, "job-password-supported": true,
 		"job-k-octets-supported": true, "pdf-k-octets-supported": true, "pdf-versions-supported": true,
 		"ipp-features-supported": true, "notify-attributes-supported": true, "notify-events-supported": true,
 		"notify-events-default": true, "notify-schemes-supported": true,
@@ -6972,6 +8658,7 @@ var (
 		"printer-error-policy-supported": true, "printer-error-policy": true, "printer-op-policy-supported": true,
 		"printer-op-policy": true, "port-monitor-supported": true, "port-monitor": true,
 		"job-cancel-after-supported": true, "job-cancel-after-default": true,
+		"job-quota-period": true, "job-k-limit": true, "job-page-limit": true,
 		"jpeg-k-octets-supported": true, "jpeg-x-dimension-supported": true, "jpeg-y-dimension-supported": true,
 		"media-col-supported": true, "marker-message": true, "printer-supply": true,
 		"printer-supply-description": true, "job-presets-supported": true, "which-jobs-supported": true,
@@ -6987,6 +8674,7 @@ var (
 		"pwg-raster-document-sheet-back": true,
 		"printer-resolution-supported":   true, "printer-resolution-default": true, "output-bin-supported": true,
 		"output-bin-default": true, "finishings-col-database": true, "urf-supported": true,
+		"printer-charge-info-uri": true, "printer-mandatory-job-attributes": true,
 	}
 )
 
@@ -7154,6 +8842,55 @@ func parseRangeValue(value string) (goipp.Range, bool) {
 	return goipp.Range{Lower: start, Upper: end}, true
 }
 
+func makePageRangesAttr(name string, ranges []goipp.Range) goipp.Attribute {
+	if len(ranges) == 0 {
+		return goipp.MakeAttribute(name, goipp.TagRange, goipp.Range{Lower: 1, Upper: 1})
+	}
+	values := make([]goipp.Value, 0, len(ranges))
+	for _, r := range ranges {
+		values = append(values, r)
+	}
+	return goipp.MakeAttr(name, goipp.TagRange, values[0], values[1:]...)
+}
+
+func parsePageRangesList(value string) ([]goipp.Range, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, false
+	}
+	parts := strings.Split(value, ",")
+	out := make([]goipp.Range, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		r, ok := parseRangeValue(part)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, r)
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+func validatePageRanges(ranges []goipp.Range) bool {
+	if len(ranges) == 0 {
+		return false
+	}
+	lower := 1
+	for _, r := range ranges {
+		if r.Lower < lower || r.Lower > r.Upper {
+			return false
+		}
+		lower = r.Upper + 1
+	}
+	return true
+}
+
 func isHoldUntilTime(value string) bool {
 	v := strings.TrimSpace(value)
 	if v == "" {
@@ -7241,8 +8978,6 @@ func urfSupported(resolutions []goipp.Resolution, colorModes []string, sides []s
 	}
 	if color {
 		urf = append(urf, "SRGB24")
-	} else {
-		urf = append(urf, "SGRAY8")
 	}
 	if len(qualities) == 0 {
 		qualities = []int{4}
@@ -7453,6 +9188,15 @@ func collectionStrings(col goipp.Collection, name string) []string {
 func isTruthy(value string) bool {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func boolStringValid(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "0", "true", "false", "yes", "no", "on", "off":
 		return true
 	default:
 		return false

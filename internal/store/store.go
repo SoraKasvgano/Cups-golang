@@ -26,6 +26,13 @@ type PrinterSupplies struct {
 	UpdatedAt time.Time
 }
 
+type DocumentStats struct {
+	JobID     int64
+	Count     int
+	SizeBytes int64
+	MimeType  string
+}
+
 var ErrJobCompleted = errors.New("job completed")
 
 func Open(ctx context.Context, dbPath string) (*Store, error) {
@@ -442,12 +449,12 @@ func (s *Store) GetPrinterByID(ctx context.Context, tx *sql.Tx, id int64) (model
 	return p, nil
 }
 
-func (s *Store) CreateJob(ctx context.Context, tx *sql.Tx, printerID int64, name, user, options string) (model.Job, error) {
+func (s *Store) CreateJob(ctx context.Context, tx *sql.Tx, printerID int64, name, user, originHost, options string) (model.Job, error) {
 	now := time.Now().UTC()
 	res, err := tx.ExecContext(ctx, `
-        INSERT INTO jobs (printer_id, name, user_name, options, state, state_reason, impressions, submitted_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `, printerID, name, user, options, 3, "job-incoming", 0, now)
+        INSERT INTO jobs (printer_id, name, user_name, origin_host, options, state, state_reason, impressions, submitted_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, printerID, name, user, originHost, options, 3, "job-incoming", 0, now)
 	if err != nil {
 		return model.Job{}, err
 	}
@@ -461,6 +468,7 @@ func (s *Store) CreateJob(ctx context.Context, tx *sql.Tx, printerID int64, name
 		PrinterID:   printerID,
 		Name:        name,
 		UserName:    user,
+		OriginHost:  originHost,
 		Options:     options,
 		State:       3,
 		StateReason: "job-incoming",
@@ -495,14 +503,18 @@ func (s *Store) AddDocument(ctx context.Context, tx *sql.Tx, jobID int64, fileNa
 
 func (s *Store) GetJob(ctx context.Context, tx *sql.Tx, jobID int64) (model.Job, error) {
 	var job model.Job
+	var processing sql.NullTime
 	var completed sql.NullTime
 	err := tx.QueryRowContext(ctx, `
-        SELECT id, printer_id, name, user_name, options, state, state_reason, impressions, submitted_at, completed_at
+        SELECT id, printer_id, name, user_name, origin_host, options, state, state_reason, impressions, submitted_at, processing_at, completed_at
         FROM jobs
         WHERE id = ?
-    `, jobID).Scan(&job.ID, &job.PrinterID, &job.Name, &job.UserName, &job.Options, &job.State, &job.StateReason, &job.Impressions, &job.SubmittedAt, &completed)
+    `, jobID).Scan(&job.ID, &job.PrinterID, &job.Name, &job.UserName, &job.OriginHost, &job.Options, &job.State, &job.StateReason, &job.Impressions, &job.SubmittedAt, &processing, &completed)
 	if err != nil {
 		return model.Job{}, err
+	}
+	if processing.Valid {
+		job.ProcessingAt = &processing.Time
 	}
 	if completed.Valid {
 		job.CompletedAt = &completed.Time
@@ -512,7 +524,7 @@ func (s *Store) GetJob(ctx context.Context, tx *sql.Tx, jobID int64) (model.Job,
 
 func (s *Store) ListJobsByPrinter(ctx context.Context, tx *sql.Tx, printerID int64, limit int) ([]model.Job, error) {
 	rows, err := tx.QueryContext(ctx, `
-        SELECT id, printer_id, name, user_name, options, state, state_reason, impressions, submitted_at, completed_at
+        SELECT id, printer_id, name, user_name, origin_host, options, state, state_reason, impressions, submitted_at, processing_at, completed_at
         FROM jobs
         WHERE printer_id = ?
         ORDER BY id DESC
@@ -526,9 +538,13 @@ func (s *Store) ListJobsByPrinter(ctx context.Context, tx *sql.Tx, printerID int
 	jobs := []model.Job{}
 	for rows.Next() {
 		var job model.Job
+		var processing sql.NullTime
 		var completed sql.NullTime
-		if err := rows.Scan(&job.ID, &job.PrinterID, &job.Name, &job.UserName, &job.Options, &job.State, &job.StateReason, &job.Impressions, &job.SubmittedAt, &completed); err != nil {
+		if err := rows.Scan(&job.ID, &job.PrinterID, &job.Name, &job.UserName, &job.OriginHost, &job.Options, &job.State, &job.StateReason, &job.Impressions, &job.SubmittedAt, &processing, &completed); err != nil {
 			return nil, err
+		}
+		if processing.Valid {
+			job.ProcessingAt = &processing.Time
 		}
 		if completed.Valid {
 			job.CompletedAt = &completed.Time
@@ -540,7 +556,7 @@ func (s *Store) ListJobsByPrinter(ctx context.Context, tx *sql.Tx, printerID int
 
 func (s *Store) ListJobsByUser(ctx context.Context, tx *sql.Tx, user string, printerID *int64, limit int) ([]model.Job, error) {
 	query := `
-        SELECT id, printer_id, name, user_name, options, state, state_reason, impressions, submitted_at, completed_at
+        SELECT id, printer_id, name, user_name, origin_host, options, state, state_reason, impressions, submitted_at, processing_at, completed_at
         FROM jobs
         WHERE user_name = ?
     `
@@ -561,9 +577,13 @@ func (s *Store) ListJobsByUser(ctx context.Context, tx *sql.Tx, user string, pri
 	jobs := []model.Job{}
 	for rows.Next() {
 		var job model.Job
+		var processing sql.NullTime
 		var completed sql.NullTime
-		if err := rows.Scan(&job.ID, &job.PrinterID, &job.Name, &job.UserName, &job.Options, &job.State, &job.StateReason, &job.Impressions, &job.SubmittedAt, &completed); err != nil {
+		if err := rows.Scan(&job.ID, &job.PrinterID, &job.Name, &job.UserName, &job.OriginHost, &job.Options, &job.State, &job.StateReason, &job.Impressions, &job.SubmittedAt, &processing, &completed); err != nil {
 			return nil, err
+		}
+		if processing.Valid {
+			job.ProcessingAt = &processing.Time
 		}
 		if completed.Valid {
 			job.CompletedAt = &completed.Time
@@ -1360,11 +1380,12 @@ func eventAllowed(events string, event string) bool {
 }
 
 func (s *Store) ClaimPendingJob(ctx context.Context, tx *sql.Tx, jobID int64) (bool, error) {
+	processingAt := time.Now().UTC()
 	res, err := tx.ExecContext(ctx, `
         UPDATE jobs
-        SET state = ?, state_reason = ?
+        SET state = ?, state_reason = ?, processing_at = COALESCE(processing_at, ?)
         WHERE id = ? AND state = ?
-    `, 5, "job-printing", jobID, 3)
+    `, 5, "job-printing", processingAt, jobID, 3)
 	if err != nil {
 		return false, err
 	}
@@ -1377,7 +1398,7 @@ func (s *Store) ClaimPendingJob(ctx context.Context, tx *sql.Tx, jobID int64) (b
 
 func (s *Store) ListPendingJobs(ctx context.Context, tx *sql.Tx, limit int) ([]model.Job, error) {
 	rows, err := tx.QueryContext(ctx, `
-        SELECT id, printer_id, name, user_name, options, state, state_reason, impressions, submitted_at, completed_at
+        SELECT id, printer_id, name, user_name, origin_host, options, state, state_reason, impressions, submitted_at, processing_at, completed_at
         FROM jobs
         WHERE state = ?
           AND printer_id IN (SELECT id FROM printers WHERE accepting = 1 AND state != 5)
@@ -1392,9 +1413,13 @@ func (s *Store) ListPendingJobs(ctx context.Context, tx *sql.Tx, limit int) ([]m
 	jobs := []model.Job{}
 	for rows.Next() {
 		var job model.Job
+		var processing sql.NullTime
 		var completed sql.NullTime
-		if err := rows.Scan(&job.ID, &job.PrinterID, &job.Name, &job.UserName, &job.Options, &job.State, &job.StateReason, &job.Impressions, &job.SubmittedAt, &completed); err != nil {
+		if err := rows.Scan(&job.ID, &job.PrinterID, &job.Name, &job.UserName, &job.OriginHost, &job.Options, &job.State, &job.StateReason, &job.Impressions, &job.SubmittedAt, &processing, &completed); err != nil {
 			return nil, err
+		}
+		if processing.Valid {
+			job.ProcessingAt = &processing.Time
 		}
 		if completed.Valid {
 			job.CompletedAt = &completed.Time
@@ -1406,7 +1431,7 @@ func (s *Store) ListPendingJobs(ctx context.Context, tx *sql.Tx, limit int) ([]m
 
 func (s *Store) ListHeldJobs(ctx context.Context, tx *sql.Tx, limit int) ([]model.Job, error) {
 	rows, err := tx.QueryContext(ctx, `
-        SELECT id, printer_id, name, user_name, options, state, state_reason, impressions, submitted_at, completed_at
+        SELECT id, printer_id, name, user_name, origin_host, options, state, state_reason, impressions, submitted_at, processing_at, completed_at
         FROM jobs
         WHERE state = ?
         ORDER BY submitted_at
@@ -1420,9 +1445,13 @@ func (s *Store) ListHeldJobs(ctx context.Context, tx *sql.Tx, limit int) ([]mode
 	jobs := []model.Job{}
 	for rows.Next() {
 		var job model.Job
+		var processing sql.NullTime
 		var completed sql.NullTime
-		if err := rows.Scan(&job.ID, &job.PrinterID, &job.Name, &job.UserName, &job.Options, &job.State, &job.StateReason, &job.Impressions, &job.SubmittedAt, &completed); err != nil {
+		if err := rows.Scan(&job.ID, &job.PrinterID, &job.Name, &job.UserName, &job.OriginHost, &job.Options, &job.State, &job.StateReason, &job.Impressions, &job.SubmittedAt, &processing, &completed); err != nil {
 			return nil, err
+		}
+		if processing.Valid {
+			job.ProcessingAt = &processing.Time
 		}
 		if completed.Valid {
 			job.CompletedAt = &completed.Time
@@ -1434,7 +1463,7 @@ func (s *Store) ListHeldJobs(ctx context.Context, tx *sql.Tx, limit int) ([]mode
 
 func (s *Store) ListTerminalJobs(ctx context.Context, tx *sql.Tx, limit int) ([]model.Job, error) {
 	rows, err := tx.QueryContext(ctx, `
-        SELECT id, printer_id, name, user_name, options, state, state_reason, impressions, submitted_at, completed_at
+        SELECT id, printer_id, name, user_name, origin_host, options, state, state_reason, impressions, submitted_at, processing_at, completed_at
         FROM jobs
         WHERE state IN (7, 8, 9)
           AND completed_at IS NOT NULL
@@ -1449,9 +1478,13 @@ func (s *Store) ListTerminalJobs(ctx context.Context, tx *sql.Tx, limit int) ([]
 	jobs := []model.Job{}
 	for rows.Next() {
 		var job model.Job
+		var processing sql.NullTime
 		var completed sql.NullTime
-		if err := rows.Scan(&job.ID, &job.PrinterID, &job.Name, &job.UserName, &job.Options, &job.State, &job.StateReason, &job.Impressions, &job.SubmittedAt, &completed); err != nil {
+		if err := rows.Scan(&job.ID, &job.PrinterID, &job.Name, &job.UserName, &job.OriginHost, &job.Options, &job.State, &job.StateReason, &job.Impressions, &job.SubmittedAt, &processing, &completed); err != nil {
 			return nil, err
+		}
+		if processing.Valid {
+			job.ProcessingAt = &processing.Time
 		}
 		if completed.Valid {
 			job.CompletedAt = &completed.Time
@@ -1482,6 +1515,41 @@ func (s *Store) ListDocumentsByJob(ctx context.Context, tx *sql.Tx, jobID int64)
 		docs = append(docs, doc)
 	}
 	return docs, rows.Err()
+}
+
+func (s *Store) ListDocumentStatsByJobIDs(ctx context.Context, tx *sql.Tx, jobIDs []int64) (map[int64]DocumentStats, error) {
+	stats := make(map[int64]DocumentStats, len(jobIDs))
+	if len(jobIDs) == 0 {
+		return stats, nil
+	}
+	placeholders := strings.Repeat("?,", len(jobIDs))
+	placeholders = strings.TrimSuffix(placeholders, ",")
+	args := make([]any, 0, len(jobIDs))
+	for _, id := range jobIDs {
+		args = append(args, id)
+	}
+	query := fmt.Sprintf(`
+        SELECT job_id,
+               COUNT(1) AS doc_count,
+               COALESCE(SUM(size_bytes), 0) AS total_size,
+               MIN(mime_type) AS mime_type
+        FROM documents
+        WHERE job_id IN (%s)
+        GROUP BY job_id
+    `, placeholders)
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var row DocumentStats
+		if err := rows.Scan(&row.JobID, &row.Count, &row.SizeBytes, &row.MimeType); err != nil {
+			return nil, err
+		}
+		stats[row.JobID] = row
+	}
+	return stats, rows.Err()
 }
 
 func (s *Store) DeleteDocumentsByJob(ctx context.Context, tx *sql.Tx, jobID int64) error {

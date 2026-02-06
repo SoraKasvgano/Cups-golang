@@ -32,6 +32,18 @@ type PPD struct {
 	HWMargins         [4]int
 	CustomMinSize     [2]int
 	CustomMaxSize     [2]int
+	ChargeInfoURI     string
+	JobAccountID      bool
+	JobAccountingUser bool
+	JobPassword       string
+	Mandatory         []string
+	MaxCopies         int
+	ManualCopies      bool
+	DeviceID          string
+	Throughput        int
+	Presets           []PPDPrinterPreset
+	APICADriver       bool
+	APScannerOnly     bool
 }
 
 type PPDGroup struct {
@@ -54,6 +66,17 @@ type PPDOption struct {
 type PPDChoice struct {
 	Choice string
 	Text   string
+}
+
+type PPDPrinterPreset struct {
+	Name    string
+	Text    string
+	Options []PPDPresetOption
+}
+
+type PPDPresetOption struct {
+	Option string
+	Value  string
 }
 
 type PPDPageSize struct {
@@ -145,6 +168,36 @@ func LoadPPD(path string) (*PPD, error) {
 			val := strings.TrimSpace(strings.Trim(line[len("*ColorDevice:"):], " \""))
 			ppd.ColorDevice = strings.EqualFold(val, "true") || val == "1" || strings.EqualFold(val, "yes")
 		}
+		if strings.HasPrefix(line, "*cupsChargeInfoURI:") {
+			ppd.ChargeInfoURI = strings.TrimSpace(strings.Trim(line[len("*cupsChargeInfoURI:"):], " \""))
+		}
+		if strings.HasPrefix(line, "*cupsJobAccountId:") {
+			val := strings.TrimSpace(strings.Trim(line[len("*cupsJobAccountId:"):], " \""))
+			ppd.JobAccountID = strings.EqualFold(val, "true") || val == "1" || strings.EqualFold(val, "yes")
+		}
+		if strings.HasPrefix(line, "*cupsJobAccountingUserId:") {
+			val := strings.TrimSpace(strings.Trim(line[len("*cupsJobAccountingUserId:"):], " \""))
+			ppd.JobAccountingUser = strings.EqualFold(val, "true") || val == "1" || strings.EqualFold(val, "yes")
+		}
+		if strings.HasPrefix(line, "*cupsJobPassword:") {
+			ppd.JobPassword = strings.TrimSpace(strings.Trim(line[len("*cupsJobPassword:"):], " \""))
+		}
+		if strings.HasPrefix(line, "*cupsMaxCopies:") {
+			val := strings.TrimSpace(strings.Trim(line[len("*cupsMaxCopies:"):], " \""))
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				ppd.MaxCopies = n
+			}
+		}
+		if strings.HasPrefix(line, "*ManualCopies:") {
+			val := strings.TrimSpace(strings.Trim(line[len("*ManualCopies:"):], " \""))
+			ppd.ManualCopies = strings.EqualFold(val, "true") || val == "1" || strings.EqualFold(val, "yes")
+		}
+		if strings.HasPrefix(line, "*cupsMandatory:") {
+			val := strings.TrimSpace(strings.Trim(line[len("*cupsMandatory:"):], " \""))
+			if val != "" {
+				ppd.Mandatory = append(ppd.Mandatory, splitPPDList(val)...)
+			}
+		}
 		if strings.HasPrefix(line, "*DefaultResolution:") {
 			ppd.DefaultResolution = strings.TrimSpace(strings.Trim(line[len("*DefaultResolution:"):], " \""))
 		}
@@ -200,6 +253,40 @@ func LoadPPD(path string) (*PPD, error) {
 					}
 				}
 			}
+		}
+		if strings.HasPrefix(line, "*APICADriver:") {
+			val := strings.TrimSpace(strings.Trim(line[len("*APICADriver:"):], " \""))
+			ppd.APICADriver = strings.EqualFold(val, "true") || val == "1" || strings.EqualFold(val, "yes")
+			continue
+		}
+		if strings.HasPrefix(line, "*APScannerOnly:") {
+			val := strings.TrimSpace(strings.Trim(line[len("*APScannerOnly:"):], " \""))
+			ppd.APScannerOnly = strings.EqualFold(val, "true") || val == "1" || strings.EqualFold(val, "yes")
+			continue
+		}
+		if strings.HasPrefix(line, "*1284DeviceId:") || strings.HasPrefix(line, "*1284DeviceID:") {
+			val := strings.TrimSpace(line[strings.Index(line, ":")+1:])
+			val = strings.Trim(val, " \"")
+			if val != "" && ppd.DeviceID == "" {
+				ppd.DeviceID = val
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "*Throughput:") {
+			val := strings.TrimSpace(line[len("*Throughput:"):])
+			val = strings.Trim(val, " \"")
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				ppd.Throughput = n
+			} else if f, err := strconv.ParseFloat(val, 64); err == nil && f > 0 {
+				ppd.Throughput = int(math.Round(f))
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "*APPrinterPreset ") {
+			if preset, ok := parsePPDPrinterPreset(line); ok {
+				ppd.Presets = append(ppd.Presets, preset)
+			}
+			continue
 		}
 		if strings.HasPrefix(line, "*OpenGroup:") {
 			group := strings.TrimSpace(line[len("*OpenGroup:"):])
@@ -426,6 +513,52 @@ func parsePPDChoiceLine(line string) (string, string, string, bool) {
 		text = choice
 	}
 	return key, choice, text, true
+}
+
+func parsePPDPrinterPreset(line string) (PPDPrinterPreset, bool) {
+	if !strings.HasPrefix(line, "*APPrinterPreset ") {
+		return PPDPrinterPreset{}, false
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(line, "*APPrinterPreset"))
+	if rest == "" {
+		return PPDPrinterPreset{}, false
+	}
+	parts := strings.SplitN(rest, ":", 2)
+	if len(parts) != 2 {
+		return PPDPrinterPreset{}, false
+	}
+	left := strings.TrimSpace(parts[0])
+	right := strings.TrimSpace(parts[1])
+	name, text := splitPPDLabel(left)
+	if name == "" {
+		return PPDPrinterPreset{}, false
+	}
+	value := strings.TrimSpace(strings.Trim(right, "\""))
+	value = strings.ReplaceAll(value, "\\n", " ")
+	value = strings.ReplaceAll(value, "\\r", " ")
+	value = strings.ReplaceAll(value, "\\t", " ")
+	tokens := strings.Fields(value)
+	options := make([]PPDPresetOption, 0, len(tokens)/2)
+	for i := 0; i < len(tokens); i++ {
+		token := strings.TrimSpace(tokens[i])
+		if token == "" || !strings.HasPrefix(token, "*") {
+			continue
+		}
+		if i+1 >= len(tokens) {
+			break
+		}
+		val := strings.Trim(tokens[i+1], "\"")
+		options = append(options, PPDPresetOption{
+			Option: token,
+			Value:  val,
+		})
+		i++
+	}
+	return PPDPrinterPreset{
+		Name:    name,
+		Text:    text,
+		Options: options,
+	}, true
 }
 
 type ppdCustomParamParsed struct {

@@ -53,11 +53,13 @@ func (s *Store) migrate(ctx context.Context) error {
                 printer_id INTEGER NOT NULL,
                 name TEXT NOT NULL DEFAULT '',
                 user_name TEXT NOT NULL DEFAULT '',
+                origin_host TEXT NOT NULL DEFAULT '',
                 options TEXT NOT NULL DEFAULT '',
                 state INTEGER NOT NULL,
                 state_reason TEXT NOT NULL DEFAULT '',
                 impressions INTEGER NOT NULL DEFAULT 0,
                 submitted_at DATETIME NOT NULL,
+                processing_at DATETIME,
                 completed_at DATETIME,
                 FOREIGN KEY (printer_id) REFERENCES printers(id) ON DELETE CASCADE
             )`,
@@ -150,6 +152,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		if err := ensureColumn(ctx, tx, "printers", "default_options", "TEXT NOT NULL DEFAULT ''"); err != nil {
 			return err
 		}
+		if err := ensureColumn(ctx, tx, "jobs", "processing_at", "DATETIME"); err != nil {
+			return err
+		}
 		if err := ensureColumn(ctx, tx, "users", "digest_ha1", "TEXT NOT NULL DEFAULT ''"); err != nil {
 			return err
 		}
@@ -172,6 +177,9 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 		if err := ensureColumn(ctx, tx, "classes", "default_options", "TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+		if err := ensureColumn(ctx, tx, "jobs", "origin_host", "TEXT NOT NULL DEFAULT ''"); err != nil {
 			return err
 		}
 		if err := ensureColumn(ctx, tx, "printer_supplies", "state", "TEXT NOT NULL DEFAULT ''"); err != nil {

@@ -1575,21 +1575,63 @@ func ppdChoiceFromJobValue(jobKey string, choices []config.PPDChoice, desired st
 }
 
 func splitList(value string) []string {
-	parts := strings.FieldsFunc(value, func(r rune) bool {
-		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
-	})
-	out := make([]string, 0, len(parts))
+	out := []string{}
 	seen := map[string]bool{}
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
+	var sb strings.Builder
+	inBrace := 0
+	inQuote := false
+	escaped := false
+	flush := func() {
+		token := strings.TrimSpace(sb.String())
+		if token == "" {
+			sb.Reset()
+			return
+		}
+		if !seen[token] {
+			seen[token] = true
+			out = append(out, token)
+		}
+		sb.Reset()
+	}
+	for _, r := range value {
+		if escaped {
+			sb.WriteRune(r)
+			escaped = false
 			continue
 		}
-		if !seen[p] {
-			seen[p] = true
-			out = append(out, p)
+		if inQuote {
+			if r == '\\' {
+				escaped = true
+				continue
+			}
+			if r == '"' {
+				inQuote = false
+			}
+			sb.WriteRune(r)
+			continue
 		}
+		switch r {
+		case '"':
+			inQuote = true
+			sb.WriteRune(r)
+			continue
+		case '{':
+			inBrace++
+		case '}':
+			if inBrace > 0 {
+				inBrace--
+			}
+		}
+		if inBrace == 0 {
+			switch r {
+			case ',', ';', ' ', '\t', '\n', '\r':
+				flush()
+				continue
+			}
+		}
+		sb.WriteRune(r)
 	}
+	flush()
 	return out
 }
 
@@ -1850,8 +1892,9 @@ func parseCustomOptionValue(opt *config.PPDOption, value string) map[string]stri
 		}
 		rest := raw[len("Custom."):]
 		rest = strings.TrimSpace(rest)
-		if len(opt.CustomParams) == 1 {
-			p := opt.CustomParams[0]
+		if len(opt.CustomParams) >= 1 {
+			params := orderedCustomParams(opt.CustomParams)
+			p := params[0]
 			if strings.EqualFold(p.Type, "points") {
 				num, unit := splitNumericSuffix(rest)
 				if unit != "" {
@@ -2026,7 +2069,7 @@ func (s *Server) enqueueTestPage(ctx context.Context, printer model.Printer) err
 	content.WriteString("\n")
 	sp := spool.Spool{Dir: s.Spool.Dir, OutputDir: s.Spool.OutputDir}
 	return s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
-		job, err := s.Store.CreateJob(ctx, tx, printer.ID, jobName, "admin", string(optionsJSON))
+		job, err := s.Store.CreateJob(ctx, tx, printer.ID, jobName, "admin", "localhost", string(optionsJSON))
 		if err != nil {
 			return err
 		}

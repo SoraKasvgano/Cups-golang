@@ -42,16 +42,18 @@ type Class struct {
 }
 
 type Job struct {
-	ID          int64
-	PrinterID   int64
-	Name        string
-	UserName    string
-	Options     string
-	State       int
-	StateReason string
-	Impressions int
-	SubmittedAt time.Time
-	CompletedAt *time.Time
+	ID           int64
+	PrinterID    int64
+	Name         string
+	UserName     string
+	OriginHost   string
+	Options      string
+	State        int
+	StateReason  string
+	Impressions  int
+	SubmittedAt  time.Time
+	ProcessingAt *time.Time
+	CompletedAt  *time.Time
 }
 
 type Document struct {

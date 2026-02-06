@@ -138,15 +138,42 @@ func buildJobAttributesFromOptions(optionsJSON string) []goipp.Attribute {
 			if n, err := strconv.Atoi(v); err == nil {
 				out = append(out, goipp.MakeAttribute(k, goipp.TagInteger, goipp.Integer(n)))
 			}
-		case "print-quality", "finishings", "orientation-requested":
+		case "print-quality", "orientation-requested":
 			if n, err := strconv.Atoi(v); err == nil {
 				out = append(out, goipp.MakeAttribute(k, goipp.TagEnum, goipp.Integer(n)))
 			}
-		case "page-ranges":
-			if r, ok := parseRange(v); ok {
-				out = append(out, goipp.MakeAttribute(k, goipp.TagRange, r))
+		case "finishings":
+			if enums := parseFinishingsEnums(v); len(enums) > 0 {
+				vals := make([]goipp.Value, 0, len(enums))
+				for _, n := range enums {
+					vals = append(vals, goipp.Integer(n))
+				}
+				out = append(out, goipp.MakeAttr(k, goipp.TagEnum, vals[0], vals[1:]...))
+			} else if n, err := strconv.Atoi(v); err == nil {
+				out = append(out, goipp.MakeAttribute(k, goipp.TagEnum, goipp.Integer(n)))
 			} else {
 				out = append(out, goipp.MakeAttribute(k, goipp.TagKeyword, goipp.String(v)))
+			}
+		case "page-ranges":
+			if ranges, ok := parseRangesList(v); ok {
+				vals := make([]goipp.Value, 0, len(ranges))
+				for _, r := range ranges {
+					vals = append(vals, r)
+				}
+				out = append(out, goipp.MakeAttr(k, goipp.TagRange, vals[0], vals[1:]...))
+			} else {
+				out = append(out, goipp.MakeAttribute(k, goipp.TagKeyword, goipp.String(v)))
+			}
+		case "job-sheets":
+			parts := splitList(v, 2)
+			if len(parts) == 1 {
+				out = append(out, goipp.MakeAttribute(k, goipp.TagKeyword, goipp.String(parts[0])))
+			} else if len(parts) > 1 {
+				vals := make([]goipp.Value, 0, len(parts))
+				for _, p := range parts {
+					vals = append(vals, goipp.String(p))
+				}
+				out = append(out, goipp.MakeAttr(k, goipp.TagKeyword, vals[0], vals[1:]...))
 			}
 		case "printer-resolution":
 			if res, ok := parseResolution(v); ok {
@@ -179,6 +206,62 @@ func parseRange(value string) (goipp.Range, bool) {
 		}
 	}
 	return goipp.Range{Lower: start, Upper: end}, true
+}
+
+func parseRangesList(value string) ([]goipp.Range, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, false
+	}
+	parts := strings.Split(value, ",")
+	out := make([]goipp.Range, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		r, ok := parseRange(part)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, r)
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+func parseFinishingsEnums(value string) []int {
+	parts := splitList(value, 0)
+	out := make([]int, 0, len(parts))
+	for _, p := range parts {
+		if n, err := strconv.Atoi(p); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+func splitList(value string, max int) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+		if max > 0 && len(out) >= max {
+			break
+		}
+	}
+	return out
 }
 
 func parseResolution(value string) (goipp.Resolution, bool) {
