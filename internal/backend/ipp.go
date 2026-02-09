@@ -128,9 +128,28 @@ func buildJobAttributesFromOptions(optionsJSON string) []goipp.Attribute {
 	if err := json.Unmarshal([]byte(optionsJSON), &opts); err != nil {
 		return nil
 	}
+	template := strings.TrimSpace(opts["finishing-template"])
+	ignoreFinishings := template != "" && !strings.EqualFold(template, "none")
 	out := []goipp.Attribute{}
+	if ignoreFinishings {
+		col := goipp.Collection{}
+		col.Add(goipp.MakeAttribute("finishing-template", finishingTemplateTag(template), goipp.String(template)))
+		out = append(out, goipp.MakeAttribute("finishings-col", goipp.TagBeginCollection, col))
+	}
 	for k, v := range opts {
 		if v == "" {
+			continue
+		}
+		if k == "finishing-template" {
+			continue
+		}
+		if k == "output-mode" {
+			mode := strings.ToLower(strings.TrimSpace(v))
+			if mode == "color" || mode == "monochrome" {
+				if _, ok := opts["print-color-mode"]; !ok {
+					opts["print-color-mode"] = mode
+				}
+			}
 			continue
 		}
 		switch k {
@@ -143,6 +162,9 @@ func buildJobAttributesFromOptions(optionsJSON string) []goipp.Attribute {
 				out = append(out, goipp.MakeAttribute(k, goipp.TagEnum, goipp.Integer(n)))
 			}
 		case "finishings":
+			if ignoreFinishings {
+				continue
+			}
 			if enums := parseFinishingsEnums(v); len(enums) > 0 {
 				vals := make([]goipp.Value, 0, len(enums))
 				for _, n := range enums {
@@ -241,6 +263,23 @@ func parseFinishingsEnums(value string) []int {
 		}
 	}
 	return out
+}
+
+func finishingTemplateTag(value string) goipp.Tag {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return goipp.TagKeyword
+	}
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if ch >= 'A' && ch <= 'Z' {
+			return goipp.TagName
+		}
+	}
+	if strings.Contains(value, " ") {
+		return goipp.TagName
+	}
+	return goipp.TagKeyword
 }
 
 func splitList(value string, max int) []string {

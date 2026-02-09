@@ -57,13 +57,15 @@ type Job struct {
 }
 
 type Document struct {
-	ID        int64
-	JobID     int64
-	FileName  string
-	MimeType  string
-	SizeBytes int64
-	Path      string
-	CreatedAt time.Time
+	ID             int64
+	JobID          int64
+	FileName       string
+	MimeType       string
+	FormatSupplied string
+	NameSupplied   string
+	SizeBytes      int64
+	Path           string
+	CreatedAt      time.Time
 }
 
 type User struct {

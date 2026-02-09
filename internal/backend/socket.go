@@ -40,11 +40,15 @@ func (socketBackend) SubmitJob(ctx context.Context, printer model.Printer, job m
 	if !strings.Contains(host, ":") {
 		host = net.JoinHostPort(host, "9100")
 	}
-	conn, err := net.DialTimeout("tcp", host, 5*time.Second)
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", host)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
 
 	f, err := os.Open(filePath)
 	if err != nil {

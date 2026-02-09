@@ -68,6 +68,8 @@ func (s *Store) migrate(ctx context.Context) error {
                 job_id INTEGER NOT NULL,
                 file_name TEXT NOT NULL DEFAULT '',
                 mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+                format_supplied TEXT NOT NULL DEFAULT '',
+                name_supplied TEXT NOT NULL DEFAULT '',
                 size_bytes INTEGER NOT NULL DEFAULT 0,
                 path TEXT NOT NULL,
                 created_at DATETIME NOT NULL,
@@ -153,6 +155,12 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 		if err := ensureColumn(ctx, tx, "jobs", "processing_at", "DATETIME"); err != nil {
+			return err
+		}
+		if err := ensureColumn(ctx, tx, "documents", "format_supplied", "TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+		if err := ensureColumn(ctx, tx, "documents", "name_supplied", "TEXT NOT NULL DEFAULT ''"); err != nil {
 			return err
 		}
 		if err := ensureColumn(ctx, tx, "users", "digest_ha1", "TEXT NOT NULL DEFAULT ''"); err != nil {

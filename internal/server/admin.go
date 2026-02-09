@@ -2077,7 +2077,7 @@ func (s *Server) enqueueTestPage(ctx context.Context, printer model.Printer) err
 		if err != nil {
 			return err
 		}
-		_, err = s.Store.AddDocument(ctx, tx, job.ID, "test-page.txt", "text/plain", path, size)
+		_, err = s.Store.AddDocument(ctx, tx, job.ID, "test-page.txt", "text/plain", path, size, "", "")
 		return err
 	})
 }

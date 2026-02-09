@@ -46,6 +46,7 @@ type Config struct {
 	ClientConfDir        string
 	JobRetryLimit        int
 	JobRetryInterval     int
+	MultipleOperationTimeout int
 	ServerBin            string
 	RequestRoot          string
 	StateDir             string
@@ -91,6 +92,7 @@ func Load() Config {
 		WebInterface:    true,
 		LogLevel:        "info",
 		BrowseLocal:     true,
+		MultipleOperationTimeout: 900,
 	}
 
 	markEnvOverrides(&overrides)
@@ -231,6 +233,11 @@ func applyEnvOverrides(cfg *Config, overrides *configOverrides) {
 		cfg.TLSKeyPath = v
 		if overrides != nil {
 			overrides.tlsKeyLocked = true
+		}
+	}
+	if v, ok := os.LookupEnv("CUPS_MULTIPLE_OPERATION_TIMEOUT"); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			cfg.MultipleOperationTimeout = n
 		}
 	}
 	cfg.TLSEnabled = getenvBool("CUPS_TLS_ENABLED", cfg.TLSEnabled)
@@ -490,6 +497,10 @@ func parseCupsdConf(path string, cfg *Config, overrides *configOverrides) {
 		case "JobRetryInterval":
 			if n, ok := parseInt(value); ok {
 				cfg.JobRetryInterval = n
+			}
+		case "MultipleOperationTimeout":
+			if n, ok := parseInt(value); ok {
+				cfg.MultipleOperationTimeout = n
 			}
 		}
 	}

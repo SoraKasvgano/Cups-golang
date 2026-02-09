@@ -74,7 +74,10 @@ func (dnssdBackend) ListDevices(ctx context.Context) ([]Device, error) {
 				}
 				seen[key] = true
 				txt := parseTxtRecords(entry.InfoFields)
-				deviceURI := buildIPPURI(service, host, entry.Port, entry.Name, txt)
+				deviceURI := buildDNSSDDeviceURI(service, entry.Name, "local", txt)
+				if deviceURI == "" {
+					deviceURI = buildIPPURI(service, host, entry.Port, entry.Name, txt)
+				}
 				info := firstNonEmptyDevice(txt["ty"], txt["note"], entry.Name)
 				makeModel := firstNonEmptyDevice(txt["product"], txt["ty"], "IPP")
 				devices = append(devices, Device{
@@ -147,6 +150,26 @@ func buildIPPURI(service, host string, port int, name string, txt map[string]str
 	}
 	resource = strings.TrimPrefix(resource, "/")
 	return scheme + "://" + host + ":" + strconv.Itoa(port) + "/" + resource
+}
+
+func buildDNSSDDeviceURI(service, instance, domain string, txt map[string]string) string {
+	instance = strings.TrimSpace(instance)
+	if instance == "" || strings.TrimSpace(service) == "" {
+		return ""
+	}
+	if domain == "" {
+		domain = "local"
+	}
+	escaped := url.PathEscape(instance)
+	host := escaped + "." + service + "." + domain
+	path := "/"
+	if cupsShared, ok := txt["cups-shared"]; ok && (cupsShared == "1" || strings.EqualFold(cupsShared, "true")) {
+		path = "/cups"
+	}
+	if uuid := strings.TrimSpace(txt["uuid"]); uuid != "" {
+		return "dnssd://" + host + path + "?uuid=" + url.QueryEscape(uuid)
+	}
+	return "dnssd://" + host + path
 }
 
 func resolveDNSSDTarget(ctx context.Context, uri string) (string, error) {

@@ -68,7 +68,7 @@ func discoverMDNSIPP() []Device {
 	}
 	devices := []Device{}
 	seen := map[string]bool{}
-	services := []string{"_ipp._tcp", "_ipps._tcp"}
+	services := []string{"_ipp._tcp", "_ipps._tcp", "_ipp-tls._tcp", "_printer._tcp", "_pdl-datastream._tcp"}
 	for _, service := range services {
 		entries := make(chan *mdns.ServiceEntry, 64)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -109,7 +109,7 @@ func discoverMDNSIPP() []Device {
 				}
 				seen[key] = true
 				txt := parseTxtRecords(entry.InfoFields)
-				deviceURI := buildIPPURI(service, host, entry.Port, entry.Name, txt)
+				deviceURI := buildDNSSDURI(service, host, entry.Port, entry.Name, txt)
 				info := firstNonEmptyDevice(txt["ty"], txt["note"], entry.Name)
 				makeModel := firstNonEmptyDevice(txt["product"], txt["ty"], "IPP")
 				devices = append(devices, Device{
@@ -146,7 +146,7 @@ func parseTxtRecords(records []string) map[string]string {
 
 func buildIPPURI(service, host string, port int, name string, txt map[string]string) string {
 	scheme := "ipp"
-	if strings.Contains(service, "ipps") {
+	if strings.Contains(service, "ipps") || strings.Contains(service, "ipp-tls") {
 		scheme = "ipps"
 	}
 	resource := txt["rp"]
@@ -155,6 +155,31 @@ func buildIPPURI(service, host string, port int, name string, txt map[string]str
 	}
 	resource = strings.TrimPrefix(resource, "/")
 	return scheme + "://" + host + ":" + strconv.Itoa(port) + "/" + resource
+}
+
+func buildDNSSDURI(service, host string, port int, name string, txt map[string]string) string {
+	switch {
+	case strings.Contains(service, "_pdl-datastream"):
+		if port == 0 {
+			port = 9100
+		}
+		return "socket://" + host + ":" + strconv.Itoa(port)
+	case strings.Contains(service, "_printer"):
+		if port == 0 {
+			port = 515
+		}
+		queue := strings.TrimSpace(txt["rp"])
+		if queue == "" {
+			queue = strings.TrimSpace(name)
+		}
+		if queue == "" {
+			queue = "lp"
+		}
+		queue = strings.TrimPrefix(queue, "/")
+		return "lpd://" + host + ":" + strconv.Itoa(port) + "/" + queue
+	default:
+		return buildIPPURI(service, host, port, name, txt)
+	}
 }
 
 func firstNonEmptyDevice(values ...string) string {

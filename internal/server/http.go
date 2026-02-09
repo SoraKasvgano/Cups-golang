@@ -56,7 +56,7 @@ func (s *Server) Handler() http.Handler {
 		switch {
 		case r.URL.Path == "/":
 			s.handleRoot(w, r)
-		case r.URL.Path == "/cups.css" || r.URL.Path == "/cups-printable.css" || r.URL.Path == "/apple-touch-icon.png" || r.URL.Path == "/robots.txt" || strings.HasPrefix(r.URL.Path, "/images/"):
+		case r.URL.Path == "/cups.css" || r.URL.Path == "/cups-printable.css" || r.URL.Path == "/apple-touch-icon.png" || r.URL.Path == "/robots.txt" || strings.HasPrefix(r.URL.Path, "/images/") || strings.HasPrefix(r.URL.Path, "/strings/"):
 			web.CupsAssetHandler().ServeHTTP(w, r)
 		case r.URL.Path == "/help" || r.URL.Path == "/help/":
 			web.RenderHelp(w, r)

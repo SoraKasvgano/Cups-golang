@@ -3,11 +3,13 @@ package backend
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,11 +48,15 @@ func (lpdBackend) SubmitJob(ctx context.Context, printer model.Printer, job mode
 		queue = "lp"
 	}
 
-	conn, err := net.DialTimeout("tcp", host, 5*time.Second)
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", host)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
 	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 
 	if err := lpdSendReceiveJob(rw, queue); err != nil {
@@ -65,19 +71,25 @@ func (lpdBackend) SubmitJob(ctx context.Context, printer model.Printer, job mode
 	if user == "" {
 		user = "anonymous"
 	}
-	jobName := job.Name
-	if jobName == "" {
-		jobName = "Untitled"
+	title := strings.TrimSpace(job.Name)
+	if title == "" {
+		title = strings.TrimSpace(doc.FileName)
 	}
-	docName := doc.FileName
-	if docName == "" {
-		docName = jobName
+	if title == "" {
+		title = "Untitled"
 	}
+	opts := parseBackendOptions(job.Options)
+	copies := parseIntOption(opts, "copies", 1)
+	if copies < 1 {
+		copies = 1
+	}
+	banner := shouldSendLPDBanner(opts)
 	jobID := int(job.ID % 1000)
-	cfName := fmt.Sprintf("cfA%03d%s", jobID, hostName)
-	dfName := fmt.Sprintf("dfA%03d%s", jobID, hostName)
+	hostShort := truncateLPD(hostName, 15)
+	cfName := fmt.Sprintf("cfA%03d%s", jobID, hostShort)
+	dfName := fmt.Sprintf("dfA%03d%s", jobID, hostShort)
 
-	control := buildLPDControl(hostName, user, jobName, docName, dfName)
+	control := buildLPDControl(hostName, user, title, dfName, banner, copies)
 	if err := lpdSendControl(rw, cfName, []byte(control)); err != nil {
 		return err
 	}
@@ -168,14 +180,80 @@ func lpdAck(rw *bufio.ReadWriter) error {
 	return nil
 }
 
-func buildLPDControl(host, user, jobName, docName, dataFile string) string {
+func buildLPDControl(host, user, title, dataFile string, banner bool, copies int) string {
+	host = truncateLPD(host, 31)
+	user = truncateLPD(user, 31)
+	title = truncateLPD(title, 99)
 	lines := []string{
 		"H" + host,
 		"P" + user,
-		"J" + jobName,
-		"N" + docName,
-		"U" + dataFile,
-		"l" + dataFile,
+		"J" + title,
 	}
+	if banner {
+		lines = append(lines,
+			"C"+host,
+			"L"+user,
+		)
+	}
+	if copies < 1 {
+		copies = 1
+	}
+	for i := 0; i < copies; i++ {
+		lines = append(lines, "l"+dataFile)
+	}
+	lines = append(lines,
+		"U"+dataFile,
+		"N"+truncateLPD(title, 131),
+	)
 	return strings.Join(lines, "\n") + "\n"
+}
+
+func parseBackendOptions(optionsJSON string) map[string]string {
+	opts := map[string]string{}
+	if strings.TrimSpace(optionsJSON) == "" {
+		return opts
+	}
+	_ = json.Unmarshal([]byte(optionsJSON), &opts)
+	return opts
+}
+
+func parseIntOption(opts map[string]string, key string, def int) int {
+	if opts == nil {
+		return def
+	}
+	if v := strings.TrimSpace(opts[key]); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func shouldSendLPDBanner(opts map[string]string) bool {
+	if opts == nil {
+		return false
+	}
+	val := strings.TrimSpace(opts["job-sheets"])
+	if val == "" || strings.EqualFold(val, "none") {
+		return false
+	}
+	parts := strings.Split(val, ",")
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" && !strings.EqualFold(p, "none") {
+			return true
+		}
+	}
+	return false
+}
+
+func truncateLPD(val string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	val = strings.TrimSpace(val)
+	if len(val) <= max {
+		return val
+	}
+	return val[:max]
 }

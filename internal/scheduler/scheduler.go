@@ -206,7 +206,14 @@ func (s *Scheduler) releaseHeldJobs(ctx context.Context) {
 			continue
 		}
 		optionsJSON := job.Options
+		changed := false
 		if normalizeRetryOptions(opts, now) {
+			changed = true
+		}
+		if normalizeHoldOptions(opts, now) {
+			changed = true
+		}
+		if changed {
 			if b, err := json.Marshal(opts); err == nil {
 				optionsJSON = string(b)
 			}
@@ -770,6 +777,8 @@ func buildCupsOptions(optionsJSON string) string {
 	if err := json.Unmarshal([]byte(optionsJSON), &opts); err != nil {
 		return ""
 	}
+	template := strings.TrimSpace(opts["finishing-template"])
+	useTemplate := template != "" && !strings.EqualFold(template, "none")
 	parts := make([]string, 0, len(opts))
 	for k, v := range opts {
 		if strings.HasPrefix(strings.ToLower(k), "cups-") {
@@ -777,6 +786,12 @@ func buildCupsOptions(optionsJSON string) string {
 		}
 		if v == "" {
 			continue
+		}
+		if useTemplate && strings.EqualFold(k, "finishings") {
+			continue
+		}
+		if strings.EqualFold(k, "finishing-template") {
+			k = "cupsFinishingTemplate"
 		}
 		parts = append(parts, k+"="+v)
 	}
@@ -877,6 +892,11 @@ func shouldHoldJob(job model.Job, opts map[string]string, now time.Time) string 
 			return "job-retry"
 		}
 	}
+	if holdUntil := optionInt64(opts, "cups-hold-until"); holdUntil > 0 {
+		if now.Unix() < holdUntil {
+			return "job-incoming"
+		}
+	}
 	hold, _ := jobHoldStatus(opts["job-hold-until"], job.SubmittedAt, now)
 	if hold {
 		return "job-hold-until-specified"
@@ -891,6 +911,18 @@ func normalizeRetryOptions(opts map[string]string, now time.Time) bool {
 	}
 	if now.Unix() >= retryAt {
 		delete(opts, "cups-retry-at")
+		return true
+	}
+	return false
+}
+
+func normalizeHoldOptions(opts map[string]string, now time.Time) bool {
+	holdUntil := optionInt64(opts, "cups-hold-until")
+	if holdUntil <= 0 {
+		return false
+	}
+	if now.Unix() >= holdUntil {
+		delete(opts, "cups-hold-until")
 		return true
 	}
 	return false

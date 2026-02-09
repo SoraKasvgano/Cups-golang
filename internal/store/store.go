@@ -477,12 +477,12 @@ func (s *Store) CreateJob(ctx context.Context, tx *sql.Tx, printerID int64, name
 	}, nil
 }
 
-func (s *Store) AddDocument(ctx context.Context, tx *sql.Tx, jobID int64, fileName, mimeType, path string, sizeBytes int64) (model.Document, error) {
+func (s *Store) AddDocument(ctx context.Context, tx *sql.Tx, jobID int64, fileName, mimeType, path string, sizeBytes int64, nameSupplied, formatSupplied string) (model.Document, error) {
 	now := time.Now().UTC()
 	res, err := tx.ExecContext(ctx, `
-        INSERT INTO documents (job_id, file_name, mime_type, size_bytes, path, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    `, jobID, fileName, mimeType, sizeBytes, path, now)
+        INSERT INTO documents (job_id, file_name, mime_type, format_supplied, name_supplied, size_bytes, path, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `, jobID, fileName, mimeType, formatSupplied, nameSupplied, sizeBytes, path, now)
 	if err != nil {
 		return model.Document{}, err
 	}
@@ -491,13 +491,15 @@ func (s *Store) AddDocument(ctx context.Context, tx *sql.Tx, jobID int64, fileNa
 		return model.Document{}, err
 	}
 	return model.Document{
-		ID:        id,
-		JobID:     jobID,
-		FileName:  fileName,
-		MimeType:  mimeType,
-		SizeBytes: sizeBytes,
-		Path:      path,
-		CreatedAt: now,
+		ID:             id,
+		JobID:          jobID,
+		FileName:       fileName,
+		MimeType:       mimeType,
+		FormatSupplied: formatSupplied,
+		NameSupplied:   nameSupplied,
+		SizeBytes:      sizeBytes,
+		Path:           path,
+		CreatedAt:      now,
 	}, nil
 }
 
@@ -1496,7 +1498,7 @@ func (s *Store) ListTerminalJobs(ctx context.Context, tx *sql.Tx, limit int) ([]
 
 func (s *Store) ListDocumentsByJob(ctx context.Context, tx *sql.Tx, jobID int64) ([]model.Document, error) {
 	rows, err := tx.QueryContext(ctx, `
-        SELECT id, job_id, file_name, mime_type, size_bytes, path, created_at
+        SELECT id, job_id, file_name, mime_type, format_supplied, name_supplied, size_bytes, path, created_at
         FROM documents
         WHERE job_id = ?
         ORDER BY id
@@ -1509,7 +1511,7 @@ func (s *Store) ListDocumentsByJob(ctx context.Context, tx *sql.Tx, jobID int64)
 	docs := []model.Document{}
 	for rows.Next() {
 		var doc model.Document
-		if err := rows.Scan(&doc.ID, &doc.JobID, &doc.FileName, &doc.MimeType, &doc.SizeBytes, &doc.Path, &doc.CreatedAt); err != nil {
+		if err := rows.Scan(&doc.ID, &doc.JobID, &doc.FileName, &doc.MimeType, &doc.FormatSupplied, &doc.NameSupplied, &doc.SizeBytes, &doc.Path, &doc.CreatedAt); err != nil {
 			return nil, err
 		}
 		docs = append(docs, doc)
@@ -1577,6 +1579,24 @@ func (s *Store) ListJobIDsByPrinter(ctx context.Context, tx *sql.Tx, printerID i
 		out = append(out, id)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) CountQueuedJobsByPrinterIDs(ctx context.Context, tx *sql.Tx, printerIDs []int64) (int, error) {
+	if len(printerIDs) == 0 {
+		return 0, nil
+	}
+	placeholders := strings.Repeat("?,", len(printerIDs))
+	placeholders = strings.TrimSuffix(placeholders, ",")
+	args := make([]any, 0, len(printerIDs))
+	for _, id := range printerIDs {
+		args = append(args, id)
+	}
+	query := fmt.Sprintf(`SELECT COUNT(1) FROM jobs WHERE printer_id IN (%s) AND state IN (3, 4, 5, 6)`, placeholders)
+	var count int
+	if err := tx.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func (s *Store) DeleteJob(ctx context.Context, tx *sql.Tx, jobID int64) error {
