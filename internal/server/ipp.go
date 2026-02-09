@@ -2191,9 +2191,10 @@ func (s *Server) handleGetDocuments(ctx context.Context, r *http.Request, req *g
 
 func (s *Server) handleGetDocumentAttributes(ctx context.Context, r *http.Request, req *goipp.Message) (*goipp.Message, error) {
 	jobID := int64(0)
-	docNum := int(attrInt(req.Operation, "document-number"))
-	if uri := attrString(req.Operation, "document-uri"); uri != "" {
-		jobID, docNum = parseDocumentURI(uri)
+	docNum := 0
+	docURI := attrString(req.Operation, "document-uri")
+	if docURI != "" {
+		jobID, docNum = parseDocumentURI(docURI)
 	}
 	if jobID == 0 {
 		if uri := attrString(req.Operation, "job-uri"); uri != "" {
@@ -2211,8 +2212,26 @@ func (s *Server) handleGetDocumentAttributes(ctx context.Context, r *http.Reques
 	if jobID == 0 {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
 	}
+	if docURI == "" {
+		docAttr := attrByName(req.Operation, "document-number")
+		if docAttr == nil {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+		}
+		if len(docAttr.Values) != 1 {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
+		}
+		if v, ok := docAttr.Values[0].V.(goipp.Integer); ok {
+			docNum = int(v)
+		} else {
+			if parsed, err := strconv.Atoi(docAttr.Values[0].V.String()); err == nil {
+				docNum = parsed
+			} else {
+				return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+			}
+		}
+	}
 	if docNum <= 0 {
-		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+		return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
 	}
 
 	var job model.Job
@@ -2255,6 +2274,10 @@ func buildDocumentAttributes(doc model.Document, docNum int64, totalDocs int, jo
 	attrs := goipp.Attributes{}
 	attrs.Add(goipp.MakeAttribute("document-number", goipp.TagInteger, goipp.Integer(docNum)))
 	attrs.Add(goipp.MakeAttribute("document-uri", goipp.TagURI, goipp.String(documentURIFor(job.ID, docNum, r))))
+	attrs.Add(goipp.MakeAttribute("more-info", goipp.TagURI, goipp.String(documentURIFor(job.ID, docNum, r))))
+	if uuid := documentUUIDFor(job, printer, docNum, r); uuid != "" {
+		attrs.Add(goipp.MakeAttribute("document-uuid", goipp.TagURI, goipp.String(uuid)))
+	}
 	if job.ID != 0 {
 		attrs.Add(goipp.MakeAttribute("document-job-id", goipp.TagInteger, goipp.Integer(job.ID)))
 		attrs.Add(goipp.MakeAttribute("document-job-uri", goipp.TagURI, goipp.String(jobURIFor(job, r))))
@@ -2269,6 +2292,10 @@ func buildDocumentAttributes(doc model.Document, docNum int64, totalDocs int, jo
 	}
 	attrs.Add(goipp.MakeAttribute("document-state-reasons", goipp.TagKeyword, goipp.String(stateReason)))
 	attrs.Add(goipp.MakeAttribute("document-state-message", goipp.TagText, goipp.String(stateReason)))
+	attrs.Add(goipp.MakeAttribute("document-message", goipp.TagText, goipp.String(stateReason)))
+	attrs.Add(goipp.MakeAttribute("document-access-errors", goipp.TagKeyword, goipp.String("none")))
+	attrs.Add(goipp.MakeAttribute("errors-count", goipp.TagInteger, goipp.Integer(0)))
+	attrs.Add(goipp.MakeAttribute("warnings-count", goipp.TagInteger, goipp.Integer(0)))
 	attrs.Add(goipp.MakeAttribute("printer-up-time", goipp.TagInteger, goipp.Integer(time.Now().Unix())))
 	attrs.Add(goipp.MakeAttribute("time-at-creation", goipp.TagInteger, goipp.Integer(job.SubmittedAt.Unix())))
 	attrs.Add(goipp.MakeAttribute("date-time-at-creation", goipp.TagDateTime, goipp.Time{job.SubmittedAt}))
@@ -2324,6 +2351,9 @@ func buildDocumentAttributes(doc model.Document, docNum int64, totalDocs int, jo
 		}
 		attrs.Add(goipp.MakeAttribute("k-octets-processed", goipp.TagInteger, goipp.Integer(processed)))
 	}
+	appendDocumentActualAttributes(&attrs, job, printer)
+	ensureDocumentDescriptionDefaults(&attrs, job, printer, doc, totalDocs, stateReason)
+	ensureDocumentStatusDefaults(&attrs, job, stateReason)
 	return filterAttributesForRequest(attrs, req)
 }
 
@@ -2347,6 +2377,789 @@ func shouldAddDocumentFormatDetected(doc model.Document, printer model.Printer) 
 		}
 	}
 	return true
+}
+
+func appendDocumentActualAttributes(attrs *goipp.Attributes, job model.Job, printer model.Printer) {
+	if attrs == nil {
+		return
+	}
+	if media := getJobOption(job.Options, "media"); media != "" {
+		attrs.Add(goipp.MakeAttribute("media-actual", goipp.TagKeyword, goipp.String(media)))
+		mediaType := getJobOption(job.Options, "media-type")
+		mediaSource := getJobOption(job.Options, "media-source")
+		attrs.Add(makeMediaColAttrWithOptions("media-col-actual", media, mediaType, mediaSource, nil))
+	}
+	if sides := getJobOption(job.Options, "sides"); sides != "" {
+		attrs.Add(goipp.MakeAttribute("sides-actual", goipp.TagKeyword, goipp.String(sides)))
+	}
+	copiesActual := 1
+	if copies := getJobOption(job.Options, "copies"); copies != "" {
+		if n, err := strconv.Atoi(copies); err == nil {
+			copiesActual = n
+		}
+	}
+	attrs.Add(goipp.MakeAttribute("copies-actual", goipp.TagInteger, goipp.Integer(copiesActual)))
+	finishingTemplate := strings.TrimSpace(getJobOption(job.Options, "finishing-template"))
+	if finishingTemplate != "" && !strings.EqualFold(finishingTemplate, "none") {
+		attrs.Add(makeFinishingsColAttrWithTemplate("finishings-col-actual", finishingTemplate))
+	} else if finishings := getJobOption(job.Options, "finishings"); finishings != "" {
+		if vals := parseFinishingsList(finishings); len(vals) > 0 {
+			attrs.Add(makeEnumsAttr("finishings-actual", vals))
+			attrs.Add(makeFinishingsColAttr("finishings-col-actual", vals))
+		}
+	}
+	if numberUp := getJobOption(job.Options, "number-up"); numberUp != "" {
+		if n, err := strconv.Atoi(numberUp); err == nil {
+			attrs.Add(goipp.MakeAttribute("number-up-actual", goipp.TagInteger, goipp.Integer(n)))
+		}
+	}
+	if scaling := getJobOption(job.Options, "print-scaling"); scaling != "" {
+		attrs.Add(goipp.MakeAttribute("print-scaling-actual", goipp.TagKeyword, goipp.String(scaling)))
+	}
+	if orientation := getJobOption(job.Options, "orientation-requested"); orientation != "" {
+		if n, err := strconv.Atoi(orientation); err == nil {
+			attrs.Add(goipp.MakeAttribute("orientation-requested-actual", goipp.TagEnum, goipp.Integer(n)))
+		}
+	}
+	if delivery := getJobOption(job.Options, "page-delivery"); delivery != "" {
+		attrs.Add(goipp.MakeAttribute("page-delivery-actual", goipp.TagKeyword, goipp.String(delivery)))
+	}
+	if res := getJobOption(job.Options, "printer-resolution"); res != "" {
+		if parsed, ok := parseResolution(res); ok {
+			attrs.Add(goipp.MakeAttribute("printer-resolution-actual", goipp.TagResolution, parsed))
+		}
+	}
+	if bin := getJobOption(job.Options, "output-bin"); bin != "" {
+		attrs.Add(goipp.MakeAttribute("output-bin-actual", goipp.TagKeyword, goipp.String(bin)))
+	}
+	if ranges := getJobOption(job.Options, "page-ranges"); ranges != "" {
+		if parsed, ok := parsePageRangesList(ranges); ok {
+			attrs.Add(makePageRangesAttr("page-ranges-actual", parsed))
+		}
+	}
+	if colorMode := getJobOption(job.Options, "print-color-mode"); colorMode != "" {
+		attrs.Add(goipp.MakeAttribute("print-color-mode-actual", goipp.TagKeyword, goipp.String(colorMode)))
+	}
+	quality := getJobOption(job.Options, "print-quality")
+	if quality != "" {
+		if n, err := strconv.Atoi(quality); err == nil {
+			attrs.Add(goipp.MakeAttribute("print-quality-actual", goipp.TagEnum, goipp.Integer(n)))
+		}
+	} else {
+		attrs.Add(goipp.MakeAttribute("print-quality-actual", goipp.TagEnum, goipp.Integer(4)))
+	}
+}
+
+func ensureDocumentDescriptionDefaults(attrs *goipp.Attributes, job model.Job, printer model.Printer, doc model.Document, totalDocs int, stateReason string) {
+	if attrs == nil {
+		return
+	}
+	existing := map[string]bool{}
+	for _, attr := range *attrs {
+		existing[attr.Name] = true
+	}
+	docCount := int64(0)
+	if totalDocs <= 1 {
+		docCount = int64(job.Impressions)
+	}
+	if docCount < 0 {
+		docCount = 0
+	}
+	for name := range documentDescriptionAttrs {
+		if existing[name] {
+			continue
+		}
+		switch name {
+		case "impressions", "impressions-completed", "pages", "pages-completed", "media-sheets", "media-sheets-completed":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(docCount)))
+		case "impressions-completed-current-copy", "pages-completed-current-copy", "sheet-completed-copy-number":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(0)))
+		case "k-octets", "k-octets-processed":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(0)))
+		case "errors-count", "warnings-count":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(0)))
+		case "output-device-assigned":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagName, goipp.String(printer.Name)))
+		case "document-message":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagText, goipp.String(stateReason)))
+		case "document-access-errors":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagKeyword, goipp.String("none")))
+		case "document-metadata", "document-format-details", "detailed-status-messages":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+		case "printer-up-time":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(time.Now().Unix())))
+		default:
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+		}
+	}
+}
+
+func ensureJobDescriptionDefaults(attrs *goipp.Attributes, job model.Job, printer model.Printer, r *http.Request, doc model.Document, docCount int, jobURI, stateReason string) {
+	if attrs == nil {
+		return
+	}
+	existing := map[string]bool{}
+	for _, attr := range *attrs {
+		existing[attr.Name] = true
+	}
+	user := strings.TrimSpace(job.UserName)
+	if user == "" {
+		user = "anonymous"
+	}
+	host := strings.TrimSpace(job.OriginHost)
+	if host == "" {
+		host = requestHost(r)
+	}
+	priorityVal := 50
+	if priority := getJobOption(job.Options, "job-priority"); priority != "" {
+		if n, err := strconv.Atoi(priority); err == nil {
+			priorityVal = n
+		}
+	}
+	holdUntil := getJobOption(job.Options, "job-hold-until")
+	if holdUntil == "" {
+		holdUntil = "no-hold"
+	}
+	kOctets := int64(0)
+	if doc.SizeBytes > 0 {
+		kOctets = (doc.SizeBytes + 1023) / 1024
+	}
+	processingTime := int64(0)
+	if job.ProcessingAt != nil && !job.ProcessingAt.IsZero() {
+		end := time.Now()
+		if job.CompletedAt != nil && !job.CompletedAt.IsZero() {
+			end = *job.CompletedAt
+		}
+		if end.Before(*job.ProcessingAt) {
+			end = *job.ProcessingAt
+		}
+		processingTime = int64(end.Sub(*job.ProcessingAt).Seconds())
+		if processingTime < 0 {
+			processingTime = 0
+		}
+	}
+	completedCount := int64(0)
+	if job.CompletedAt != nil || job.State >= 5 {
+		completedCount = int64(job.Impressions)
+	}
+
+	for name := range jobDescriptionAttrs {
+		if existing[name] {
+			continue
+		}
+		switch name {
+		case "job-id":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(job.ID)))
+		case "job-uri":
+			if jobURI == "" {
+				jobURI = jobURIFor(job, r)
+			}
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagURI, goipp.String(jobURI)))
+		case "job-name":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagName, goipp.String(job.Name)))
+		case "job-state":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagEnum, goipp.Integer(job.State)))
+		case "job-state-reasons":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagKeyword, goipp.String(stateReason)))
+		case "job-state-message":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagText, goipp.String(stateReason)))
+		case "job-originating-user-name", "original-requesting-user-name":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagName, goipp.String(user)))
+		case "job-originating-user-uri":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagURI, goipp.String("urn:sub:"+user)))
+		case "job-originating-host-name":
+			if host != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagName, goipp.String(host)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "job-printer-uri":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagURI, goipp.String(printerURIFor(printer, r))))
+		case "job-printer-state-reasons":
+			printerReason := printerStateReason(printer)
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagKeyword, goipp.String(printerReason)))
+		case "job-printer-state-message":
+			printerReason := printerStateReason(printer)
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagText, goipp.String(printerReason)))
+		case "job-printer-up-time":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(time.Now().Unix())))
+		case "time-at-creation":
+			if !job.SubmittedAt.IsZero() {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(job.SubmittedAt.Unix())))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "date-time-at-creation":
+			if !job.SubmittedAt.IsZero() {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagDateTime, goipp.Time{job.SubmittedAt}))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "time-at-processing":
+			if job.ProcessingAt != nil && !job.ProcessingAt.IsZero() {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(job.ProcessingAt.Unix())))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "date-time-at-processing":
+			if job.ProcessingAt != nil && !job.ProcessingAt.IsZero() {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagDateTime, goipp.Time{*job.ProcessingAt}))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "time-at-completed":
+			if job.CompletedAt != nil && !job.CompletedAt.IsZero() {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(job.CompletedAt.Unix())))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "date-time-at-completed":
+			if job.CompletedAt != nil && !job.CompletedAt.IsZero() {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagDateTime, goipp.Time{*job.CompletedAt}))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "job-impressions":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(job.Impressions)))
+		case "job-impressions-completed":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(completedCount)))
+		case "job-priority-actual":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(priorityVal)))
+		case "job-hold-until-actual":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagKeyword, goipp.String(holdUntil)))
+		case "job-account-id-actual":
+			if account := getJobOption(job.Options, "job-account-id"); account != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagName, goipp.String(account)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "job-accounting-user-id-actual":
+			if account := getJobOption(job.Options, "job-accounting-user-id"); account != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagName, goipp.String(account)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "job-k-octets":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(kOctets)))
+		case "job-k-octets-processed":
+			processed := int64(0)
+			if job.State >= 5 {
+				processed = kOctets
+			}
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(processed)))
+		case "job-pages":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(job.Impressions)))
+		case "job-pages-completed":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(completedCount)))
+		case "job-media-sheets":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(job.Impressions)))
+		case "job-media-sheets-completed":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(completedCount)))
+		case "job-more-info":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagURI, goipp.String(jobMoreInfoURI(job, r))))
+		case "job-uuid":
+			if uuid := jobUUIDFor(job, printer, r); uuid != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagURI, goipp.String(uuid)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "number-of-documents":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(docCount)))
+		case "number-of-intervening-jobs":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(0)))
+		case "output-device-assigned":
+			if printer.Name != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagName, goipp.String(printer.Name)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "job-processing-time":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(processingTime)))
+		case "document-format-supplied":
+			if supplied := strings.TrimSpace(doc.FormatSupplied); supplied != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagMimeType, goipp.String(supplied)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "document-name-supplied":
+			if supplied := strings.TrimSpace(doc.NameSupplied); supplied != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagName, goipp.String(supplied)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "document-charset-supplied":
+			if supplied := strings.TrimSpace(getJobOption(job.Options, "document-charset-supplied")); supplied != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagCharset, goipp.String(supplied)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "document-natural-language-supplied":
+			if supplied := strings.TrimSpace(getJobOption(job.Options, "document-natural-language-supplied")); supplied != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagLanguage, goipp.String(supplied)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "compression-supplied":
+			if supplied := strings.TrimSpace(getJobOption(job.Options, "compression-supplied")); supplied != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagKeyword, goipp.String(supplied)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "job-attribute-fidelity":
+			if fidelity := strings.TrimSpace(getJobOption(job.Options, "job-attribute-fidelity")); fidelity != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagBoolean, goipp.Boolean(isTruthy(fidelity))))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "copies-actual":
+			copiesActual := 1
+			if copies := getJobOption(job.Options, "copies"); copies != "" {
+				if n, err := strconv.Atoi(copies); err == nil {
+					copiesActual = n
+				}
+			}
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(copiesActual)))
+		case "job-sheets-actual":
+			sheets := getJobOption(job.Options, "job-sheets")
+			if sheets == "" {
+				sheets = printer.JobSheetsDefault
+			}
+			if strings.TrimSpace(sheets) == "" {
+				sheets = "none"
+			}
+			attrs.Add(makeJobSheetsAttr(name, sheets))
+		case "job-sheets-col-actual":
+			sheets := getJobOption(job.Options, "job-sheets")
+			if sheets == "" {
+				sheets = printer.JobSheetsDefault
+			}
+			if strings.TrimSpace(sheets) == "" {
+				sheets = "none"
+			}
+			jobSheetsMedia := getJobOption(job.Options, "job-sheets-col-media")
+			jobSheetsMediaType := getJobOption(job.Options, "job-sheets-col-media-type")
+			jobSheetsMediaSource := getJobOption(job.Options, "job-sheets-col-media-source")
+			attrs.Add(makeJobSheetsColAttr(name, sheets, jobSheetsMedia, jobSheetsMediaType, jobSheetsMediaSource))
+		case "media-actual":
+			if media := getJobOption(job.Options, "media"); media != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagKeyword, goipp.String(media)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "media-col-actual":
+			if media := getJobOption(job.Options, "media"); media != "" {
+				mediaType := getJobOption(job.Options, "media-type")
+				mediaSource := getJobOption(job.Options, "media-source")
+				attrs.Add(makeMediaColAttrWithOptions(name, media, mediaType, mediaSource, nil))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "number-up-actual":
+			if numberUp := getJobOption(job.Options, "number-up"); numberUp != "" {
+				if n, err := strconv.Atoi(numberUp); err == nil {
+					attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(n)))
+				} else {
+					attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+				}
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "orientation-requested-actual":
+			if orientation := getJobOption(job.Options, "orientation-requested"); orientation != "" {
+				if n, err := strconv.Atoi(orientation); err == nil {
+					attrs.Add(goipp.MakeAttribute(name, goipp.TagEnum, goipp.Integer(n)))
+				} else {
+					attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+				}
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "output-bin-actual":
+			if bin := getJobOption(job.Options, "output-bin"); bin != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagKeyword, goipp.String(bin)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "page-delivery-actual":
+			if delivery := getJobOption(job.Options, "page-delivery"); delivery != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagKeyword, goipp.String(delivery)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "page-ranges-actual":
+			if ranges := getJobOption(job.Options, "page-ranges"); ranges != "" {
+				if parsed, ok := parsePageRangesList(ranges); ok {
+					attrs.Add(makePageRangesAttr(name, parsed))
+				} else {
+					attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+				}
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "print-color-mode-actual":
+			if colorMode := getJobOption(job.Options, "print-color-mode"); colorMode != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagKeyword, goipp.String(colorMode)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "print-quality-actual":
+			if quality := getJobOption(job.Options, "print-quality"); quality != "" {
+				if n, err := strconv.Atoi(quality); err == nil {
+					attrs.Add(goipp.MakeAttribute(name, goipp.TagEnum, goipp.Integer(n)))
+				} else {
+					attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+				}
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagEnum, goipp.Integer(4)))
+			}
+		case "print-scaling-actual":
+			if scaling := getJobOption(job.Options, "print-scaling"); scaling != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagKeyword, goipp.String(scaling)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "printer-resolution-actual":
+			if res := getJobOption(job.Options, "printer-resolution"); res != "" {
+				if parsed, ok := parseResolution(res); ok {
+					attrs.Add(goipp.MakeAttribute(name, goipp.TagResolution, parsed))
+				} else {
+					attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+				}
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "sides-actual":
+			if sides := getJobOption(job.Options, "sides"); sides != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagKeyword, goipp.String(sides)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		default:
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+		}
+	}
+}
+
+func ensurePrinterDescriptionDefaults(attrs *goipp.Attributes, name string, r *http.Request, cfg config.Config, authInfo []string) {
+	if attrs == nil {
+		return
+	}
+	existing := map[string]bool{}
+	for _, attr := range *attrs {
+		existing[attr.Name] = true
+	}
+	host := hostForRequest(r)
+	for attrName := range printerDescriptionAttrs {
+		if existing[attrName] {
+			continue
+		}
+		switch attrName {
+		case "printer-icons":
+			if strings.TrimSpace(name) != "" && strings.TrimSpace(host) != "" {
+				uri := fmt.Sprintf("%s://%s/icons/%s.png", webScheme(r), host, name)
+				attrs.Add(goipp.MakeAttribute(attrName, goipp.TagURI, goipp.String(uri)))
+			}
+		case "printer-dns-sd-name":
+			if cfg.DNSSDHostName != "" {
+				attrs.Add(goipp.MakeAttribute(attrName, goipp.TagName, goipp.String(cfg.DNSSDHostName)))
+			}
+		case "uri-security-supported":
+			attrs.Add(goipp.MakeAttribute(attrName, goipp.TagKeyword, goipp.String(uriSecurityForRequest(r))))
+		case "uri-authentication-supported":
+			attrs.Add(goipp.MakeAttribute(attrName, goipp.TagKeyword, goipp.String(authSupportedForAuthInfo(authInfo))))
+		case "printer-geo-location":
+			attrs.Add(goipp.MakeAttribute(attrName, goipp.TagUnknown, goipp.Void{}))
+		default:
+			continue
+		}
+	}
+}
+
+func ensureJobTemplateDefaults(attrs *goipp.Attributes) {
+	if attrs == nil {
+		return
+	}
+	existing := map[string]bool{}
+	for _, attr := range *attrs {
+		existing[attr.Name] = true
+	}
+	for name := range jobTemplateAttrs {
+		if existing[name] {
+			continue
+		}
+		attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+	}
+}
+
+func ensureDocumentTemplateDefaults(attrs *goipp.Attributes) {
+	if attrs == nil {
+		return
+	}
+	existing := map[string]bool{}
+	for _, attr := range *attrs {
+		existing[attr.Name] = true
+	}
+	for name := range documentTemplateAttrs {
+		if existing[name] {
+			continue
+		}
+		attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+	}
+}
+
+func ensurePrinterDefaultsDefaults(attrs *goipp.Attributes) {
+	if attrs == nil {
+		return
+	}
+	existing := map[string]bool{}
+	for _, attr := range *attrs {
+		existing[attr.Name] = true
+	}
+	for name := range printerDefaultsAttrs {
+		if existing[name] {
+			continue
+		}
+		attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+	}
+}
+
+func ensurePrinterStatusDefaults(attrs *goipp.Attributes) {
+	if attrs == nil {
+		return
+	}
+	existing := map[string]bool{}
+	for _, attr := range *attrs {
+		existing[attr.Name] = true
+	}
+	for name := range printerStatusAttrs {
+		if existing[name] {
+			continue
+		}
+		attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+	}
+}
+
+func ensurePrinterConfigurationDefaults(attrs *goipp.Attributes) {
+	if attrs == nil {
+		return
+	}
+	existing := map[string]bool{}
+	for _, attr := range *attrs {
+		existing[attr.Name] = true
+	}
+	for name := range printerConfigurationAttrs {
+		if existing[name] {
+			continue
+		}
+		attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+	}
+}
+
+func ensureSubscriptionDescriptionDefaults(attrs *goipp.Attributes, sub model.Subscription, r *http.Request, s *Server) {
+	if attrs == nil {
+		return
+	}
+	existing := map[string]bool{}
+	for _, attr := range *attrs {
+		existing[attr.Name] = true
+	}
+	events := strings.Split(strings.TrimSpace(sub.Events), ",")
+	clean := make([]string, 0, len(events))
+	for _, e := range events {
+		e = strings.TrimSpace(e)
+		if e != "" {
+			clean = append(clean, e)
+		}
+	}
+	if len(clean) == 0 {
+		clean = []string{"all"}
+	}
+	user := strings.TrimSpace(sub.Owner)
+	if user == "" {
+		user = "anonymous"
+	}
+	pull := strings.TrimSpace(sub.PullMethod)
+	if pull == "" {
+		pull = "ippget"
+	}
+	var printerURI string
+	if sub.PrinterID.Valid && s != nil && r != nil {
+		_ = s.Store.WithTx(r.Context(), true, func(tx *sql.Tx) error {
+			p, err := s.Store.GetPrinterByID(r.Context(), tx, sub.PrinterID.Int64)
+			if err != nil {
+				return err
+			}
+			printerURI = printerURIFor(p, r)
+			return nil
+		})
+	}
+	for name := range subscriptionDescriptionAttrs {
+		if existing[name] {
+			continue
+		}
+		switch name {
+		case "notify-job-id":
+			if sub.JobID.Valid {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(sub.JobID.Int64)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "notify-lease-expiration-time":
+			if sub.LeaseSecs > 0 && !sub.CreatedAt.IsZero() {
+				exp := sub.CreatedAt.Add(time.Duration(sub.LeaseSecs) * time.Second).Unix()
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(exp)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "notify-printer-up-time":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(time.Now().Unix())))
+		case "notify-printer-uri":
+			if printerURI != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagURI, goipp.String(printerURI)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "notify-resource-id", "notify-system-uri":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+		case "notify-sequence-number":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+		case "notify-subscriber-user-name":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagName, goipp.String(user)))
+		case "notify-subscriber-user-uri":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagURI, goipp.String("urn:sub:"+user)))
+		case "notify-subscription-id":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(sub.ID)))
+		case "notify-subscription-uuid":
+			if uuid := subscriptionUUIDFor(sub, r); uuid != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagURI, goipp.String(uuid)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		default:
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+		}
+	}
+}
+
+func ensureSubscriptionTemplateDefaults(attrs *goipp.Attributes, sub model.Subscription, r *http.Request, s *Server) {
+	if attrs == nil {
+		return
+	}
+	existing := map[string]bool{}
+	for _, attr := range *attrs {
+		existing[attr.Name] = true
+	}
+	events := strings.Split(strings.TrimSpace(sub.Events), ",")
+	clean := make([]string, 0, len(events))
+	for _, e := range events {
+		e = strings.TrimSpace(e)
+		if e != "" {
+			clean = append(clean, e)
+		}
+	}
+	if len(clean) == 0 {
+		clean = []string{"all"}
+	}
+	pull := strings.TrimSpace(sub.PullMethod)
+	if pull == "" {
+		pull = "ippget"
+	}
+	for name := range subscriptionTemplateAttrs {
+		if existing[name] {
+			continue
+		}
+		switch name {
+		case "notify-attributes":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+		case "notify-attributes-supported":
+			attrs.Add(makeKeywordsAttr(name, []string{
+				"printer-state-change-time", "notify-lease-expiration-time", "notify-subscriber-user-name",
+			}))
+		case "notify-charset":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagCharset, goipp.String("utf-8")))
+		case "notify-events":
+			attrs.Add(makeKeywordsAttr(name, clean))
+		case "notify-events-default":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagKeyword, goipp.String("job-completed")))
+		case "notify-events-supported":
+			attrs.Add(makeKeywordsAttr(name, []string{
+				"job-completed", "job-config-changed", "job-created", "job-progress", "job-state-changed", "job-stopped",
+				"printer-added", "printer-changed", "printer-config-changed", "printer-deleted",
+				"printer-finishings-changed", "printer-media-changed", "printer-modified", "printer-restarted",
+				"printer-shutdown", "printer-state-changed", "printer-stopped",
+				"server-audit", "server-restarted", "server-started", "server-stopped",
+			}))
+		case "notify-lease-duration":
+			if sub.LeaseSecs > 0 {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(sub.LeaseSecs)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "notify-lease-duration-default":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(0)))
+		case "notify-lease-duration-supported":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagRange, goipp.Range{Lower: 0, Upper: 2147483647}))
+		case "notify-max-events-supported":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(100)))
+		case "notify-natural-language":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagLanguage, goipp.String("en")))
+		case "notify-recipient-uri":
+			if strings.TrimSpace(sub.RecipientURI) != "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagURI, goipp.String(sub.RecipientURI)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "notify-pull-method":
+			if strings.TrimSpace(sub.RecipientURI) == "" {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagKeyword, goipp.String(pull)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "notify-pull-method-supported":
+			attrs.Add(makeKeywordsAttr(name, []string{"ippget"}))
+		case "notify-schemes-supported":
+			attrs.Add(makeKeywordsAttr(name, []string{"ippget"}))
+		case "notify-time-interval":
+			if sub.TimeInterval > 0 {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(sub.TimeInterval)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		case "notify-user-data":
+			if len(sub.UserData) > 0 {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagString, goipp.Binary(sub.UserData)))
+			} else {
+				attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+			}
+		default:
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+		}
+	}
+}
+
+func ensureDocumentStatusDefaults(attrs *goipp.Attributes, job model.Job, stateReason string) {
+	if attrs == nil {
+		return
+	}
+	existing := map[string]bool{}
+	for _, attr := range *attrs {
+		existing[attr.Name] = true
+	}
+	for name := range documentStatusAttrs {
+		if existing[name] {
+			continue
+		}
+		switch name {
+		case "document-state":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagEnum, goipp.Integer(documentStateForJob(job.State))))
+		case "document-state-reasons":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagKeyword, goipp.String(stateReason)))
+		case "document-state-message":
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagText, goipp.String(stateReason)))
+		default:
+			attrs.Add(goipp.MakeAttribute(name, goipp.TagNoValue, goipp.Void{}))
+		}
+	}
 }
 
 func (s *Server) handleSetJobAttributes(ctx context.Context, r *http.Request, req *goipp.Message) (*goipp.Message, error) {
@@ -3077,13 +3890,13 @@ func (s *Server) updateAllPrinters(ctx context.Context, req *goipp.Message, stat
 
 func addOperationDefaults(resp *goipp.Message) {
 	resp.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
-	resp.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
+	resp.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en")))
 }
 
 func buildOperationDefaults() goipp.Attributes {
 	attrs := goipp.Attributes{}
 	attrs.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
-	attrs.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
+	attrs.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en")))
 	return attrs
 }
 
@@ -3172,12 +3985,8 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	attrs.Add(goipp.MakeAttribute("printer-config-change-time", goipp.TagInteger, goipp.Integer(configChange.Unix())))
 	attrs.Add(goipp.MakeAttribute("printer-config-change-date-time", goipp.TagDateTime, goipp.Time{configChange}))
 	attrs.Add(goipp.MakeAttribute("printer-current-time", goipp.TagDateTime, goipp.Time{time.Now()}))
-	if printer.Location != "" {
-		attrs.Add(goipp.MakeAttribute("printer-location", goipp.TagText, goipp.String(printer.Location)))
-	}
-	if printer.Info != "" {
-		attrs.Add(goipp.MakeAttribute("printer-info", goipp.TagText, goipp.String(printer.Info)))
-	}
+	attrs.Add(goipp.MakeAttribute("printer-location", goipp.TagText, goipp.String(printer.Location)))
+	attrs.Add(goipp.MakeAttribute("printer-info", goipp.TagText, goipp.String(printer.Info)))
 	attrs.Add(goipp.MakeAttribute("ppd-name", goipp.TagName, goipp.String(ppdName)))
 	attrs.Add(goipp.MakeAttribute("printer-make-and-model", goipp.TagText, goipp.String(modelName)))
 	attrs.Add(goipp.MakeAttribute("printer-more-info", goipp.TagURI, goipp.String(printerMoreInfoURI(printer.Name, false, r))))
@@ -3193,15 +4002,24 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	attrs.Add(goipp.MakeAttribute("color-supported", goipp.TagBoolean, goipp.Boolean(colorSupported)))
 	attrs.Add(makeMimeTypesAttr("document-format-supported", documentFormats))
 	attrs.Add(goipp.MakeAttribute("document-format-default", goipp.TagMimeType, goipp.String("application/octet-stream")))
-	attrs.Add(goipp.MakeAttribute("document-format-preferred", goipp.TagMimeType, goipp.String("application/octet-stream")))
+	attrs.Add(goipp.MakeAttribute("document-format-preferred", goipp.TagMimeType, goipp.String(preferredDocumentFormat(documentFormats))))
+	attrs.Add(makeKeywordsAttr("document-creation-attributes-supported", []string{
+		"compression", "document-charset", "document-format", "document-name", "document-natural-language",
+	}))
+	attrs.Add(goipp.MakeAttribute("document-format-details-supported", goipp.TagNoValue, goipp.Void{}))
+	attrs.Add(goipp.MakeAttribute("document-format-varying-attributes", goipp.TagKeyword, goipp.String("none")))
+	attrs.Add(goipp.MakeAttribute("document-password-supported", goipp.TagKeyword, goipp.String("none")))
+	attrs.Add(goipp.MakeAttribute("document-privacy-attributes", goipp.TagKeyword, goipp.String("none")))
+	attrs.Add(goipp.MakeAttribute("document-privacy-scope", goipp.TagKeyword, goipp.String("none")))
 	attrs.Add(goipp.MakeAttribute("document-charset-default", goipp.TagCharset, goipp.String("utf-8")))
 	attrs.Add(makeCharsetsAttr("document-charset-supported", []string{"us-ascii", "utf-8"}))
 	attrs.Add(goipp.MakeAttribute("document-natural-language-default", goipp.TagLanguage, goipp.String("en")))
 	attrs.Add(goipp.MakeAttribute("document-natural-language-supported", goipp.TagLanguage, goipp.String("en")))
 	attrs.Add(goipp.MakeAttribute("charset-configured", goipp.TagCharset, goipp.String("utf-8")))
 	attrs.Add(makeCharsetsAttr("charset-supported", []string{"us-ascii", "utf-8"}))
-	attrs.Add(goipp.MakeAttribute("natural-language-configured", goipp.TagLanguage, goipp.String("en-US")))
-	attrs.Add(goipp.MakeAttribute("natural-language-supported", goipp.TagLanguage, goipp.String("en-US")))
+	attrs.Add(goipp.MakeAttribute("natural-language-configured", goipp.TagLanguage, goipp.String("en")))
+	attrs.Add(goipp.MakeAttribute("natural-language-supported", goipp.TagLanguage, goipp.String("en")))
+	attrs.Add(goipp.MakeAttribute("pdl-override-supported", goipp.TagKeyword, goipp.String("attempted")))
 	attrs.Add(makeKeywordsAttr("ipp-versions-supported", []string{"1.0", "1.1", "2.0", "2.1"}))
 	attrs.Add(goipp.MakeAttribute("printer-up-time", goipp.TagInteger, goipp.Integer(time.Now().Unix())))
 	attrs.Add(goipp.MakeAttribute("queued-job-count", goipp.TagInteger, goipp.Integer(queuedJobCountForPrinters(ctx, st, []int64{printer.ID}))))
@@ -3209,7 +4027,7 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 		attrs.Add(goipp.MakeAttribute("printer-uuid", goipp.TagURI, goipp.String(uuid)))
 	}
 	attrs.Add(goipp.MakeAttribute("cups-version", goipp.TagText, goipp.String("2.4.16")))
-	attrs.Add(goipp.MakeAttribute("generated-natural-language-supported", goipp.TagLanguage, goipp.String("en-US")))
+	attrs.Add(goipp.MakeAttribute("generated-natural-language-supported", goipp.TagLanguage, goipp.String("en")))
 	attrs.Add(goipp.MakeAttribute("printer-id", goipp.TagInteger, goipp.Integer(printer.ID)))
 	geo := strings.TrimSpace(printer.Geo)
 	if geo == "" {
@@ -3230,7 +4048,7 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	}
 	attrs.Add(goipp.MakeAttribute("printer-organization", goipp.TagText, goipp.String(org)))
 	attrs.Add(goipp.MakeAttribute("printer-organizational-unit", goipp.TagText, goipp.String(orgUnit)))
-	attrs.Add(goipp.MakeAttribute("printer-strings-languages-supported", goipp.TagLanguage, goipp.String("en-US")))
+	attrs.Add(goipp.MakeAttribute("printer-strings-languages-supported", goipp.TagLanguage, goipp.String("en")))
 	attrs.Add(goipp.MakeAttribute("printer-strings-uri", goipp.TagURI, goipp.String(printerStringsURI(r))))
 	deviceID := "MFG:CUPS-Golang;MDL:Generic;"
 	if ppd != nil && strings.TrimSpace(ppd.DeviceID) != "" {
@@ -3240,9 +4058,11 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	attrs.Add(goipp.MakeAttribute("device-uri", goipp.TagURI, goipp.String(printer.URI)))
 	attrs.Add(goipp.MakeAttribute("destination-uri", goipp.TagURI, goipp.String(uri)))
 	attrs.Add(goipp.MakeAttribute("multiple-destination-uris-supported", goipp.TagBoolean, goipp.Boolean(false)))
-	attrs.Add(makeKeywordsAttr("uri-security-supported", []string{"none"}))
-	attrs.Add(makeKeywordsAttr("uri-authentication-supported", []string{"none"}))
+	attrs.Add(goipp.MakeAttribute("uri-security-supported", goipp.TagKeyword, goipp.String(uriSecurityForRequest(r))))
+	attrs.Add(goipp.MakeAttribute("uri-authentication-supported", goipp.TagKeyword, goipp.String(authSupportedForAuthInfo(authInfo))))
+	attrs.Add(makeURISchemesAttr("reference-uri-schemes-supported", referenceURISchemesSupported()))
 	attrs.Add(makeEnumsAttr("operations-supported", supportedOperations()))
+	attrs.Add(goipp.MakeAttribute("preferred-attributes-supported", goipp.TagBoolean, goipp.Boolean(false)))
 	attrs.Add(goipp.MakeAttribute("printer-is-shared", goipp.TagBoolean, goipp.Boolean(share)))
 	attrs.Add(goipp.MakeAttribute("printer-state-message", goipp.TagText, goipp.String(printerStateReason(printer))))
 	attrs.Add(makeKeywordsAttr("multiple-document-handling-supported", []string{
@@ -3300,6 +4120,7 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 		"server-audit", "server-restarted", "server-started", "server-stopped",
 	}))
 	attrs.Add(goipp.MakeAttribute("notify-events-default", goipp.TagKeyword, goipp.String("job-completed")))
+	attrs.Add(goipp.MakeAttribute("notify-pull-method-supported", goipp.TagKeyword, goipp.String("ippget")))
 	attrs.Add(makeKeywordsAttr("notify-schemes-supported", []string{"ippget"}))
 	attrs.Add(goipp.MakeAttribute("notify-lease-duration-default", goipp.TagInteger, goipp.Integer(0)))
 	attrs.Add(goipp.MakeAttribute("notify-max-events-supported", goipp.TagInteger, goipp.Integer(100)))
@@ -3320,8 +4141,8 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	attrs.Add(goipp.MakeAttribute("job-quota-period", goipp.TagInteger, goipp.Integer(0)))
 	attrs.Add(goipp.MakeAttribute("job-k-limit", goipp.TagInteger, goipp.Integer(0)))
 	attrs.Add(goipp.MakeAttribute("job-page-limit", goipp.TagInteger, goipp.Integer(0)))
-	attrs.Add(makeKeywordsAttr("job-sheets-supported", jobSheetsSupported()))
-	attrs.Add(makeJobSheetsAttr("job-sheets-default", jobSheetsDefault))
+	attrs.Add(makeNamesAttr("job-sheets-supported", jobSheetsSupported()))
+	attrs.Add(makeJobSheetsDefaultAttr("job-sheets-default", jobSheetsDefault))
 	attrs.Add(makeKeywordsAttr("job-sheets-col-supported", []string{"job-sheets", "media", "media-col"}))
 	attrs.Add(makeJobSheetsColAttr("job-sheets-col-default", jobSheetsDefault, "", "", ""))
 	attrs.Add(goipp.MakeAttribute("print-as-raster-supported", goipp.TagBoolean, goipp.Boolean(true)))
@@ -3411,6 +4232,7 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	attrs.Add(goipp.MakeAttribute("printer-op-policy", goipp.TagName, goipp.String(opPolicyDefault)))
 	attrs.Add(makeNamesAttr("port-monitor-supported", portMonitors))
 	attrs.Add(goipp.MakeAttribute("port-monitor", goipp.TagName, goipp.String(portMonitorDefault)))
+	attrs.Add(makeKeywordsAttr("printer-commands", printerCommandsForPPD(ppd)))
 	allowed, denied := loadUserAccessLists(ctx, st, "printer."+strconv.FormatInt(printer.ID, 10))
 	if len(allowed) > 0 {
 		attrs.Add(makeNamesAttr("requesting-user-name-allowed", allowed))
@@ -3421,13 +4243,17 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 		attrs.Add(makeKeywordsAttr("auth-info-required", authInfo))
 	}
 	attrs.Add(goipp.MakeAttribute("job-cancel-after-supported", goipp.TagRange, goipp.Range{Lower: 0, Upper: 2147483647}))
-	attrs.Add(goipp.MakeAttribute("job-cancel-after-default", goipp.TagInteger, goipp.Integer(0)))
+	if cfg.MaxJobTime > 0 {
+		attrs.Add(goipp.MakeAttribute("job-cancel-after-default", goipp.TagInteger, goipp.Integer(cfg.MaxJobTime)))
+	} else {
+		attrs.Add(goipp.MakeAttribute("job-cancel-after-default", goipp.TagNoValue, goipp.Void{}))
+	}
 	attrs.Add(goipp.MakeAttribute("jpeg-k-octets-supported", goipp.TagRange, goipp.Range{Lower: 0, Upper: 2147483647}))
 	attrs.Add(goipp.MakeAttribute("jpeg-x-dimension-supported", goipp.TagRange, goipp.Range{Lower: 0, Upper: 65535}))
 	attrs.Add(goipp.MakeAttribute("jpeg-y-dimension-supported", goipp.TagRange, goipp.Range{Lower: 1, Upper: 65535}))
 	attrs.Add(makeKeywordsAttr("media-col-supported", []string{
-		"media-size", "media-type", "media-source", "media-bottom-margin", "media-left-margin",
-		"media-right-margin", "media-top-margin",
+		"media-bottom-margin", "media-left-margin", "media-right-margin", "media-size",
+		"media-source", "media-top-margin", "media-type",
 	}))
 	supplyState, supplyDetails := loadPrinterSupplies(ctx, st, printer)
 	supplyVals, supplyDesc, markerMsg := buildSupplyAttributes(supplyState, supplyDetails)
@@ -3526,6 +4352,12 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 		attrs.Add(makeFinishingsColDatabaseAttr("finishings-col-database", finishingsSupported))
 	}
 	attrs.Add(makeKeywordsAttr("urf-supported", urfSupported(resolutions, colorModes, sidesSupported, finishingsSupported, caps.printQualitySupported)))
+	ensureJobTemplateDefaults(&attrs)
+	ensureDocumentTemplateDefaults(&attrs)
+	ensurePrinterDefaultsDefaults(&attrs)
+	ensurePrinterStatusDefaults(&attrs)
+	ensurePrinterConfigurationDefaults(&attrs)
+	ensurePrinterDescriptionDefaults(&attrs, printer.Name, r, cfg, authInfo)
 	return filterAttributesForRequest(attrs, req)
 }
 
@@ -3552,12 +4384,8 @@ func buildClassAttributes(ctx context.Context, class model.Class, r *http.Reques
 	attrs.Add(goipp.MakeAttribute("printer-config-change-time", goipp.TagInteger, goipp.Integer(configChange.Unix())))
 	attrs.Add(goipp.MakeAttribute("printer-config-change-date-time", goipp.TagDateTime, goipp.Time{configChange}))
 	attrs.Add(goipp.MakeAttribute("printer-current-time", goipp.TagDateTime, goipp.Time{time.Now()}))
-	if class.Location != "" {
-		attrs.Add(goipp.MakeAttribute("printer-location", goipp.TagText, goipp.String(class.Location)))
-	}
-	if class.Info != "" {
-		attrs.Add(goipp.MakeAttribute("printer-info", goipp.TagText, goipp.String(class.Info)))
-	}
+	attrs.Add(goipp.MakeAttribute("printer-location", goipp.TagText, goipp.String(class.Location)))
+	attrs.Add(goipp.MakeAttribute("printer-info", goipp.TagText, goipp.String(class.Info)))
 	attrs.Add(goipp.MakeAttribute("printer-more-info", goipp.TagURI, goipp.String(printerMoreInfoURI(class.Name, true, r))))
 	attrs.Add(goipp.MakeAttribute("printer-is-temporary", goipp.TagBoolean, goipp.Boolean(false)))
 	attrs.Add(goipp.MakeAttribute("document-charset-default", goipp.TagCharset, goipp.String("utf-8")))
@@ -3566,13 +4394,21 @@ func buildClassAttributes(ctx context.Context, class model.Class, r *http.Reques
 	attrs.Add(goipp.MakeAttribute("document-natural-language-supported", goipp.TagLanguage, goipp.String("en")))
 	attrs.Add(goipp.MakeAttribute("charset-configured", goipp.TagCharset, goipp.String("utf-8")))
 	attrs.Add(makeCharsetsAttr("charset-supported", []string{"us-ascii", "utf-8"}))
-	attrs.Add(goipp.MakeAttribute("natural-language-configured", goipp.TagLanguage, goipp.String("en-US")))
-	attrs.Add(goipp.MakeAttribute("natural-language-supported", goipp.TagLanguage, goipp.String("en-US")))
-	attrs.Add(goipp.MakeAttribute("printer-strings-languages-supported", goipp.TagLanguage, goipp.String("en-US")))
+	attrs.Add(goipp.MakeAttribute("natural-language-configured", goipp.TagLanguage, goipp.String("en")))
+	attrs.Add(goipp.MakeAttribute("natural-language-supported", goipp.TagLanguage, goipp.String("en")))
+	attrs.Add(goipp.MakeAttribute("pdl-override-supported", goipp.TagKeyword, goipp.String("attempted")))
+	attrs.Add(goipp.MakeAttribute("printer-strings-languages-supported", goipp.TagLanguage, goipp.String("en")))
 	attrs.Add(goipp.MakeAttribute("printer-strings-uri", goipp.TagURI, goipp.String(printerStringsURI(r))))
-	attrs.Add(makeMimeTypesAttr("document-format-supported", supportedDocumentFormats()))
+	attrs.Add(makeMimeTypesAttr("document-format-supported", []string{"application/octet-stream"}))
 	attrs.Add(goipp.MakeAttribute("document-format-default", goipp.TagMimeType, goipp.String("application/octet-stream")))
-	attrs.Add(goipp.MakeAttribute("document-format-preferred", goipp.TagMimeType, goipp.String("application/octet-stream")))
+	attrs.Add(makeKeywordsAttr("document-creation-attributes-supported", []string{
+		"compression", "document-charset", "document-format", "document-name", "document-natural-language",
+	}))
+	attrs.Add(goipp.MakeAttribute("document-format-details-supported", goipp.TagNoValue, goipp.Void{}))
+	attrs.Add(goipp.MakeAttribute("document-format-varying-attributes", goipp.TagKeyword, goipp.String("none")))
+	attrs.Add(goipp.MakeAttribute("document-password-supported", goipp.TagKeyword, goipp.String("none")))
+	attrs.Add(goipp.MakeAttribute("document-privacy-attributes", goipp.TagKeyword, goipp.String("none")))
+	attrs.Add(goipp.MakeAttribute("document-privacy-scope", goipp.TagKeyword, goipp.String("none")))
 	attrs.Add(makeKeywordsAttr("ipp-versions-supported", []string{"1.0", "1.1", "2.0", "2.1"}))
 	shareServer := sharingEnabled(r, st)
 	attrs.Add(goipp.MakeAttribute("printer-make-and-model", goipp.TagText, goipp.String("Local Printer Class")))
@@ -3587,6 +4423,26 @@ func buildClassAttributes(ctx context.Context, class model.Class, r *http.Reques
 	attrs.Add(goipp.MakeAttribute("printer-id", goipp.TagInteger, goipp.Integer(class.ID)))
 	attrs.Add(goipp.MakeAttribute("cups-version", goipp.TagText, goipp.String("2.4.16")))
 	attrs.Add(makeEnumsAttr("operations-supported", supportedOperations()))
+	attrs.Add(makeKeywordsAttr("notify-attributes-supported", []string{
+		"printer-state-change-time", "notify-lease-expiration-time", "notify-subscriber-user-name",
+	}))
+	attrs.Add(makeKeywordsAttr("notify-events-supported", []string{
+		"job-completed", "job-config-changed", "job-created", "job-progress", "job-state-changed", "job-stopped",
+		"printer-added", "printer-changed", "printer-config-changed", "printer-deleted",
+		"printer-finishings-changed", "printer-media-changed", "printer-modified", "printer-restarted",
+		"printer-shutdown", "printer-state-changed", "printer-stopped",
+		"server-audit", "server-restarted", "server-started", "server-stopped",
+	}))
+	attrs.Add(goipp.MakeAttribute("notify-events-default", goipp.TagKeyword, goipp.String("job-completed")))
+	attrs.Add(goipp.MakeAttribute("notify-pull-method-supported", goipp.TagKeyword, goipp.String("ippget")))
+	attrs.Add(makeKeywordsAttr("notify-schemes-supported", []string{"ippget"}))
+	attrs.Add(goipp.MakeAttribute("notify-lease-duration-default", goipp.TagInteger, goipp.Integer(0)))
+	attrs.Add(goipp.MakeAttribute("notify-max-events-supported", goipp.TagInteger, goipp.Integer(100)))
+	attrs.Add(goipp.MakeAttribute("notify-lease-duration-supported", goipp.TagRange, goipp.Range{Lower: 0, Upper: 2147483647}))
+	attrs.Add(goipp.MakeAttribute("uri-security-supported", goipp.TagKeyword, goipp.String(uriSecurityForRequest(r))))
+	attrs.Add(goipp.MakeAttribute("uri-authentication-supported", goipp.TagKeyword, goipp.String(authSupportedForAuthInfo(authInfo))))
+	attrs.Add(makeURISchemesAttr("reference-uri-schemes-supported", referenceURISchemesSupported()))
+	attrs.Add(goipp.MakeAttribute("preferred-attributes-supported", goipp.TagBoolean, goipp.Boolean(false)))
 	defaultOpts := parseJobOptions(class.DefaultOptions)
 	errorPolicies := printerErrorPolicySupported(true)
 	opPolicies := supportedOpPolicies()
@@ -3600,6 +4456,7 @@ func buildClassAttributes(ctx context.Context, class model.Class, r *http.Reques
 	attrs.Add(goipp.MakeAttribute("printer-op-policy", goipp.TagName, goipp.String(opPolicyDefault)))
 	attrs.Add(makeNamesAttr("port-monitor-supported", portMonitors))
 	attrs.Add(goipp.MakeAttribute("port-monitor", goipp.TagName, goipp.String(portMonitorDefault)))
+	attrs.Add(makeKeywordsAttr("printer-commands", printerCommandsForPPD(nil)))
 	jobSheetsDefault := strings.TrimSpace(class.JobSheetsDefault)
 	if jobSheetsDefault == "" {
 		jobSheetsDefault = "none"
@@ -3616,8 +4473,8 @@ func buildClassAttributes(ctx context.Context, class model.Class, r *http.Reques
 	attrs.Add(goipp.MakeAttribute("job-quota-period", goipp.TagInteger, goipp.Integer(0)))
 	attrs.Add(goipp.MakeAttribute("job-k-limit", goipp.TagInteger, goipp.Integer(0)))
 	attrs.Add(goipp.MakeAttribute("job-page-limit", goipp.TagInteger, goipp.Integer(0)))
-	attrs.Add(makeKeywordsAttr("job-sheets-supported", jobSheetsSupported()))
-	attrs.Add(makeJobSheetsAttr("job-sheets-default", jobSheetsDefault))
+	attrs.Add(makeNamesAttr("job-sheets-supported", jobSheetsSupported()))
+	attrs.Add(makeJobSheetsDefaultAttr("job-sheets-default", jobSheetsDefault))
 	attrs.Add(makeKeywordsAttr("job-sheets-col-supported", []string{"job-sheets", "media", "media-col"}))
 	attrs.Add(makeJobSheetsColAttr("job-sheets-col-default", jobSheetsDefault, "", "", ""))
 	timeout := cfg.MultipleOperationTimeout
@@ -3626,6 +4483,12 @@ func buildClassAttributes(ctx context.Context, class model.Class, r *http.Reques
 	}
 	attrs.Add(goipp.MakeAttribute("multiple-operation-time-out", goipp.TagInteger, goipp.Integer(timeout)))
 	attrs.Add(goipp.MakeAttribute("multiple-operation-time-out-action", goipp.TagKeyword, goipp.String("process-job")))
+	ensureJobTemplateDefaults(&attrs)
+	ensureDocumentTemplateDefaults(&attrs)
+	ensurePrinterDefaultsDefaults(&attrs)
+	ensurePrinterStatusDefaults(&attrs)
+	ensurePrinterConfigurationDefaults(&attrs)
+	ensurePrinterDescriptionDefaults(&attrs, class.Name, r, cfg, authInfo)
 	return attrs
 }
 
@@ -3704,6 +4567,8 @@ func buildSubscriptionAttributes(sub model.Subscription, r *http.Request, s *Ser
 		}
 	}
 	attrs.Add(goipp.MakeAttribute("notify-subscription-id", goipp.TagInteger, goipp.Integer(sub.ID)))
+	ensureSubscriptionDescriptionDefaults(&attrs, sub, r, s)
+	ensureSubscriptionTemplateDefaults(&attrs, sub, r, s)
 	return filterAttributesForRequest(attrs, req)
 }
 
@@ -3744,6 +4609,27 @@ func jobUUIDFor(job model.Job, printer model.Printer, r *http.Request) string {
 	return assembleUUID(host, port, printer.Name, job.ID, 0, 0)
 }
 
+func documentUUIDFor(job model.Job, printer model.Printer, docNum int64, r *http.Request) string {
+	if job.ID == 0 || docNum <= 0 {
+		return ""
+	}
+	host, port := serverHostPortForUUID(r)
+	name := printer.Name
+	if strings.TrimSpace(name) == "" {
+		name = "document"
+	}
+	name = fmt.Sprintf("%s-doc-%d", name, docNum)
+	return assembleUUID(host, port, name, job.ID, 0, 0)
+}
+
+func subscriptionUUIDFor(sub model.Subscription, r *http.Request) string {
+	if sub.ID == 0 {
+		return ""
+	}
+	host, port := serverHostPortForUUID(r)
+	return assembleUUID(host, port, "subscription", sub.ID, 0, 0)
+}
+
 func buildJobAttributes(job model.Job, printer model.Printer, r *http.Request, doc model.Document, docCount int, req *goipp.Message) goipp.Attributes {
 	jobURI := jobURIFor(job, r)
 	attrs := goipp.Attributes{}
@@ -3761,6 +4647,7 @@ func buildJobAttributes(job model.Job, printer model.Printer, r *http.Request, d
 	}
 	attrs.Add(goipp.MakeAttribute("job-state-reasons", goipp.TagKeyword, goipp.String(stateReason)))
 	attrs.Add(goipp.MakeAttribute("job-state-message", goipp.TagText, goipp.String(stateReason)))
+	attrs.Add(goipp.MakeAttribute("job-document-access-errors", goipp.TagKeyword, goipp.String("none")))
 	attrs.Add(goipp.MakeAttribute("job-originating-user-name", goipp.TagName, goipp.String(job.UserName)))
 	origUser := strings.TrimSpace(job.UserName)
 	if origUser == "" {
@@ -4035,6 +4922,7 @@ func buildJobAttributes(job model.Job, printer model.Printer, r *http.Request, d
 			attrs.Add(goipp.MakeAttribute("document-name-supplied", goipp.TagName, goipp.String(supplied)))
 		}
 	}
+	ensureJobDescriptionDefaults(&attrs, job, printer, r, doc, docCount, jobURI, stateReason)
 	return filterAttributesForRequest(attrs, req)
 }
 
@@ -4049,6 +4937,15 @@ func attrString(attrs goipp.Attributes, name string) string {
 		return attr.Values[0].V.String()
 	}
 	return ""
+}
+
+func attrByName(attrs goipp.Attributes, name string) *goipp.Attribute {
+	for i := range attrs {
+		if attrs[i].Name == name {
+			return &attrs[i]
+		}
+	}
+	return nil
 }
 
 func attrValue(attrs goipp.Attributes, name string) (string, bool) {
@@ -5751,6 +6648,50 @@ func portMonitorSupported(ppd *config.PPD) []string {
 	return out
 }
 
+func printerCommandsForPPD(ppd *config.PPD) []string {
+	if ppd == nil {
+		return []string{"none"}
+	}
+	if len(ppd.Commands) > 0 {
+		out := make([]string, 0, len(ppd.Commands))
+		for _, cmd := range ppd.Commands {
+			cmd = strings.TrimSpace(cmd)
+			if cmd == "" {
+				continue
+			}
+			out = append(out, cmd)
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return []string{"AutoConfigure", "Clean", "PrintSelfTestPage"}
+}
+
+func referenceURISchemesSupported() []string {
+	return []string{"file", "ftp", "http", "https"}
+}
+
+func uriSecurityForRequest(r *http.Request) string {
+	if r != nil && r.TLS != nil {
+		return "tls"
+	}
+	return "none"
+}
+
+func authSupportedForAuthInfo(authInfo []string) string {
+	auth := "requesting-user-name"
+	for _, v := range authInfo {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "negotiate", "kerberos":
+			return "negotiate"
+		case "basic", "digest", "username", "password", "domain":
+			auth = "basic"
+		}
+	}
+	return auth
+}
+
 func hasProtocol(protocols []string, value string) bool {
 	for _, p := range protocols {
 		if strings.EqualFold(p, value) {
@@ -6741,6 +7682,17 @@ func makeKeywordsAttr(name string, values []string) goipp.Attribute {
 	return goipp.MakeAttr(name, goipp.TagKeyword, vals[0], vals[1:]...)
 }
 
+func makeURISchemesAttr(name string, values []string) goipp.Attribute {
+	vals := make([]goipp.Value, 0, len(values))
+	for _, v := range values {
+		vals = append(vals, goipp.String(v))
+	}
+	if len(vals) == 0 {
+		vals = append(vals, goipp.String(""))
+	}
+	return goipp.MakeAttr(name, goipp.TagURIScheme, vals[0], vals[1:]...)
+}
+
 func sharingEnabled(r *http.Request, st *store.Store) bool {
 	if st == nil {
 		return true
@@ -7049,6 +8001,25 @@ func makeJobSheetsAttr(name string, sheets string) goipp.Attribute {
 	}
 	if len(vals) == 0 {
 		vals = append(vals, goipp.String("none"))
+	}
+	return goipp.MakeAttr(name, goipp.TagName, vals[0], vals[1:]...)
+}
+
+func makeJobSheetsDefaultAttr(name string, sheets string) goipp.Attribute {
+	values := parseJobSheetsValues(sheets)
+	switch len(values) {
+	case 0:
+		values = []string{"none", "none"}
+	case 1:
+		values = append(values, "none")
+	default:
+		if len(values) > 2 {
+			values = values[:2]
+		}
+	}
+	vals := make([]goipp.Value, 0, len(values))
+	for _, v := range values {
+		vals = append(vals, goipp.String(v))
 	}
 	return goipp.MakeAttr(name, goipp.TagName, vals[0], vals[1:]...)
 }
@@ -9042,6 +10013,9 @@ func supportedDocumentFormats() []string {
 		for mt := range db.Types {
 			mimeTypes = append(mimeTypes, mt)
 		}
+		if !stringInList("application/octet-stream", mimeTypes) {
+			mimeTypes = append(mimeTypes, "application/octet-stream")
+		}
 		if !stringInList("application/vnd.cups-raw", mimeTypes) {
 			mimeTypes = append(mimeTypes, "application/vnd.cups-raw")
 		}
@@ -9051,6 +10025,19 @@ func supportedDocumentFormats() []string {
 		}
 	})
 	return mimeTypes
+}
+
+func preferredDocumentFormat(formats []string) string {
+	if stringInList("application/pdf", formats) {
+		return "application/pdf"
+	}
+	if stringInList("image/urf", formats) {
+		return "image/urf"
+	}
+	if len(formats) > 0 {
+		return formats[0]
+	}
+	return "application/octet-stream"
 }
 
 func detectDocumentFormat(name string) string {
@@ -9105,59 +10092,49 @@ func supportedOperations() []int {
 		goipp.OpValidateJob,
 		goipp.OpCreateJob,
 		goipp.OpSendDocument,
-		goipp.OpCloseJob,
 		goipp.OpCancelJob,
-		goipp.OpCancelMyJobs,
 		goipp.OpGetJobAttributes,
-		goipp.OpSetJobAttributes,
 		goipp.OpGetJobs,
 		goipp.OpGetPrinterAttributes,
-		goipp.OpEnablePrinter,
-		goipp.OpDisablePrinter,
-		goipp.OpSetPrinterAttributes,
-		goipp.OpGetPrinterSupportedValues,
-		goipp.OpGetDocuments,
-		goipp.OpGetDocumentAttributes,
 		goipp.OpHoldJob,
 		goipp.OpReleaseJob,
-		goipp.OpRestartJob,
-		goipp.OpResumeJob,
 		goipp.OpPausePrinter,
-		goipp.OpPausePrinterAfterCurrentJob,
 		goipp.OpResumePrinter,
-		goipp.OpHoldNewJobs,
-		goipp.OpReleaseHeldNewJobs,
-		goipp.OpRestartPrinter,
 		goipp.OpPurgeJobs,
-		goipp.OpCancelJobs,
-		goipp.OpPauseAllPrinters,
-		goipp.OpPauseAllPrintersAfterCurrentJob,
-		goipp.OpResumeAllPrinters,
-		goipp.OpRestartSystem,
+		goipp.OpSetPrinterAttributes,
+		goipp.OpSetJobAttributes,
+		goipp.OpGetPrinterSupportedValues,
 		goipp.OpCreatePrinterSubscriptions,
 		goipp.OpCreateJobSubscriptions,
 		goipp.OpGetSubscriptionAttributes,
 		goipp.OpGetSubscriptions,
 		goipp.OpRenewSubscription,
-		goipp.OpGetNotifications,
 		goipp.OpCancelSubscription,
-		goipp.OpValidateDocument,
-		goipp.OpCupsAuthenticateJob,
+		goipp.OpGetNotifications,
+		goipp.OpEnablePrinter,
+		goipp.OpDisablePrinter,
+		goipp.OpHoldNewJobs,
+		goipp.OpReleaseHeldNewJobs,
+		goipp.OpCancelJobs,
+		goipp.OpCancelMyJobs,
+		goipp.OpCloseJob,
 		goipp.OpCupsGetDefault,
 		goipp.OpCupsGetPrinters,
 		goipp.OpCupsAddModifyPrinter,
-		goipp.OpCupsAcceptJobs,
-		goipp.OpCupsRejectJobs,
-		goipp.OpCupsMoveJob,
 		goipp.OpCupsDeletePrinter,
 		goipp.OpCupsGetClasses,
 		goipp.OpCupsAddModifyClass,
 		goipp.OpCupsDeleteClass,
+		goipp.OpCupsAcceptJobs,
+		goipp.OpCupsRejectJobs,
 		goipp.OpCupsSetDefault,
 		goipp.OpCupsGetDevices,
 		goipp.OpCupsGetPpds,
+		goipp.OpCupsMoveJob,
+		goipp.OpCupsAuthenticateJob,
 		goipp.OpCupsGetPpd,
 		goipp.OpCupsGetDocument,
+		goipp.OpRestartJob,
 	}
 	out := make([]int, 0, len(ops))
 	for _, op := range ops {
@@ -9820,14 +10797,18 @@ var (
 		"document-state": true, "document-state-reasons": true, "document-state-message": true,
 	}
 	subscriptionDescriptionAttrs = map[string]bool{
-		"notify-events": true, "notify-lease-duration": true, "notify-recipient-uri": true,
-		"notify-pull-method": true, "notify-subscriber-user-name": true, "notify-time-interval": true,
-		"notify-user-data": true, "notify-job-id": true, "notify-printer-uri": true,
-		"notify-subscription-id": true,
+		"notify-job-id": true, "notify-lease-expiration-time": true, "notify-printer-up-time": true,
+		"notify-printer-uri": true, "notify-resource-id": true, "notify-system-uri": true,
+		"notify-sequence-number": true, "notify-subscriber-user-name": true, "notify-subscriber-user-uri": true,
+		"notify-subscription-id": true, "notify-subscription-uuid": true,
 	}
 	subscriptionTemplateAttrs = map[string]bool{
-		"notify-events": true, "notify-lease-duration": true, "notify-recipient-uri": true,
-		"notify-pull-method": true, "notify-time-interval": true, "notify-user-data": true,
+		"notify-attributes": true, "notify-attributes-supported": true, "notify-charset": true,
+		"notify-events": true, "notify-events-default": true, "notify-events-supported": true,
+		"notify-lease-duration": true, "notify-lease-duration-default": true, "notify-lease-duration-supported": true,
+		"notify-max-events-supported": true, "notify-natural-language": true, "notify-pull-method": true,
+		"notify-pull-method-supported": true, "notify-recipient-uri": true, "notify-schemes-supported": true,
+		"notify-time-interval": true, "notify-user-data": true,
 	}
 	printerStatusAttrs = map[string]bool{
 		"printer-state": true, "printer-state-reasons": true, "printer-state-message": true,

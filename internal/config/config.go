@@ -37,6 +37,7 @@ type Config struct {
 	PageLogPath          string
 	ErrorPolicy          string
 	DefaultAuthType      string
+	MaxJobTime           int
 	BrowseLocal          bool
 	BrowseLocalProtocols []string
 	DNSSDHostName        string
@@ -93,6 +94,7 @@ func Load() Config {
 		LogLevel:        "info",
 		BrowseLocal:     true,
 		MultipleOperationTimeout: 900,
+		MaxJobTime:               3 * 60 * 60,
 	}
 
 	markEnvOverrides(&overrides)
@@ -238,6 +240,11 @@ func applyEnvOverrides(cfg *Config, overrides *configOverrides) {
 	if v, ok := os.LookupEnv("CUPS_MULTIPLE_OPERATION_TIMEOUT"); ok {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
 			cfg.MultipleOperationTimeout = n
+		}
+	}
+	if v, ok := os.LookupEnv("CUPS_MAX_JOB_TIME"); ok {
+		if n, ok := parseTimeSeconds(v); ok {
+			cfg.MaxJobTime = n
 		}
 	}
 	cfg.TLSEnabled = getenvBool("CUPS_TLS_ENABLED", cfg.TLSEnabled)
@@ -502,6 +509,10 @@ func parseCupsdConf(path string, cfg *Config, overrides *configOverrides) {
 			if n, ok := parseInt(value); ok {
 				cfg.MultipleOperationTimeout = n
 			}
+		case "MaxJobTime":
+			if n, ok := parseTimeSeconds(value); ok {
+				cfg.MaxJobTime = n
+			}
 		}
 	}
 }
@@ -699,6 +710,37 @@ func parseInt(value string) (int, bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+func parseTimeSeconds(value string) (int, bool) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return 0, false
+	}
+	mult := 1
+	last := v[len(v)-1]
+	switch last {
+	case 's', 'S':
+		mult = 1
+		v = v[:len(v)-1]
+	case 'm', 'M':
+		mult = 60
+		v = v[:len(v)-1]
+	case 'h', 'H':
+		mult = 60 * 60
+		v = v[:len(v)-1]
+	case 'd', 'D':
+		mult = 24 * 60 * 60
+		v = v[:len(v)-1]
+	case 'w', 'W':
+		mult = 7 * 24 * 60 * 60
+		v = v[:len(v)-1]
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n * mult, true
 }
 
 func getenv(key, fallback string) string {

@@ -23,3 +23,5 @@ go.work.sum
 
 # env file
 .env
+agent.md
+/cups2.4.16

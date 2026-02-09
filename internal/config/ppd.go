@@ -23,6 +23,7 @@ type PPD struct {
 	ColorSpaces       []string
 	Protocols         []string
 	PortMonitors      []string
+	Commands          []string
 	Filters           []PPDFilter
 	Constraints       []PPDConstraint
 	OrderDependencies []PPDOrderDependency
@@ -232,6 +233,26 @@ func LoadPPD(path string) (*PPD, error) {
 					}
 					if !seen {
 						ppd.Protocols = append(ppd.Protocols, token)
+					}
+				}
+			}
+		}
+		if strings.HasPrefix(line, "*cupsCommands:") {
+			val := strings.TrimSpace(strings.Trim(line[len("*cupsCommands:"):], " \""))
+			if val != "" {
+				for _, cmd := range strings.Fields(val) {
+					if cmd == "" {
+						continue
+					}
+					seen := false
+					for _, existing := range ppd.Commands {
+						if strings.EqualFold(existing, cmd) {
+							seen = true
+							break
+						}
+					}
+					if !seen {
+						ppd.Commands = append(ppd.Commands, cmd)
 					}
 				}
 			}

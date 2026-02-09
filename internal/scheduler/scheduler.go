@@ -92,7 +92,7 @@ func (s *Scheduler) processOnce(ctx context.Context) {
 	for _, candidate := range candidates {
 		job := candidate.job
 		opts := candidate.options
-		if shouldCancelJob(job, opts, now) {
+		if shouldCancelJob(job, opts, now, s.Config.MaxJobTime) {
 			_ = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
 				completed := time.Now().UTC()
 				return s.Store.UpdateJobState(ctx, tx, job.ID, 7, "job-canceled-at-device", &completed)
@@ -195,7 +195,7 @@ func (s *Scheduler) releaseHeldJobs(ctx context.Context) {
 	now := time.Now()
 	for _, job := range jobs {
 		opts := parseOptionsJSON(job.Options)
-		if shouldCancelJob(job, opts, now) {
+		if shouldCancelJob(job, opts, now, s.Config.MaxJobTime) {
 			_ = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
 				completed := time.Now().UTC()
 				return s.Store.UpdateJobState(ctx, tx, job.ID, 7, "job-canceled-at-device", &completed)
@@ -875,15 +875,18 @@ func jobPriority(opts map[string]string) int {
 	return n
 }
 
-func shouldCancelJob(job model.Job, opts map[string]string, now time.Time) bool {
+func shouldCancelJob(job model.Job, opts map[string]string, now time.Time, defaultAfter int) bool {
 	after := optionInt(opts, "job-cancel-after")
+	if after <= 0 {
+		after = defaultAfter
+	}
 	if after <= 0 {
 		return false
 	}
-	if job.SubmittedAt.IsZero() {
+	if job.ProcessingAt == nil || job.ProcessingAt.IsZero() {
 		return false
 	}
-	return now.Sub(job.SubmittedAt) > time.Duration(after)*time.Second
+	return now.Sub(*job.ProcessingAt) > time.Duration(after)*time.Second
 }
 
 func shouldHoldJob(job model.Job, opts map[string]string, now time.Time) string {
