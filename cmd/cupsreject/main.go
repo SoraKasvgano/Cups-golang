@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"os"
 	"time"
@@ -13,18 +12,64 @@ import (
 )
 
 func main() {
-	flag.Parse()
-	printers := flag.Args()
-	if len(printers) == 0 {
-		printers = []string{"Default"}
+	opts, err := parseArgs(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cupsreject:", err)
+		os.Exit(1)
 	}
-	client := cupsclient.NewFromEnv()
-	for _, p := range printers {
+	if len(opts.printers) == 0 {
+		opts.printers = []string{"Default"}
+	}
+	client := cupsclient.NewFromConfig(
+		cupsclient.WithServer(opts.server),
+		cupsclient.WithTLS(opts.encrypt),
+		cupsclient.WithUser(opts.user),
+	)
+	for _, p := range opts.printers {
 		if err := holdNewJobs(client, p); err != nil {
 			fmt.Fprintln(os.Stderr, "cupsreject:", err)
 			os.Exit(1)
 		}
 	}
+}
+
+type options struct {
+	server   string
+	encrypt  bool
+	user     string
+	printers []string
+}
+
+func parseArgs(args []string) (options, error) {
+	opts := options{}
+	seenOther := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-h":
+			if seenOther {
+				return opts, fmt.Errorf("-h must appear before all other options")
+			}
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing argument for -h")
+			}
+			i++
+			opts.server = args[i]
+		case "-E":
+			opts.encrypt = true
+		case "-U":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing argument for -U")
+			}
+			i++
+			opts.user = args[i]
+		default:
+			opts.printers = append(opts.printers, args[i])
+		}
+		if args[i] != "-h" && args[i] != "-E" && args[i] != "-U" {
+			seenOther = true
+		}
+	}
+	return opts, nil
 }
 
 func holdNewJobs(client *cupsclient.Client, name string) error {

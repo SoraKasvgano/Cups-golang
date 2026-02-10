@@ -13,9 +13,18 @@ import (
 type PPD struct {
 	NickName          string
 	Model             string
+	MakeAndModel      string
 	Options           map[string][]string
 	Defaults          map[string]string
 	Make              string
+	LanguageVersion   string
+	LanguageEncoding  string
+	Languages         []string
+	Products          []string
+	PSVersions        []string
+	ModelNumber       int
+	PPDType           string
+	Scheme            string
 	ColorDevice       bool
 	DefaultResolution string
 	Resolutions       []string
@@ -132,6 +141,8 @@ func LoadPPD(path string) (*PPD, error) {
 		Defaults:      map[string]string{},
 		OptionDetails: map[string]*PPDOption{},
 		PageSizes:     map[string]PPDPageSize{},
+		PPDType:       "postscript",
+		Scheme:        "file",
 	}
 	groupMap := map[string]*PPDGroup{}
 	var currentGroup *PPDGroup
@@ -164,6 +175,36 @@ func LoadPPD(path string) (*PPD, error) {
 		}
 		if strings.HasPrefix(line, "*Manufacturer:") {
 			ppd.Make = strings.Trim(line[len("*Manufacturer:"):], " \"")
+		}
+		if strings.HasPrefix(line, "*LanguageEncoding:") {
+			ppd.LanguageEncoding = parsePPDToken(line)
+		}
+		if strings.HasPrefix(line, "*LanguageVersion:") {
+			ppd.LanguageVersion = parsePPDToken(line)
+		}
+		if strings.HasPrefix(line, "*cupsLanguages:") {
+			ppd.Languages = appendPPDList(ppd.Languages, parsePPDQuotedList(line)...)
+		}
+		if strings.HasPrefix(line, "*Product:") {
+			if product := parsePPDProduct(line); product != "" {
+				ppd.Products = appendPPDList(ppd.Products, product)
+			}
+		}
+		if strings.HasPrefix(line, "*PSVersion:") {
+			if psversion := parsePPDQuotedValue(line); psversion != "" {
+				ppd.PSVersions = appendPPDList(ppd.PSVersions, psversion)
+			}
+		}
+		if strings.HasPrefix(line, "*cupsModelNumber:") {
+			if n, err := strconv.Atoi(parsePPDToken(line)); err == nil {
+				ppd.ModelNumber = n
+			}
+		}
+		if strings.HasPrefix(line, "*cupsFax:") {
+			val := strings.TrimSpace(strings.Trim(line[len("*cupsFax:"):], " \""))
+			if strings.EqualFold(val, "true") || val == "1" || strings.EqualFold(val, "yes") {
+				ppd.PPDType = "fax"
+			}
 		}
 		if strings.HasPrefix(line, "*ColorDevice:") {
 			val := strings.TrimSpace(strings.Trim(line[len("*ColorDevice:"):], " \""))
@@ -206,12 +247,26 @@ func LoadPPD(path string) (*PPD, error) {
 			ppd.DefaultColorSpace = strings.TrimSpace(strings.Trim(line[len("*DefaultColorSpace:"):], " \""))
 		}
 		if strings.HasPrefix(line, "*cupsFilter2:") {
+			if ppd.PPDType == "postscript" {
+				if strings.Contains(line, "application/vnd.cups-raster") {
+					ppd.PPDType = "raster"
+				} else if strings.Contains(line, "application/vnd.cups-pdf") {
+					ppd.PPDType = "pdf"
+				}
+			}
 			if filter, ok := parsePPDFilterLine(line, true); ok {
 				ppd.Filters = append(ppd.Filters, filter)
 			}
 			continue
 		}
 		if strings.HasPrefix(line, "*cupsFilter:") {
+			if ppd.PPDType == "postscript" {
+				if strings.Contains(line, "application/vnd.cups-raster") {
+					ppd.PPDType = "raster"
+				} else if strings.Contains(line, "application/vnd.cups-pdf") {
+					ppd.PPDType = "pdf"
+				}
+			}
 			if filter, ok := parsePPDFilterLine(line, false); ok {
 				ppd.Filters = append(ppd.Filters, filter)
 			}
@@ -465,6 +520,7 @@ func LoadPPD(path string) (*PPD, error) {
 			}
 		}
 	}
+	finalizePPD(ppd)
 	return ppd, sc.Err()
 }
 
@@ -887,6 +943,239 @@ func updateCustomSizeBounds(ppd *PPD, param PPDCustomParam) {
 			}
 		}
 	}
+}
+
+func finalizePPD(ppd *PPD) {
+	if ppd == nil {
+		return
+	}
+	if strings.TrimSpace(ppd.PPDType) == "" {
+		ppd.PPDType = "postscript"
+	}
+	if strings.TrimSpace(ppd.Scheme) == "" {
+		ppd.Scheme = "file"
+	}
+	lang := normalizeLanguageVersion(ppd.LanguageVersion)
+	if lang == "" {
+		lang = "en"
+	}
+	ppd.LanguageVersion = lang
+	langs := make([]string, 0, len(ppd.Languages)+1)
+	if lang != "" {
+		langs = appendPPDList(langs, lang)
+	}
+	for _, l := range ppd.Languages {
+		langs = appendPPDList(langs, l)
+	}
+	ppd.Languages = langs
+	ppd.MakeAndModel = computeMakeAndModel(ppd.Make, ppd.NickName, ppd.Model)
+	makeVal := strings.TrimSpace(ppd.Make)
+	if makeVal == "" || strings.EqualFold(makeVal, "ESP") {
+		makeVal = deriveMake(ppd.MakeAndModel)
+	}
+	makeLower := strings.ToLower(makeVal)
+	if strings.HasPrefix(makeLower, "lhag") || strings.HasPrefix(makeLower, "linotype") {
+		makeVal = "LHAG"
+	} else if strings.HasPrefix(makeLower, "hewlett") {
+		makeVal = "HP"
+	}
+	ppd.Make = makeVal
+	if ppd.MakeAndModel == "" {
+		ppd.MakeAndModel = makeVal
+	}
+	if len(ppd.Products) == 0 && strings.TrimSpace(ppd.Model) != "" {
+		ppd.Products = appendPPDList(ppd.Products, ppd.Model)
+	}
+	if id := strings.TrimSpace(ppd.DeviceID); id != "" {
+		if !strings.HasSuffix(id, ";") {
+			id += ";"
+		}
+		ppd.DeviceID = id
+	}
+}
+
+func parsePPDToken(line string) string {
+	if idx := strings.Index(line, ":"); idx != -1 {
+		val := strings.TrimSpace(line[idx+1:])
+		val = strings.Trim(val, " \"")
+		if fields := strings.Fields(val); len(fields) > 0 {
+			return fields[0]
+		}
+		return val
+	}
+	return ""
+}
+
+func parsePPDQuotedValue(line string) string {
+	start := strings.Index(line, "\"")
+	if start == -1 {
+		return strings.TrimSpace(strings.TrimPrefix(line, "*"))
+	}
+	end := strings.LastIndex(line, "\"")
+	if end <= start {
+		return ""
+	}
+	return strings.TrimSpace(line[start+1 : end])
+}
+
+func parsePPDQuotedList(line string) []string {
+	val := parsePPDQuotedValue(line)
+	if val == "" {
+		return nil
+	}
+	fields := strings.Fields(val)
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if f = strings.TrimSpace(f); f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func parsePPDProduct(line string) string {
+	val := parsePPDQuotedValue(line)
+	if val == "" {
+		return ""
+	}
+	val = strings.TrimSpace(val)
+	if strings.HasPrefix(val, "(") && strings.HasSuffix(val, ")") && len(val) > 2 {
+		val = strings.TrimSuffix(strings.TrimPrefix(val, "("), ")")
+		val = strings.TrimSpace(val)
+	}
+	return val
+}
+
+func appendPPDList(list []string, values ...string) []string {
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		if !containsFold(list, v) {
+			list = append(list, v)
+		}
+	}
+	return list
+}
+
+func containsFold(list []string, val string) bool {
+	for _, v := range list {
+		if strings.EqualFold(v, val) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeLanguageVersion(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "en"
+	}
+	if isLangCode(raw) {
+		return strings.ReplaceAll(raw, "-", "_")
+	}
+	country := ""
+	orig := raw
+	if idx := strings.IndexAny(raw, "-_"); idx != -1 {
+		country = strings.TrimSpace(orig[idx+1:])
+		raw = strings.TrimSpace(orig[:idx])
+	}
+	rawLower := strings.ToLower(raw)
+	langMap := map[string]string{
+		"chinese":             "zh",
+		"czech":               "cs",
+		"danish":              "da",
+		"dutch":               "nl",
+		"english":             "en",
+		"finnish":             "fi",
+		"french":              "fr",
+		"german":              "de",
+		"greek":               "el",
+		"hungarian":           "hu",
+		"italian":             "it",
+		"japanese":            "ja",
+		"korean":              "ko",
+		"norwegian":           "no",
+		"polish":              "pl",
+		"portuguese":          "pt",
+		"russian":             "ru",
+		"simplified chinese":  "zh_CN",
+		"slovak":              "sk",
+		"spanish":             "es",
+		"swedish":             "sv",
+		"traditional chinese": "zh_TW",
+		"turkish":             "tr",
+	}
+	code, ok := langMap[rawLower]
+	if !ok {
+		code = "xx"
+	}
+	if country != "" && code != "xx" && !strings.Contains(code, "_") {
+		return code + "_" + country
+	}
+	return code
+}
+
+func isLangCode(raw string) bool {
+	if len(raw) == 2 {
+		return isAlpha(raw[0]) && isAlpha(raw[1])
+	}
+	if len(raw) == 5 && (raw[2] == '_' || raw[2] == '-') {
+		return isAlpha(raw[0]) && isAlpha(raw[1]) && isAlpha(raw[3]) && isAlpha(raw[4])
+	}
+	return false
+}
+
+func isAlpha(ch byte) bool {
+	return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')
+}
+
+func computeMakeAndModel(makeVal, nickname, model string) string {
+	base := strings.TrimSpace(firstNonEmpty(nickname, model))
+	makeVal = strings.TrimSpace(makeVal)
+	if base == "" {
+		return makeVal
+	}
+	if makeVal == "" {
+		return base
+	}
+	if strings.HasPrefix(strings.ToLower(base), strings.ToLower(makeVal)) {
+		return base
+	}
+	return strings.TrimSpace(makeVal + " " + base)
+}
+
+func deriveMake(makeModel string) string {
+	makeModel = strings.TrimSpace(makeModel)
+	if makeModel == "" {
+		return "Other"
+	}
+	makeVal := makeModel
+	for i := 0; i < len(makeModel); i++ {
+		switch makeModel[i] {
+		case ' ', '-', '/':
+			if i > 0 {
+				makeVal = makeModel[:i]
+			}
+			i = len(makeModel)
+		}
+	}
+	makeVal = strings.TrimSpace(makeVal)
+	if makeVal == "" {
+		return "Other"
+	}
+	return makeVal
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v = strings.TrimSpace(v); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func pointsToPWG(points float64) int {

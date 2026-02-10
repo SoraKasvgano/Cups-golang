@@ -11,6 +11,7 @@ import (
 
 	goipp "github.com/OpenPrinting/goipp"
 
+	"cupsgolang/internal/config"
 	"cupsgolang/internal/cupsclient"
 )
 
@@ -21,6 +22,9 @@ type options struct {
 	setOps  []string
 	rmOps   []string
 	remove  bool
+	server  string
+	encrypt bool
+	user    string
 }
 
 type lpOptionsFile struct {
@@ -74,9 +78,13 @@ func main() {
 		return
 	}
 
-	client := cupsclient.NewFromEnv()
+	client := cupsclient.NewFromConfig(
+		cupsclient.WithServer(opts.server),
+		cupsclient.WithTLS(opts.encrypt),
+		cupsclient.WithUser(opts.user),
+	)
 	if opts.list {
-		if err := printSupported(client, dest); err != nil {
+		if err := printSupported(client, dest, store); err != nil {
 			fail(err)
 		}
 		return
@@ -88,8 +96,26 @@ func main() {
 
 func parseArgs(args []string) (options, error) {
 	opts := options{}
+	seenOther := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
+		case "-h":
+			if seenOther {
+				return opts, fmt.Errorf("-h must appear before all other options")
+			}
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing argument for -h")
+			}
+			i++
+			opts.server = args[i]
+		case "-E":
+			opts.encrypt = true
+		case "-U":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing argument for -U")
+			}
+			i++
+			opts.user = args[i]
 		case "-p":
 			if i+1 >= len(args) {
 				return opts, fmt.Errorf("missing argument for -p")
@@ -119,6 +145,9 @@ func parseArgs(args []string) (options, error) {
 		case "-x":
 			opts.remove = true
 		}
+		if args[i] != "-h" && args[i] != "-E" && args[i] != "-U" {
+			seenOther = true
+		}
 	}
 	return opts, nil
 }
@@ -134,6 +163,9 @@ func resolveDest(arg string, store *lpOptionsFile) string {
 	}
 	if store != nil && store.Default != "" {
 		return store.Default
+	}
+	if env := os.Getenv("LPDEST"); env != "" {
+		return env
 	}
 	if env := os.Getenv("PRINTER"); env != "" {
 		return env
@@ -215,62 +247,22 @@ func addDefault(out map[string]string, attrs goipp.Attributes, src, dest string)
 	}
 }
 
-func printSupported(client *cupsclient.Client, dest string) error {
-	req := goipp.NewRequest(goipp.DefaultVersion, goipp.OpGetPrinterAttributes, uint32(time.Now().UnixNano()))
-	req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
-	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
-	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(client.PrinterURI(dest))))
-	req.Operation.Add(goipp.MakeAttr("requested-attributes", goipp.TagKeyword,
-		goipp.String("media-supported"),
-		goipp.String("sides-supported"),
-		goipp.String("print-color-mode-supported"),
-		goipp.String("printer-resolution-supported"),
-		goipp.String("output-bin-supported"),
-		goipp.String("print-quality-supported"),
-		goipp.String("finishings-supported"),
-		goipp.String("number-up-supported"),
-		goipp.String("orientation-requested-supported"),
-		goipp.String("page-delivery-supported"),
-		goipp.String("print-scaling-supported"),
-		goipp.String("job-sheets-supported"),
-		goipp.String("job-hold-until-supported"),
-	))
-	resp, err := client.Send(context.Background(), req, nil)
+func printSupported(client *cupsclient.Client, dest string, store *lpOptionsFile) error {
+	ppd, err := fetchPPD(client, dest)
 	if err != nil {
 		return err
 	}
-	for _, g := range resp.Groups {
-		if g.Tag != goipp.TagPrinterGroup {
-			continue
-		}
-		printList(g.Attrs, "media-supported")
-		printList(g.Attrs, "sides-supported")
-		printList(g.Attrs, "print-color-mode-supported")
-		printList(g.Attrs, "printer-resolution-supported")
-		printList(g.Attrs, "output-bin-supported")
-		printList(g.Attrs, "print-quality-supported")
-		printList(g.Attrs, "finishings-supported")
-		printList(g.Attrs, "number-up-supported")
-		printList(g.Attrs, "orientation-requested-supported")
-		printList(g.Attrs, "page-delivery-supported")
-		printList(g.Attrs, "print-scaling-supported")
-		printList(g.Attrs, "job-sheets-supported")
-		printList(g.Attrs, "job-hold-until-supported")
+	if ppd == nil {
+		return fmt.Errorf("lpoptions: No printers.")
 	}
+	destOpts := map[string]string{}
+	if store != nil && store.Dests[dest] != nil {
+		for k, v := range store.Dests[dest] {
+			destOpts[k] = v
+		}
+	}
+	listPPDOptions(ppd, destOpts)
 	return nil
-}
-
-func printList(attrs goipp.Attributes, name string) {
-	for _, a := range attrs {
-		if a.Name != name || len(a.Values) == 0 {
-			continue
-		}
-		vals := []string{}
-		for _, v := range a.Values {
-			vals = append(vals, v.V.String())
-		}
-		fmt.Printf("%s=%s\n", strings.TrimSuffix(name, "-supported"), strings.Join(vals, ","))
-	}
 }
 
 func applyOptionEdits(store *lpOptionsFile, dest string, setOps []string, rmOps []string) {
@@ -301,6 +293,184 @@ func splitOpt(opt string) (string, string) {
 		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
 	}
 	return strings.TrimSpace(opt), ""
+}
+
+func fetchPPD(client *cupsclient.Client, dest string) (*config.PPD, error) {
+	if client == nil || dest == "" {
+		return nil, fmt.Errorf("lpoptions: No printers.")
+	}
+	req := goipp.NewRequest(goipp.DefaultVersion, goipp.OpCupsGetPpd, uint32(time.Now().UnixNano()))
+	req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
+	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
+	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(client.PrinterURI(dest))))
+	resp, payload, err := client.SendWithPayload(context.Background(), req, nil)
+	if err != nil {
+		return nil, err
+	}
+	if goipp.Status(resp.Code) >= goipp.StatusRedirectionOtherSite {
+		return nil, fmt.Errorf("lpoptions: %s", goipp.Status(resp.Code))
+	}
+	if len(payload) == 0 {
+		return nil, fmt.Errorf("lpoptions: Unable to get PPD file for %s.", dest)
+	}
+	tmp, err := os.CreateTemp("", "lpoptions-*.ppd")
+	if err != nil {
+		return nil, err
+	}
+	path := tmp.Name()
+	if _, err := tmp.Write(payload); err != nil {
+		tmp.Close()
+		_ = os.Remove(path)
+		return nil, err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(path)
+		return nil, err
+	}
+	ppd, err := config.LoadPPD(path)
+	_ = os.Remove(path)
+	if err != nil {
+		return nil, err
+	}
+	return ppd, nil
+}
+
+func listPPDOptions(ppd *config.PPD, destOpts map[string]string) {
+	if ppd == nil {
+		return
+	}
+	seen := map[string]bool{}
+	for _, group := range ppd.Groups {
+		for _, opt := range group.Options {
+			if opt == nil || strings.EqualFold(opt.Keyword, "PageRegion") {
+				continue
+			}
+			if seen[opt.Keyword] {
+				continue
+			}
+			seen[opt.Keyword] = true
+			fmt.Println(formatPPDOption(ppd, opt, destOpts))
+		}
+	}
+	for keyword, opt := range ppd.OptionDetails {
+		if opt == nil || strings.EqualFold(keyword, "PageRegion") {
+			continue
+		}
+		if seen[keyword] {
+			continue
+		}
+		seen[keyword] = true
+		fmt.Println(formatPPDOption(ppd, opt, destOpts))
+	}
+}
+
+func formatPPDOption(ppd *config.PPD, opt *config.PPDOption, destOpts map[string]string) string {
+	keyword := opt.Keyword
+	if keyword == "" {
+		return ""
+	}
+	title := opt.Text
+	if title == "" {
+		title = keyword
+	}
+	selected := resolveSelectedChoices(opt, destOpts)
+	sb := strings.Builder{}
+	sb.WriteString(keyword)
+	sb.WriteString("/")
+	sb.WriteString(title)
+	sb.WriteString(":")
+	for _, choice := range opt.Choices {
+		name := choice.Choice
+		if name == "" {
+			continue
+		}
+		mark := ""
+		if selected[name] {
+			mark = "*"
+		}
+		if strings.EqualFold(name, "Custom") {
+			sb.WriteString(" ")
+			sb.WriteString(mark)
+			sb.WriteString(formatCustomChoice(opt))
+		} else {
+			sb.WriteString(" ")
+			sb.WriteString(mark)
+			sb.WriteString(name)
+		}
+	}
+	return sb.String()
+}
+
+func resolveSelectedChoices(opt *config.PPDOption, destOpts map[string]string) map[string]bool {
+	selected := map[string]bool{}
+	if opt == nil {
+		return selected
+	}
+	value := ""
+	if destOpts != nil {
+		for k, v := range destOpts {
+			if strings.EqualFold(k, opt.Keyword) {
+				value = v
+				break
+			}
+		}
+	}
+	if value == "" {
+		value = opt.Default
+	}
+	if value == "" {
+		return selected
+	}
+	values := splitChoiceList(value)
+	for _, v := range values {
+		if strings.HasPrefix(strings.ToLower(v), "custom") {
+			selected["Custom"] = true
+			continue
+		}
+		selected[v] = true
+	}
+	return selected
+}
+
+func splitChoiceList(value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func formatCustomChoice(opt *config.PPDOption) string {
+	if opt == nil || !opt.Custom || len(opt.CustomParams) == 0 {
+		return "Custom"
+	}
+	if strings.EqualFold(opt.Keyword, "PageSize") || strings.EqualFold(opt.Keyword, "PageRegion") {
+		return "Custom.WIDTHxHEIGHT"
+	}
+	if len(opt.CustomParams) == 1 {
+		return "Custom." + opt.CustomParams[0].Type
+	}
+	parts := make([]string, 0, len(opt.CustomParams))
+	for _, p := range opt.CustomParams {
+		if p.Name == "" {
+			continue
+		}
+		parts = append(parts, p.Name+"="+p.Type)
+	}
+	if len(parts) == 0 {
+		return "Custom"
+	}
+	return "{" + strings.Join(parts, " ") + "}"
 }
 
 func loadLpOptions() (*lpOptionsFile, error) {

@@ -3,7 +3,6 @@ package backend
 import (
 	"context"
 	"os"
-	"strings"
 
 	"cupsgolang/internal/model"
 )
@@ -33,12 +32,10 @@ func (usbBackend) QuerySupplies(ctx context.Context, printer model.Printer) (Sup
 func envUSBDevices() []Device {
 	devices := []Device{}
 	if env := os.Getenv("CUPS_USB_DEVICES"); env != "" {
-		for _, entry := range strings.Split(env, ",") {
-			entry = strings.TrimSpace(entry)
-			if entry == "" {
-				continue
+		for _, entry := range splitEnvList(env) {
+			if d, ok := parseDeviceEntry(entry, "USB Device", "USB", "direct"); ok {
+				devices = append(devices, d)
 			}
-			devices = append(devices, Device{URI: entry, Info: "USB Device", Make: "USB", Class: "direct"})
 		}
 	}
 	return devices

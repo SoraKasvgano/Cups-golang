@@ -93,16 +93,26 @@ func (db *MimeDB) readMimeTypes(path string) error {
 	defer file.Close()
 	sc := bufio.NewScanner(file)
 	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
+		raw := sc.Text()
+		// Skip continuation lines in CUPS mime.types (they begin with whitespace).
+		if len(raw) > 0 && (raw[0] == ' ' || raw[0] == '\t') {
+			continue
+		}
+		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 		parts := strings.Fields(line)
-		if len(parts) < 2 {
+		if len(parts) < 1 {
 			continue
 		}
 		mt := parts[0]
-		exts := parts[1:]
+		exts := []string{}
+		for _, token := range parts[1:] {
+			if ext, ok := mimeExtToken(token); ok {
+				exts = append(exts, ext)
+			}
+		}
 		db.Types[mt] = MimeType{Type: mt, Exts: exts}
 		for _, e := range exts {
 			db.ExtToType[strings.ToLower(e)] = mt
@@ -124,6 +134,10 @@ func (db *MimeDB) readMimeConvs(path string) error {
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Ignore build-time placeholders from CUPS *.in templates.
+		if strings.HasPrefix(line, "@") {
 			continue
 		}
 		parts := strings.Fields(line)
@@ -158,4 +172,39 @@ func (db *MimeDB) FindConvs(src, dst string) []MimeConv {
 		}
 	}
 	return out
+}
+
+func mimeExtToken(token string) (string, bool) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return "", false
+	}
+	// CUPS mime.types supports file-magic rules like string(0,"...") and
+	// expressions. We only use extension mappings for client-side detection.
+	if strings.ContainsAny(token, "()<>\"'") {
+		return "", false
+	}
+	if strings.ContainsAny(token, "+,!=:\\") {
+		return "", false
+	}
+	if strings.Contains(token, "/") {
+		return "", false
+	}
+	token = strings.TrimPrefix(token, ".")
+	if token == "" {
+		return "", false
+	}
+	for i := 0; i < len(token); i++ {
+		ch := token[i]
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') {
+			continue
+		}
+		switch ch {
+		case '-', '_', '+', '.':
+			continue
+		default:
+			return "", false
+		}
+	}
+	return token, true
 }

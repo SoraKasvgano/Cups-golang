@@ -34,7 +34,14 @@ func listUSBDevices() ([]Device, error) {
 			makeModel = "USB"
 		}
 		uri := "usb://" + url.PathEscape(name)
-		devices = append(devices, Device{URI: uri, Info: name, Make: makeModel, Class: "direct"})
+		location := strings.TrimSpace(p.Location)
+		devices = append(devices, Device{
+			URI:      uri,
+			Info:     name,
+			Make:     makeModel,
+			Class:    "direct",
+			Location: location,
+		})
 	}
 	return devices, nil
 }
@@ -163,9 +170,10 @@ type printerInfo2 struct {
 }
 
 type printerInfo struct {
-	Name   string
-	Port   string
-	Driver string
+	Name     string
+	Port     string
+	Driver   string
+	Location string
 }
 
 const (
@@ -211,7 +219,13 @@ func enumLocalPrinters() ([]printerInfo, error) {
 		name := windows.UTF16PtrToString(ptr.PrinterName)
 		port := windows.UTF16PtrToString(ptr.PortName)
 		driver := windows.UTF16PtrToString(ptr.DriverName)
-		out = append(out, printerInfo{Name: name, Port: port, Driver: driver})
+		location := windows.UTF16PtrToString(ptr.Location)
+		out = append(out, printerInfo{
+			Name:     name,
+			Port:     port,
+			Driver:   driver,
+			Location: location,
+		})
 	}
 	return out, nil
 }

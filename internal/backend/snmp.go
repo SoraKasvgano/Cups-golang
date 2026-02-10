@@ -39,16 +39,26 @@ func (snmpBackend) ListDevices(ctx context.Context) ([]Device, error) {
 		if host == "" {
 			continue
 		}
-		name, _ := snmpSysName(host, port, community)
+		name, location, descr, _ := snmpSysInfo(host, port, community)
 		info := name
 		if info == "" {
 			info = host
+		}
+		makeModel := strings.TrimSpace(descr)
+		if makeModel == "" {
+			makeModel = "SNMP"
 		}
 		uri := "snmp://" + host
 		if port != "" && port != "161" {
 			uri = uri + ":" + port
 		}
-		devices = append(devices, Device{URI: uri, Info: info, Make: "SNMP", Class: "network"})
+		devices = append(devices, Device{
+			URI:      uri,
+			Info:     info,
+			Make:     makeModel,
+			Class:    "network",
+			Location: strings.TrimSpace(location),
+		})
 	}
 	if subnets := snmpScanSubnets(); len(subnets) > 0 {
 		scanned := scanSNMPSubnets(ctx, subnets, community)
@@ -88,7 +98,7 @@ func (snmpBackend) QuerySupplies(ctx context.Context, printer model.Printer) (Su
 	defer params.Conn.Close()
 
 	details := map[string]string{}
-	if name, _ := snmpSysNameWith(params); name != "" {
+	if name, _, _, _ := snmpSysInfoWith(params); name != "" {
 		details["sysName"] = name
 	}
 
@@ -243,29 +253,45 @@ func newSNMPParamsWithTimeout(host, port, community string, timeout time.Duratio
 	return params
 }
 
-func snmpSysName(host, port, community string) (string, error) {
+func snmpSysInfo(host, port, community string) (string, string, string, error) {
 	params := newSNMPParams(host, port, community)
 	if err := params.Connect(); err != nil {
-		return "", err
+		return "", "", "", err
 	}
 	defer params.Conn.Close()
-	return snmpSysNameWith(params)
+	return snmpSysInfoWith(params)
 }
 
-func snmpSysNameWith(params *gosnmp.GoSNMP) (string, error) {
-	oids := []string{".1.3.6.1.2.1.1.5.0"}
+func snmpSysInfoWith(params *gosnmp.GoSNMP) (string, string, string, error) {
+	oids := []string{
+		".1.3.6.1.2.1.1.5.0", // sysName
+		".1.3.6.1.2.1.1.6.0", // sysLocation
+		".1.3.6.1.2.1.1.1.0", // sysDescr
+	}
 	result, err := params.Get(oids)
 	if err != nil {
-		return "", err
+		return "", "", "", err
 	}
+	name := ""
+	location := ""
+	descr := ""
 	for _, v := range result.Variables {
-		if v.Name == ".1.3.6.1.2.1.1.5.0" {
-			if name, ok := v.Value.(string); ok {
-				return name, nil
+		switch v.Name {
+		case ".1.3.6.1.2.1.1.5.0":
+			if val, ok := v.Value.(string); ok {
+				name = val
+			}
+		case ".1.3.6.1.2.1.1.6.0":
+			if val, ok := v.Value.(string); ok {
+				location = val
+			}
+		case ".1.3.6.1.2.1.1.1.0":
+			if val, ok := v.Value.(string); ok {
+				descr = val
 			}
 		}
 	}
-	return "", nil
+	return name, location, descr, nil
 }
 
 func snmpIndex(name, base string) string {
@@ -333,8 +359,10 @@ func snmpScanConcurrency() int {
 
 func scanSNMPSubnets(ctx context.Context, subnets []string, community string) []Device {
 	type result struct {
-		host string
-		info string
+		host     string
+		info     string
+		location string
+		descr    string
 	}
 	ips := []string{}
 	for _, subnet := range subnets {
@@ -363,12 +391,12 @@ func scanSNMPSubnets(ctx context.Context, subnets []string, community string) []
 					results <- result{}
 					continue
 				}
-				name, _ := snmpSysNameWith(params)
+				name, location, descr, _ := snmpSysInfoWith(params)
 				_ = params.Conn.Close()
 				if name == "" {
 					name = host
 				}
-				results <- result{host: host, info: name}
+				results <- result{host: host, info: name, location: location, descr: descr}
 			}
 		}()
 	}
@@ -391,11 +419,16 @@ func scanSNMPSubnets(ctx context.Context, subnets []string, community string) []
 		case res := <-results:
 			pending--
 			if res.host != "" {
+				makeModel := strings.TrimSpace(res.descr)
+				if makeModel == "" {
+					makeModel = "SNMP"
+				}
 				devices = append(devices, Device{
-					URI:   "snmp://" + res.host,
-					Info:  res.info,
-					Make:  "SNMP",
-					Class: "network",
+					URI:      "snmp://" + res.host,
+					Info:     res.info,
+					Make:     makeModel,
+					Class:    "network",
+					Location: strings.TrimSpace(res.location),
 				})
 			}
 		case <-ctx.Done():

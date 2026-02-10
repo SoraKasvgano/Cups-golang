@@ -551,9 +551,10 @@ func (s *Server) applyServerSettingsFromForm(r *http.Request) error {
 
 func (s *Server) renderAvailablePrinters(w http.ResponseWriter, r *http.Request) {
 	devices := []Device{}
-	devices = append(devices, discoverLocalDevices()...)
-	devices = append(devices, discoverNetworkIPP()...)
-	devices = append(devices, discoverMDNSIPP()...)
+	ctx := r.Context()
+	devices = append(devices, discoverLocalDevices(ctx)...)
+	devices = append(devices, discoverNetworkIPP(ctx)...)
+	devices = append(devices, discoverMDNSIPP(ctx)...)
 
 	uris := make([]string, 0, len(devices))
 	infos := make([]string, 0, len(devices))

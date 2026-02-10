@@ -11,10 +11,12 @@ import (
 )
 
 type Device struct {
-	URI   string
-	Info  string
-	Make  string
-	Class string
+	URI      string
+	Info     string
+	Make     string
+	Class    string
+	DeviceID string
+	Location string
 }
 
 type SupplyStatus struct {
@@ -87,39 +89,54 @@ func envDevices(envKey, className, makeName string) []Device {
 	}
 	devices := []Device{}
 	for _, entry := range splitEnvList(val) {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
-			continue
+		if d, ok := parseDeviceEntry(entry, "", makeName, className); ok {
+			devices = append(devices, d)
 		}
-		uri := entry
-		info := ""
-		makeVal := makeName
-		if strings.Contains(entry, "|") {
-			parts := strings.Split(entry, "|")
-			if len(parts) > 0 {
-				uri = strings.TrimSpace(parts[0])
-			}
-			if len(parts) > 1 {
-				info = strings.TrimSpace(parts[1])
-			}
-			if len(parts) > 2 {
-				makeVal = strings.TrimSpace(parts[2])
-			}
-		}
-		if uri == "" {
-			continue
-		}
-		if info == "" {
-			info = uri
-		}
-		devices = append(devices, Device{
-			URI:   uri,
-			Info:  info,
-			Make:  makeVal,
-			Class: className,
-		})
 	}
 	return devices
+}
+
+func parseDeviceEntry(entry, defaultInfo, defaultMake, className string) (Device, bool) {
+	entry = strings.TrimSpace(entry)
+	if entry == "" {
+		return Device{}, false
+	}
+	parts := strings.Split(entry, "|")
+	uri := strings.TrimSpace(parts[0])
+	if uri == "" {
+		return Device{}, false
+	}
+	info := ""
+	makeVal := defaultMake
+	deviceID := ""
+	location := ""
+	if len(parts) > 1 {
+		info = strings.TrimSpace(parts[1])
+	}
+	if len(parts) > 2 {
+		makeVal = strings.TrimSpace(parts[2])
+	}
+	if len(parts) > 3 {
+		deviceID = strings.TrimSpace(parts[3])
+	}
+	if len(parts) > 4 {
+		location = strings.TrimSpace(parts[4])
+	}
+	if info == "" {
+		if defaultInfo != "" {
+			info = defaultInfo
+		} else {
+			info = uri
+		}
+	}
+	return Device{
+		URI:      uri,
+		Info:     info,
+		Make:     makeVal,
+		Class:    className,
+		DeviceID: deviceID,
+		Location: location,
+	}, true
 }
 
 func splitEnvList(value string) []string {

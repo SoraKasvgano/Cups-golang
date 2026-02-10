@@ -14,39 +14,56 @@ import (
 )
 
 type Device struct {
-	URI   string
-	Info  string
-	Make  string
-	Class string
+	URI      string
+	Info     string
+	Make     string
+	Class    string
+	DeviceID string
+	Location string
 }
 
-func discoverLocalDevices() []Device {
+func discoverLocalDevices(ctx context.Context) []Device {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	devices := []Device{}
 	// Use env-provided device list when available.
 	if env := os.Getenv("CUPS_DEVICE_URIS"); env != "" {
-		for _, entry := range strings.Split(env, ",") {
-			entry = strings.TrimSpace(entry)
-			if entry == "" {
-				continue
+		for _, entry := range splitDeviceEnv(env) {
+			if ctx.Err() != nil {
+				return devices
 			}
-			devices = append(devices, Device{URI: entry, Info: "Env Device", Make: "CUPS-Golang", Class: "file"})
+			if d, ok := parseDeviceEntry(entry, "Env Device", "CUPS-Golang", "file"); ok {
+				devices = append(devices, d)
+			}
 		}
 	}
-	for _, d := range backend.ListDevices(context.Background()) {
+	for _, d := range backend.ListDevices(ctx) {
+		if ctx.Err() != nil {
+			break
+		}
 		devices = append(devices, Device{
-			URI:   d.URI,
-			Info:  d.Info,
-			Make:  d.Make,
-			Class: d.Class,
+			URI:      d.URI,
+			Info:     d.Info,
+			Make:     d.Make,
+			Class:    d.Class,
+			DeviceID: d.DeviceID,
+			Location: d.Location,
 		})
 	}
 	return devices
 }
 
-func discoverNetworkIPP() []Device {
+func discoverNetworkIPP(ctx context.Context) []Device {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	devices := []Device{}
 	if hosts := os.Getenv("CUPS_IPP_SCAN"); hosts != "" {
 		for _, host := range strings.Split(hosts, ",") {
+			if ctx.Err() != nil {
+				return devices
+			}
 			host = strings.TrimSpace(host)
 			if host == "" {
 				continue
@@ -62,7 +79,10 @@ func discoverNetworkIPP() []Device {
 	return devices
 }
 
-func discoverMDNSIPP() []Device {
+func discoverMDNSIPP(ctx context.Context) []Device {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if strings.ToLower(os.Getenv("CUPS_ENABLE_MDNS")) != "1" && strings.ToLower(os.Getenv("CUPS_ENABLE_MDNS")) != "true" {
 		return nil
 	}
@@ -70,20 +90,29 @@ func discoverMDNSIPP() []Device {
 	seen := map[string]bool{}
 	services := []string{"_ipp._tcp", "_ipps._tcp", "_ipp-tls._tcp", "_printer._tcp", "_pdl-datastream._tcp"}
 	for _, service := range services {
+		if ctx.Err() != nil {
+			break
+		}
 		entries := make(chan *mdns.ServiceEntry, 64)
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		timeout := 2 * time.Second
+		if deadline, ok := ctx.Deadline(); ok {
+			if remaining := time.Until(deadline); remaining > 0 && remaining < timeout {
+				timeout = remaining
+			}
+		}
+		ctxQuery, cancel := context.WithTimeout(ctx, timeout)
 		go func() {
 			_ = mdns.Query(&mdns.QueryParam{
 				Service: service,
 				Domain:  "local",
-				Timeout: 2 * time.Second,
+				Timeout: timeout,
 				Entries: entries,
 			})
 			close(entries)
 		}()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-ctxQuery.Done():
 				cancel()
 				goto nextService
 			case entry, ok := <-entries:
@@ -113,16 +142,74 @@ func discoverMDNSIPP() []Device {
 				info := firstNonEmptyDevice(txt["ty"], txt["note"], entry.Name)
 				makeModel := firstNonEmptyDevice(txt["product"], txt["ty"], "IPP")
 				devices = append(devices, Device{
-					URI:   deviceURI,
-					Info:  info,
-					Make:  makeModel,
-					Class: "network",
+					URI:      deviceURI,
+					Info:     info,
+					Make:     makeModel,
+					Class:    "network",
+					Location: txt["note"],
 				})
 			}
 		}
 	nextService:
 	}
 	return devices
+}
+
+func splitDeviceEnv(env string) []string {
+	parts := strings.FieldsFunc(env, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\r' || r == '\t'
+	})
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func parseDeviceEntry(entry, defaultInfo, defaultMake, className string) (Device, bool) {
+	entry = strings.TrimSpace(entry)
+	if entry == "" {
+		return Device{}, false
+	}
+	parts := strings.Split(entry, "|")
+	uri := strings.TrimSpace(parts[0])
+	if uri == "" {
+		return Device{}, false
+	}
+	info := ""
+	makeVal := defaultMake
+	deviceID := ""
+	location := ""
+	if len(parts) > 1 {
+		info = strings.TrimSpace(parts[1])
+	}
+	if len(parts) > 2 {
+		makeVal = strings.TrimSpace(parts[2])
+	}
+	if len(parts) > 3 {
+		deviceID = strings.TrimSpace(parts[3])
+	}
+	if len(parts) > 4 {
+		location = strings.TrimSpace(parts[4])
+	}
+	if info == "" {
+		if defaultInfo != "" {
+			info = defaultInfo
+		} else {
+			info = uri
+		}
+	}
+	return Device{
+		URI:      uri,
+		Info:     info,
+		Make:     makeVal,
+		Class:    className,
+		DeviceID: deviceID,
+		Location: location,
+	}, true
 }
 
 func parseTxtRecords(records []string) map[string]string {

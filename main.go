@@ -63,6 +63,7 @@ func main() {
 		log.Fatalf("failed to open store: %v", err)
 	}
 	defer st.Close()
+	st.MaxEvents = cfg.MaxEvents
 
 	if err := st.EnsureDefaultPrinter(ctx); err != nil {
 		log.Fatalf("failed to ensure default printer: %v", err)

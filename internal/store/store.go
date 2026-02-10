@@ -16,7 +16,8 @@ import (
 )
 
 type Store struct {
-	db *sql.DB
+	db        *sql.DB
+	MaxEvents int
 }
 
 type PrinterSupplies struct {
@@ -1218,6 +1219,50 @@ func (s *Store) CancelSubscription(ctx context.Context, tx *sql.Tx, id int64) er
 	return err
 }
 
+func (s *Store) CountSubscriptions(ctx context.Context, tx *sql.Tx) (int, error) {
+	if err := s.PruneExpiredSubscriptions(ctx, tx); err != nil {
+		return 0, err
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM subscriptions`).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *Store) CountSubscriptionsForPrinter(ctx context.Context, tx *sql.Tx, printerID int64) (int, error) {
+	if err := s.PruneExpiredSubscriptions(ctx, tx); err != nil {
+		return 0, err
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM subscriptions WHERE printer_id = ?`, printerID).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *Store) CountSubscriptionsForJob(ctx context.Context, tx *sql.Tx, jobID int64) (int, error) {
+	if err := s.PruneExpiredSubscriptions(ctx, tx); err != nil {
+		return 0, err
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM subscriptions WHERE job_id = ?`, jobID).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *Store) CountSubscriptionsForUser(ctx context.Context, tx *sql.Tx, owner string) (int, error) {
+	if err := s.PruneExpiredSubscriptions(ctx, tx); err != nil {
+		return 0, err
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM subscriptions WHERE owner = ?`, owner).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 func (s *Store) ListNotifications(ctx context.Context, tx *sql.Tx, subscriptionID int64, limit int) ([]model.Notification, error) {
 	if err := s.PruneExpiredSubscriptions(ctx, tx); err != nil {
 		return nil, err
@@ -1246,6 +1291,9 @@ func (s *Store) ListNotifications(ctx context.Context, tx *sql.Tx, subscriptionI
 
 func (s *Store) addNotificationForPrinter(ctx context.Context, tx *sql.Tx, printerID int64, event string) error {
 	now := time.Now().UTC()
+	if s.MaxEvents <= 0 {
+		return nil
+	}
 	if err := s.PruneExpiredSubscriptions(ctx, tx); err != nil {
 		return err
 	}
@@ -1281,12 +1329,29 @@ func (s *Store) addNotificationForPrinter(ctx context.Context, tx *sql.Tx, print
         `, id, event, now); err != nil {
 			return err
 		}
+		if s.MaxEvents > 0 {
+			if _, err := tx.ExecContext(ctx, `
+                DELETE FROM notifications
+                WHERE subscription_id = ?
+                  AND id NOT IN (
+                    SELECT id FROM notifications
+                    WHERE subscription_id = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                  )
+            `, id, id, s.MaxEvents); err != nil {
+				return err
+			}
+		}
 	}
 	return rows.Err()
 }
 
 func (s *Store) addNotificationForJob(ctx context.Context, tx *sql.Tx, jobID int64, event string) error {
 	now := time.Now().UTC()
+	if s.MaxEvents <= 0 {
+		return nil
+	}
 	if err := s.PruneExpiredSubscriptions(ctx, tx); err != nil {
 		return err
 	}
@@ -1321,6 +1386,20 @@ func (s *Store) addNotificationForJob(ctx context.Context, tx *sql.Tx, jobID int
             VALUES (?, ?, ?)
         `, id, event, now); err != nil {
 			return err
+		}
+		if s.MaxEvents > 0 {
+			if _, err := tx.ExecContext(ctx, `
+                DELETE FROM notifications
+                WHERE subscription_id = ?
+                  AND id NOT IN (
+                    SELECT id FROM notifications
+                    WHERE subscription_id = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                  )
+            `, id, id, s.MaxEvents); err != nil {
+				return err
+			}
 		}
 	}
 	return rows.Err()

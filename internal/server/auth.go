@@ -39,15 +39,27 @@ func (s *Server) authTypeForRequest(r *http.Request, op string) string {
 		if op != "" {
 			if limit := s.Policy.LimitFor(r.URL.Path, op); limit != nil {
 				if limit.AuthType != "" {
-					return limit.AuthType
+					return s.normalizeAuthType(limit.AuthType)
 				}
 			}
 		}
 		if rule.AuthType != "" {
-			return rule.AuthType
+			return s.normalizeAuthType(rule.AuthType)
 		}
 	}
 	return ""
+}
+
+func (s *Server) normalizeAuthType(authType string) string {
+	authType = strings.TrimSpace(authType)
+	if authType == "" {
+		return strings.TrimSpace(s.Config.DefaultAuthType)
+	}
+	// cupsd.conf supports `AuthType Default`, which maps to DefaultAuthType.
+	if strings.EqualFold(authType, "default") {
+		return strings.TrimSpace(s.Config.DefaultAuthType)
+	}
+	return authType
 }
 
 func (s *Server) requireAdmin(r *http.Request) bool {
@@ -60,8 +72,13 @@ func (s *Server) requireAdminOr401(w http.ResponseWriter, r *http.Request) bool 
 
 func (s *Server) requireAuthOr401(w http.ResponseWriter, r *http.Request, requireAdmin bool, op string) bool {
 	authType := s.authTypeForRequest(r, op)
-	if s.authorize(r, authType, requireAdmin) {
-		return true
+	u, ok := s.authenticate(r, authType)
+	if ok {
+		if !requireAdmin || u.IsAdmin {
+			return true
+		}
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return false
 	}
 	setAuthChallenge(w, authType)
 	http.Error(w, "Unauthorized", http.StatusUnauthorized)

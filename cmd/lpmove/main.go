@@ -14,18 +14,18 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "lpmove: usage: lpmove job destination")
+	opts, err := parseArgs(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "lpmove:", err)
 		os.Exit(1)
 	}
-	jobID := parseJobID(os.Args[1])
-	if jobID == 0 {
-		fmt.Fprintln(os.Stderr, "lpmove: invalid job id")
-		os.Exit(1)
-	}
-	dest := os.Args[2]
-
-	client := cupsclient.NewFromEnv()
+	client := cupsclient.NewFromConfig(
+		cupsclient.WithServer(opts.server),
+		cupsclient.WithTLS(opts.encrypt),
+		cupsclient.WithUser(opts.user),
+	)
+	jobID := opts.jobID
+	dest := opts.dest
 	destURI := dest
 	if !strings.Contains(dest, "://") {
 		destURI = client.PrinterURI(dest)
@@ -46,6 +46,55 @@ func main() {
 		fmt.Fprintln(os.Stderr, "lpmove:", goipp.Status(resp.Code))
 		os.Exit(1)
 	}
+}
+
+type options struct {
+	server  string
+	encrypt bool
+	user    string
+	jobID   int
+	dest    string
+}
+
+func parseArgs(args []string) (options, error) {
+	opts := options{}
+	seenOther := false
+	positional := []string{}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-h":
+			if seenOther {
+				return opts, fmt.Errorf("-h must appear before all other options")
+			}
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing argument for -h")
+			}
+			i++
+			opts.server = args[i]
+		case "-E":
+			opts.encrypt = true
+		case "-U":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing argument for -U")
+			}
+			i++
+			opts.user = args[i]
+		default:
+			positional = append(positional, args[i])
+		}
+		if args[i] != "-h" && args[i] != "-E" && args[i] != "-U" {
+			seenOther = true
+		}
+	}
+	if len(positional) < 2 {
+		return opts, fmt.Errorf("usage: lpmove job destination")
+	}
+	opts.jobID = parseJobID(positional[0])
+	if opts.jobID == 0 {
+		return opts, fmt.Errorf("invalid job id")
+	}
+	opts.dest = positional[1]
+	return opts, nil
 }
 
 func parseJobID(arg string) int {

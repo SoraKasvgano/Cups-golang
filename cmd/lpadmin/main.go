@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,13 +23,21 @@ type options struct {
 	deleteName  string
 	defaultName string
 	enable      bool
+	encrypt     bool
+	server      string
+	user        string
 	classAdd    string
 	classRemove string
+	extraOpts   map[string]string
 }
 
 func main() {
 	opts := parseArgs(os.Args[1:])
-	client := cupsclient.NewFromEnv()
+	client := cupsclient.NewFromConfig(
+		cupsclient.WithServer(opts.server),
+		cupsclient.WithTLS(opts.encrypt),
+		cupsclient.WithUser(opts.user),
+	)
 
 	if opts.deleteName != "" {
 		if err := deleteDestination(client, opts.deleteName); err != nil {
@@ -78,59 +87,96 @@ func fail(err error) {
 
 func parseArgs(args []string) options {
 	opts := options{}
+	seenDestOp := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
+		case "-h":
+			if i+1 < len(args) {
+				i++
+				opts.server = args[i]
+			}
+		case "-U":
+			if i+1 < len(args) {
+				i++
+				opts.user = args[i]
+			}
 		case "-p":
 			if i+1 < len(args) {
 				i++
 				opts.printer = args[i]
+				seenDestOp = true
 			}
 		case "-v":
 			if i+1 < len(args) {
 				i++
 				opts.deviceURI = args[i]
+				seenDestOp = true
 			}
 		case "-D":
 			if i+1 < len(args) {
 				i++
 				opts.description = args[i]
+				seenDestOp = true
 			}
 		case "-L":
 			if i+1 < len(args) {
 				i++
 				opts.location = args[i]
+				seenDestOp = true
 			}
 		case "-x":
 			if i+1 < len(args) {
 				i++
 				opts.deleteName = args[i]
+				seenDestOp = true
 			}
 		case "-P":
 			if i+1 < len(args) {
 				i++
 				opts.ppdFile = args[i]
+				seenDestOp = true
 			}
 		case "-m":
 			if i+1 < len(args) {
 				i++
 				opts.ppdName = args[i]
+				seenDestOp = true
 			}
 		case "-d":
 			if i+1 < len(args) {
 				i++
 				opts.defaultName = args[i]
+				seenDestOp = true
 			}
 		case "-E":
-			opts.enable = true
+			if !seenDestOp {
+				opts.encrypt = true
+			} else {
+				opts.enable = true
+			}
+		case "-o":
+			if i+1 < len(args) {
+				i++
+				name, val := parseOption(args[i])
+				if name != "" {
+					if opts.extraOpts == nil {
+						opts.extraOpts = map[string]string{}
+					}
+					opts.extraOpts[name] = val
+				}
+				seenDestOp = true
+			}
 		case "-c":
 			if i+1 < len(args) {
 				i++
 				opts.classAdd = args[i]
+				seenDestOp = true
 			}
 		case "-r":
 			if i+1 < len(args) {
 				i++
 				opts.classRemove = args[i]
+				seenDestOp = true
 			}
 		}
 	}
@@ -156,6 +202,7 @@ func addModifyPrinter(client *cupsclient.Client, opts options) error {
 	if opts.location != "" {
 		req.Printer.Add(goipp.MakeAttribute("printer-location", goipp.TagText, goipp.String(opts.location)))
 	}
+	applyLpadminOptions(req, opts.extraOpts)
 	var payload *os.File
 	if opts.ppdFile != "" {
 		f, err := os.Open(opts.ppdFile)
@@ -173,6 +220,120 @@ func addModifyPrinter(client *cupsclient.Client, opts options) error {
 		return fmt.Errorf("%s", goipp.Status(resp.Code))
 	}
 	return nil
+}
+
+func applyLpadminOptions(req *goipp.Message, opts map[string]string) {
+	if req == nil || len(opts) == 0 {
+		return
+	}
+	for name, val := range opts {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		attrName, tag, values := normalizeLpadminOption(name, val)
+		if attrName == "" || len(values) == 0 {
+			continue
+		}
+		req.Printer.Add(goipp.MakeAttr(attrName, tag, values[0], values[1:]...))
+	}
+}
+
+func normalizeLpadminOption(name, value string) (string, goipp.Tag, []goipp.Value) {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	value = strings.TrimSpace(value)
+	if value == "" {
+		value = "true"
+	}
+	switch lower {
+	case "printer-error-policy", "printer-op-policy", "port-monitor":
+		return lower, goipp.TagName, []goipp.Value{goipp.String(value)}
+	case "printer-is-shared":
+		return "printer-is-shared", goipp.TagBoolean, []goipp.Value{goipp.Boolean(isTruthy(value))}
+	case "job-sheets", "job-sheets-default":
+		vals := splitList(value, 2)
+		if len(vals) == 0 {
+			vals = []string{"none", "none"}
+		} else if len(vals) == 1 {
+			vals = append(vals, "none")
+		}
+		out := make([]goipp.Value, 0, len(vals))
+		for _, v := range vals {
+			out = append(out, goipp.String(v))
+		}
+		return "job-sheets-default", goipp.TagName, out
+	}
+
+	attrName := lower
+	if !strings.HasSuffix(attrName, "-default") && isJobDefaultOption(attrName) {
+		attrName = attrName + "-default"
+	}
+	switch attrName {
+	case "copies-default", "job-priority-default", "number-up-default", "job-cancel-after-default", "number-of-retries-default", "retry-interval-default", "retry-time-out-default":
+		if n, err := strconv.Atoi(value); err == nil {
+			return attrName, goipp.TagInteger, []goipp.Value{goipp.Integer(n)}
+		}
+	case "print-quality-default", "orientation-requested-default":
+		if n, err := strconv.Atoi(value); err == nil {
+			return attrName, goipp.TagEnum, []goipp.Value{goipp.Integer(n)}
+		}
+	}
+	return attrName, goipp.TagKeyword, []goipp.Value{goipp.String(value)}
+}
+
+func isJobDefaultOption(name string) bool {
+	switch name {
+	case "media", "media-col", "media-source", "media-type", "sides", "print-quality",
+		"print-color-mode", "output-mode", "finishings", "finishings-col", "output-bin",
+		"number-up", "orientation-requested", "print-scaling", "printer-resolution",
+		"page-ranges", "page-delivery", "multiple-document-handling", "print-as-raster",
+		"job-hold-until", "job-priority", "job-cancel-after", "job-account-id", "job-accounting-user-id":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseOption(raw string) (string, string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", ""
+	}
+	if strings.Contains(raw, "=") {
+		parts := strings.SplitN(raw, "=", 2)
+		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	}
+	return raw, "true"
+}
+
+func splitList(value string, max int) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+		if max > 0 && len(out) >= max {
+			break
+		}
+	}
+	return out
+}
+
+func isTruthy(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func deleteDestination(client *cupsclient.Client, name string) error {

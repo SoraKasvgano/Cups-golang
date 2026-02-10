@@ -81,10 +81,11 @@ func (dnssdBackend) ListDevices(ctx context.Context) ([]Device, error) {
 				info := firstNonEmptyDevice(txt["ty"], txt["note"], entry.Name)
 				makeModel := firstNonEmptyDevice(txt["product"], txt["ty"], "IPP")
 				devices = append(devices, Device{
-					URI:   deviceURI,
-					Info:  info,
-					Make:  makeModel,
-					Class: "network",
+					URI:      deviceURI,
+					Info:     info,
+					Make:     makeModel,
+					Class:    "network",
+					Location: txt["note"],
 				})
 			}
 		}

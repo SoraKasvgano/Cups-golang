@@ -38,6 +38,13 @@ type Config struct {
 	ErrorPolicy          string
 	DefaultAuthType      string
 	MaxJobTime           int
+	MaxEvents            int
+	MaxLeaseDuration     int
+	DefaultLeaseDuration int
+	MaxSubscriptions           int
+	MaxSubscriptionsPerJob     int
+	MaxSubscriptionsPerPrinter int
+	MaxSubscriptionsPerUser    int
 	BrowseLocal          bool
 	BrowseLocalProtocols []string
 	DNSSDHostName        string
@@ -93,8 +100,16 @@ func Load() Config {
 		WebInterface:    true,
 		LogLevel:        "info",
 		BrowseLocal:     true,
+		BrowseLocalProtocols: []string{"dnssd"},
 		MultipleOperationTimeout: 900,
 		MaxJobTime:               3 * 60 * 60,
+		MaxEvents:               100,
+		MaxLeaseDuration:        0,
+		DefaultLeaseDuration:    24 * 60 * 60,
+		MaxSubscriptions:           100,
+		MaxSubscriptionsPerJob:     0,
+		MaxSubscriptionsPerPrinter: 0,
+		MaxSubscriptionsPerUser:    0,
 	}
 
 	markEnvOverrides(&overrides)
@@ -240,6 +255,41 @@ func applyEnvOverrides(cfg *Config, overrides *configOverrides) {
 	if v, ok := os.LookupEnv("CUPS_MULTIPLE_OPERATION_TIMEOUT"); ok {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
 			cfg.MultipleOperationTimeout = n
+		}
+	}
+	if v, ok := os.LookupEnv("CUPS_MAX_EVENTS"); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			cfg.MaxEvents = n
+		}
+	}
+	if v, ok := os.LookupEnv("CUPS_MAX_LEASE_DURATION"); ok {
+		if n, ok := parseTimeSeconds(v); ok {
+			cfg.MaxLeaseDuration = n
+		}
+	}
+	if v, ok := os.LookupEnv("CUPS_DEFAULT_LEASE_DURATION"); ok {
+		if n, ok := parseTimeSeconds(v); ok {
+			cfg.DefaultLeaseDuration = n
+		}
+	}
+	if v, ok := os.LookupEnv("CUPS_MAX_SUBSCRIPTIONS"); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			cfg.MaxSubscriptions = n
+		}
+	}
+	if v, ok := os.LookupEnv("CUPS_MAX_SUBSCRIPTIONS_PER_JOB"); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			cfg.MaxSubscriptionsPerJob = n
+		}
+	}
+	if v, ok := os.LookupEnv("CUPS_MAX_SUBSCRIPTIONS_PER_PRINTER"); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			cfg.MaxSubscriptionsPerPrinter = n
+		}
+	}
+	if v, ok := os.LookupEnv("CUPS_MAX_SUBSCRIPTIONS_PER_USER"); ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			cfg.MaxSubscriptionsPerUser = n
 		}
 	}
 	if v, ok := os.LookupEnv("CUPS_MAX_JOB_TIME"); ok {
@@ -490,7 +540,7 @@ func parseCupsdConf(path string, cfg *Config, overrides *configOverrides) {
 				cfg.BrowseLocal = v
 			}
 		case "BrowseLocalProtocols":
-			cfg.BrowseLocalProtocols = appendUniqueList(cfg.BrowseLocalProtocols, parts[1:]...)
+			cfg.BrowseLocalProtocols = parseBrowseLocalProtocols(parts[1:])
 		case "DNSSDHostName":
 			cfg.DNSSDHostName = value
 		case "DNSSDComputerName":
@@ -512,6 +562,34 @@ func parseCupsdConf(path string, cfg *Config, overrides *configOverrides) {
 		case "MaxJobTime":
 			if n, ok := parseTimeSeconds(value); ok {
 				cfg.MaxJobTime = n
+			}
+		case "MaxEvents":
+			if n, ok := parseInt(value); ok {
+				cfg.MaxEvents = n
+			}
+		case "MaxLeaseDuration":
+			if n, ok := parseTimeSeconds(value); ok {
+				cfg.MaxLeaseDuration = n
+			}
+		case "DefaultLeaseDuration":
+			if n, ok := parseTimeSeconds(value); ok {
+				cfg.DefaultLeaseDuration = n
+			}
+		case "MaxSubscriptions":
+			if n, ok := parseInt(value); ok {
+				cfg.MaxSubscriptions = n
+			}
+		case "MaxSubscriptionsPerJob":
+			if n, ok := parseInt(value); ok {
+				cfg.MaxSubscriptionsPerJob = n
+			}
+		case "MaxSubscriptionsPerPrinter":
+			if n, ok := parseInt(value); ok {
+				cfg.MaxSubscriptionsPerPrinter = n
+			}
+		case "MaxSubscriptionsPerUser":
+			if n, ok := parseInt(value); ok {
+				cfg.MaxSubscriptionsPerUser = n
 			}
 		}
 	}
@@ -619,6 +697,21 @@ func appendUnique(list []string, value string) []string {
 		}
 	}
 	return append(list, value)
+}
+
+func parseBrowseLocalProtocols(values []string) []string {
+	out := []string{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if strings.EqualFold(value, "none") {
+			return nil
+		}
+		out = appendUnique(out, value)
+	}
+	return out
 }
 
 func appendUniqueList(list []string, values ...string) []string {
