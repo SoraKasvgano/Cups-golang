@@ -22,6 +22,7 @@ func (s *Store) migrate(ctx context.Context) error {
                 state INTEGER NOT NULL DEFAULT 3,
                 accepting INTEGER NOT NULL DEFAULT 1,
                 shared INTEGER NOT NULL DEFAULT 1,
+                is_temporary INTEGER NOT NULL DEFAULT 0,
                 is_default INTEGER NOT NULL DEFAULT 0,
                 job_sheets_default TEXT NOT NULL DEFAULT 'none',
                 default_options TEXT NOT NULL DEFAULT '',
@@ -146,6 +147,9 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 		if err := ensureColumn(ctx, tx, "printers", "shared", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+			return err
+		}
+		if err := ensureColumn(ctx, tx, "printers", "is_temporary", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 			return err
 		}
 		if err := ensureColumn(ctx, tx, "printers", "job_sheets_default", "TEXT NOT NULL DEFAULT 'none'"); err != nil {

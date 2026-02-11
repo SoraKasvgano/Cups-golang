@@ -194,6 +194,11 @@ func remoteIPForRequest(r *http.Request) string {
 	return remoteIP
 }
 
+func isLocalhostRequest(r *http.Request) bool {
+	ip := net.ParseIP(remoteIPForRequest(r))
+	return ip != nil && ip.IsLoopback()
+}
+
 func (s *Server) defaultPolicyName() string {
 	if s == nil {
 		return "default"
@@ -566,6 +571,19 @@ func (s *Server) handleIPPRequest(w http.ResponseWriter, r *http.Request) error 
 		}
 		return err
 	}
+
+	// CUPS-Create-Local-Printer returns an IPP forbidden status for non-local
+	// clients (it is not a policy-based HTTP 401/403).
+	if op == goipp.OpCupsCreateLocalPrinter && !isLocalhostRequest(r) {
+		resp := goipp.NewResponse(req.Version, goipp.StatusErrorForbidden, req.RequestID)
+		addOperationDefaults(resp)
+		resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String("Only local users can create a local printer.")))
+		w.Header().Set("Content-Type", goipp.ContentType)
+		w.WriteHeader(http.StatusOK)
+		_ = resp.Encode(w)
+		return nil
+	}
+
 	if err := s.enforceIPPOpPolicy(ctx, r, &req); err != nil {
 		var httpErr *ippHTTPError
 		if errors.As(err, &httpErr) {
@@ -602,6 +620,8 @@ func (s *Server) handleIPPRequest(w http.ResponseWriter, r *http.Request) error 
 		resp, err = s.handleCupsGetPpds(ctx, r, &req)
 	case goipp.OpCupsGetPpd:
 		resp, payload, err = s.handleCupsGetPpd(ctx, r, &req)
+	case goipp.OpCupsCreateLocalPrinter:
+		resp, err = s.handleCupsCreateLocalPrinter(ctx, r, &req)
 	case goipp.OpCupsAddModifyPrinter:
 		resp, err = s.handleCupsAddModifyPrinter(ctx, r, &req, buf)
 	case goipp.OpCupsMoveJob:
@@ -849,6 +869,31 @@ func (s *Server) handleSetPrinterAttributes(ctx context.Context, r *http.Request
 	orgVal, orgOk := attrValue(req.Printer, "printer-organization")
 	orgUnitVal, orgUnitOk := attrValue(req.Printer, "printer-organizational-unit")
 	defaultOpts, jobSheetsDefault, jobSheetsOk, sharedPtr := collectPrinterDefaultOptions(req.Printer)
+
+	// Match CUPS behavior: you cannot save (persistent) default values for a
+	// temporary queue.
+	if printer.IsTemporary && (sharedPtr != nil || jobSheetsOk || len(defaultOpts) > 0) {
+		attrName := "printer-defaults"
+		switch {
+		case sharedPtr != nil:
+			attrName = "printer-is-shared"
+		case jobSheetsOk:
+			attrName = "job-sheets-default"
+		case len(defaultOpts) > 0:
+			keys := make([]string, 0, len(defaultOpts))
+			for k := range defaultOpts {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			if len(keys) > 0 {
+				attrName = keys[0]
+			}
+		}
+		resp := goipp.NewResponse(req.Version, goipp.StatusErrorNotPossible, req.RequestID)
+		addOperationDefaults(resp)
+		resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String(fmt.Sprintf("Unable to save value for \"%s\" with a temporary printer.", attrName))))
+		return resp, nil
+	}
 
 	var infoPtr, locPtr, geoPtr, orgPtr, orgUnitPtr *string
 	if infoOk {
@@ -1406,6 +1451,245 @@ func (s *Server) handleCupsGetPpd(ctx context.Context, r *http.Request, req *goi
 	return resp, ppd, nil
 }
 
+func (s *Server) handleCupsCreateLocalPrinter(ctx context.Context, r *http.Request, req *goipp.Message) (*goipp.Message, error) {
+	// Defense in depth: handleIPPRequest already blocks non-local callers.
+	if !isLocalhostRequest(r) {
+		resp := goipp.NewResponse(req.Version, goipp.StatusErrorForbidden, req.RequestID)
+		addOperationDefaults(resp)
+		resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String("Only local users can create a local printer.")))
+		return resp, nil
+	}
+
+	// Required attributes live in the printer group.
+	rawNameAttr := attrByName(req.Printer, "printer-name")
+	if rawNameAttr == nil {
+		if attrByName(req.Operation, "printer-name") != nil {
+			resp := goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID)
+			addOperationDefaults(resp)
+			resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String("Attribute \"printer-name\" is in the wrong group.")))
+			return resp, nil
+		}
+		resp := goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID)
+		addOperationDefaults(resp)
+		resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String("Missing required attribute \"printer-name\".")))
+		return resp, nil
+	}
+	if len(rawNameAttr.Values) == 0 || rawNameAttr.Values[0].T != goipp.TagName {
+		resp := goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID)
+		addOperationDefaults(resp)
+		resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String("Attribute \"printer-name\" is the wrong value type.")))
+		return resp, nil
+	}
+
+	rawName := strings.TrimSpace(rawNameAttr.Values[0].V.String())
+	name := sanitizeLocalPrinterName(rawName)
+	if strings.TrimSpace(name) == "" {
+		resp := goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID)
+		addOperationDefaults(resp)
+		resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String("Attribute \"printer-name\" has empty value.")))
+		return resp, nil
+	}
+
+	deviceURIAttr := attrByName(req.Printer, "device-uri")
+	if deviceURIAttr == nil {
+		if attrByName(req.Operation, "device-uri") != nil {
+			resp := goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID)
+			addOperationDefaults(resp)
+			resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String("Attribute \"device-uri\" is in the wrong group.")))
+			return resp, nil
+		}
+		resp := goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID)
+		addOperationDefaults(resp)
+		resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String("Missing required attribute \"device-uri\".")))
+		return resp, nil
+	}
+	if len(deviceURIAttr.Values) == 0 || deviceURIAttr.Values[0].T != goipp.TagURI {
+		resp := goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID)
+		addOperationDefaults(resp)
+		resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String("Attribute \"device-uri\" is the wrong value type.")))
+		return resp, nil
+	}
+
+	deviceURI := strings.TrimSpace(deviceURIAttr.Values[0].V.String())
+	if deviceURI == "" {
+		resp := goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID)
+		addOperationDefaults(resp)
+		resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String("Attribute \"device-uri\" has empty value.")))
+		return resp, nil
+	}
+
+	// Optional attributes (ignore wrong type, matching CUPS ippFindAttribute behavior).
+	geo := optionalStringAttr(req.Printer, "printer-geo-location", goipp.TagURI)
+	info := optionalStringAttr(req.Printer, "printer-info", goipp.TagText)
+	location := optionalStringAttr(req.Printer, "printer-location", goipp.TagText)
+
+	localizedDeviceURI := localizeDeviceURIForLocalQueue(deviceURI, s.Config)
+
+	var printer model.Printer
+	alreadyExists := false
+	existsName := ""
+	err := s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
+		// Prefer name match (CUPS does name match first).
+		if p, err := s.Store.GetPrinterByName(ctx, tx, name); err == nil {
+			printer = p
+			alreadyExists = true
+			existsName = p.Name
+			_ = s.Store.TouchPrinter(ctx, tx, p.ID)
+			return nil
+		}
+
+		// Then check device URI match. Compare both raw and localized URI to avoid
+		// duplicates when the queue has been localized to localhost.
+		if p, err := s.Store.GetPrinterByURI(ctx, tx, deviceURI); err == nil {
+			printer = p
+			alreadyExists = true
+			existsName = p.Name
+			_ = s.Store.TouchPrinter(ctx, tx, p.ID)
+			return nil
+		}
+		if localizedDeviceURI != deviceURI {
+			if p, err := s.Store.GetPrinterByURI(ctx, tx, localizedDeviceURI); err == nil {
+				printer = p
+				alreadyExists = true
+				existsName = p.Name
+				_ = s.Store.TouchPrinter(ctx, tx, p.ID)
+				return nil
+			}
+		}
+
+		// Create the queue (temporary + not shared).
+		p, err := s.Store.CreatePrinter(ctx, tx, name, localizedDeviceURI, location, info, model.DefaultPPDName, true, false, false, "none", "")
+		if err != nil {
+			return err
+		}
+		printer = p
+		if err := s.Store.UpdatePrinterTemporary(ctx, tx, printer.ID, true); err != nil {
+			return err
+		}
+		printer.IsTemporary = true
+
+		// Persist optional metadata.
+		var geoPtr *string
+		if strings.TrimSpace(geo) != "" {
+			geoPtr = &geo
+			printer.Geo = geo
+		}
+		if geoPtr != nil {
+			_ = s.Store.UpdatePrinterAttributes(ctx, tx, printer.ID, nil, nil, geoPtr, nil, nil)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
+	addOperationDefaults(resp)
+	if alreadyExists {
+		msg := fmt.Sprintf("Printer \"%s\" already exists.", existsName)
+		resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String(msg)))
+	}
+	resp.Printer.Add(goipp.MakeAttribute("printer-is-accepting-jobs", goipp.TagBoolean, goipp.Boolean(printer.Accepting)))
+	resp.Printer.Add(goipp.MakeAttribute("printer-state", goipp.TagEnum, goipp.Integer(printer.State)))
+	resp.Printer.Add(goipp.MakeAttribute("printer-state-reasons", goipp.TagKeyword, goipp.String(printerStateReason(printer))))
+	resp.Printer.Add(goipp.MakeAttribute("printer-uri-supported", goipp.TagURI, goipp.String(printerURIFor(printer, r))))
+	return resp, nil
+}
+
+func optionalStringAttr(attrs goipp.Attributes, name string, tag goipp.Tag) string {
+	attr := attrByName(attrs, name)
+	if attr == nil || len(attr.Values) == 0 {
+		return ""
+	}
+	actual := attr.Values[0].T
+	if actual != tag {
+		// Accept "*-with-language" values for optional text attributes.
+		if !(tag == goipp.TagText && actual == goipp.TagTextLang) {
+			return ""
+		}
+	}
+	return strings.TrimSpace(attr.Values[0].V.String())
+}
+
+func sanitizeLocalPrinterName(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	const maxLen = 127 // CUPS uses a 128-byte buffer including NUL terminator.
+	var b strings.Builder
+	b.Grow(len(raw))
+	prevUnderscore := false
+	for i := 0; i < len(raw) && b.Len() < maxLen; i++ {
+		c := raw[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			b.WriteByte(c)
+			prevUnderscore = false
+			continue
+		}
+		if b.Len() == 0 || !prevUnderscore {
+			b.WriteByte('_')
+			prevUnderscore = true
+		}
+	}
+	return b.String()
+}
+
+func localizeDeviceURIForLocalQueue(deviceURI string, cfg config.Config) string {
+	u, err := url.Parse(deviceURI)
+	if err != nil || u == nil {
+		return deviceURI
+	}
+	host := strings.TrimSpace(u.Hostname())
+	if host == "" {
+		return deviceURI
+	}
+
+	serverHost := strings.TrimSpace(cfg.DNSSDHostName)
+	fromServerName := false
+	if serverHost == "" {
+		serverHost = strings.TrimSpace(cfg.ServerName)
+		fromServerName = true
+	}
+	serverHost = strings.TrimSpace(serverHost)
+	if serverHost == "" {
+		return deviceURI
+	}
+	if h, _, err := net.SplitHostPort(serverHost); err == nil {
+		serverHost = h
+	}
+	serverHost = strings.Trim(serverHost, "[]")
+
+	normalize := func(s string) string {
+		s = strings.ToLower(strings.TrimSpace(s))
+		s = strings.TrimSuffix(s, ".")
+		return s
+	}
+
+	hostCmp := normalize(host)
+	serverCmp := normalize(serverHost)
+
+	// When we have only a ServerName (Browsing=Off), it may lack ".local" while
+	// the requested device URI includes it. Match these like CUPS does.
+	if fromServerName && strings.HasSuffix(hostCmp, ".local") && !strings.HasSuffix(serverCmp, ".local") {
+		hostCmp = strings.TrimSuffix(hostCmp, ".local")
+	}
+
+	if hostCmp != serverCmp {
+		return deviceURI
+	}
+
+	// Replace hostname with localhost while preserving port and userinfo/path.
+	port := u.Port()
+	if port != "" {
+		u.Host = "localhost:" + port
+	} else {
+		u.Host = "localhost"
+	}
+	return u.String()
+}
+
 func (s *Server) handleCupsMoveJob(ctx context.Context, r *http.Request, req *goipp.Message) (*goipp.Message, error) {
 	jobID := attrInt(req.Operation, "job-id")
 	if jobID == 0 {
@@ -1476,6 +1760,40 @@ func (s *Server) handleCupsAddModifyPrinter(ctx context.Context, r *http.Request
 	org := attrString(req.Printer, "printer-organization")
 	orgUnit := attrString(req.Printer, "printer-organizational-unit")
 	defaultOpts, jobSheetsDefault, jobSheetsOk, sharedPtr := collectPrinterDefaultOptions(req.Printer)
+
+	// Match CUPS behavior: you cannot save (persistent) default values for a
+	// temporary queue.
+	if sharedPtr != nil || jobSheetsOk || len(defaultOpts) > 0 {
+		var existing model.Printer
+		_ = s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
+			if p, err := s.Store.GetPrinterByName(ctx, tx, name); err == nil {
+				existing = p
+			}
+			return nil
+		})
+		if existing.ID != 0 && existing.IsTemporary {
+			attrName := "printer-defaults"
+			switch {
+			case sharedPtr != nil:
+				attrName = "printer-is-shared"
+			case jobSheetsOk:
+				attrName = "job-sheets-default"
+			case len(defaultOpts) > 0:
+				keys := make([]string, 0, len(defaultOpts))
+				for k := range defaultOpts {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				if len(keys) > 0 {
+					attrName = keys[0]
+				}
+			}
+			resp := goipp.NewResponse(req.Version, goipp.StatusErrorNotPossible, req.RequestID)
+			addOperationDefaults(resp)
+			resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String(fmt.Sprintf("Unable to save value for \"%s\" with a temporary printer.", attrName))))
+			return resp, nil
+		}
+	}
 	if uri == "" {
 		uri = attrString(req.Operation, "printer-uri")
 	}
@@ -1575,13 +1893,57 @@ func (s *Server) handleCupsDeletePrinter(ctx context.Context, r *http.Request, r
 	if name == "" {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
 	}
-	err := s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
-		p, err := s.Store.GetPrinterByName(ctx, tx, name)
+
+	var printer model.Printer
+	docPaths := []string{}
+	outPaths := []string{}
+
+	// Collect document/output paths first so we don't orphan spool files after the
+	// DB rows cascade-delete.
+	err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
+		var err error
+		printer, err = s.Store.GetPrinterByName(ctx, tx, name)
 		if err != nil {
 			return err
 		}
-		return s.Store.DeletePrinter(ctx, tx, p.ID)
+		jobIDs, err := s.Store.ListJobIDsByPrinter(ctx, tx, printer.ID)
+		if err != nil {
+			return err
+		}
+		for _, jobID := range jobIDs {
+			docs, err := s.Store.ListDocumentsByJob(ctx, tx, jobID)
+			if err != nil {
+				return err
+			}
+			for _, d := range docs {
+				if p := strings.TrimSpace(d.Path); p != "" {
+					docPaths = append(docPaths, p)
+				}
+				if s.Spool.OutputDir != "" {
+					if op := strings.TrimSpace(s.Spool.OutputPath(jobID, d.FileName)); op != "" {
+						outPaths = append(outPaths, op)
+					}
+				}
+			}
+		}
+		return nil
 	})
+	if err == nil {
+		for _, p := range docPaths {
+			_ = os.Remove(p)
+		}
+		for _, p := range outPaths {
+			_ = os.Remove(p)
+		}
+		err = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
+			// Re-check the printer still exists before deleting.
+			p, err := s.Store.GetPrinterByID(ctx, tx, printer.ID)
+			if err != nil {
+				return err
+			}
+			return s.Store.DeletePrinter(ctx, tx, p.ID)
+		})
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -4824,7 +5186,7 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	attrs.Add(goipp.MakeAttribute("ppd-name", goipp.TagName, goipp.String(ppdName)))
 	attrs.Add(goipp.MakeAttribute("printer-make-and-model", goipp.TagText, goipp.String(modelName)))
 	attrs.Add(goipp.MakeAttribute("printer-more-info", goipp.TagURI, goipp.String(printerMoreInfoURI(printer.Name, false, r))))
-	attrs.Add(goipp.MakeAttribute("printer-is-temporary", goipp.TagBoolean, goipp.Boolean(false)))
+	attrs.Add(goipp.MakeAttribute("printer-is-temporary", goipp.TagBoolean, goipp.Boolean(printer.IsTemporary)))
 	attrs.Add(goipp.MakeAttribute("printer-type", goipp.TagInteger, goipp.Integer(computePrinterType(printer, caps, ppd, false, authInfo))))
 	colorSupported := false
 	for _, mode := range caps.colorModes {

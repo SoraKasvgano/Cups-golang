@@ -197,6 +197,10 @@ func writePrintersConf(path string, printers []model.Printer) error {
 	defer w.Flush()
 
 	for _, p := range printers {
+		// Temporary queues are not persisted to printers.conf in CUPS.
+		if p.IsTemporary {
+			continue
+		}
 		_, _ = w.WriteString("<Printer " + p.Name + ">\n")
 		if p.Info != "" {
 			_, _ = w.WriteString("Info " + p.Info + "\n")

@@ -28,6 +28,8 @@ type Scheduler struct {
 	StopChan chan struct{}
 	Mime     *config.MimeDB
 	Config   config.Config
+
+	lastTempCleanup time.Time
 }
 
 func (s *Scheduler) Start(ctx context.Context) {
@@ -37,6 +39,9 @@ func (s *Scheduler) Start(ctx context.Context) {
 	if s.StopChan == nil {
 		s.StopChan = make(chan struct{})
 	}
+
+	// CUPS temporary queues are not persisted across scheduler restarts.
+	s.cleanupTemporaryPrinters(ctx, true)
 
 	ticker := time.NewTicker(s.Interval)
 	go func() {
@@ -174,6 +179,9 @@ func (s *Scheduler) processOnce(ctx context.Context) {
 	// Match CUPS behavior: completed jobs and/or job files are cleaned up based on
 	// PreserveJobHistory/PreserveJobFiles time intervals.
 	s.cleanTerminalJobs(ctx, historySecs, filesSecs)
+
+	// Match CUPS behavior: temporary queues are removed when unused.
+	s.cleanupTemporaryPrinters(ctx, false)
 }
 
 type jobCandidate struct {
@@ -1170,6 +1178,101 @@ func (s *Scheduler) cleanTerminalJobs(ctx context.Context, historySecs int, file
 				if err := s.Store.DeleteDocumentsByJob(ctx, tx, c.id); err != nil {
 					return err
 				}
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Scheduler) cleanupTemporaryPrinters(ctx context.Context, force bool) {
+	if s == nil || s.Store == nil {
+		return
+	}
+
+	if !force && !s.lastTempCleanup.IsZero() && time.Since(s.lastTempCleanup) < 30*time.Second {
+		return
+	}
+	s.lastTempCleanup = time.Now().UTC()
+
+	// CUPS keeps temporary queues around for 5 minutes after the last job
+	// completes, unless forced (e.g. on startup/shutdown).
+	unusedBefore := time.Now().UTC().Add(-5 * time.Minute)
+
+	type cleanupPrinter struct {
+		printerID int64
+		docPaths  []string
+		outPaths  []string
+	}
+	cleanups := []cleanupPrinter{}
+	var candidates []model.Printer
+
+	_ = s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
+		var err error
+		candidates, err = s.Store.ListTemporaryPrinters(ctx, tx, force, unusedBefore, 100)
+		if err != nil {
+			return err
+		}
+		for _, p := range candidates {
+			jobIDs, err := s.Store.ListJobIDsByPrinter(ctx, tx, p.ID)
+			if err != nil {
+				return err
+			}
+			docPaths := []string{}
+			outPaths := []string{}
+			for _, jobID := range jobIDs {
+				docs, err := s.Store.ListDocumentsByJob(ctx, tx, jobID)
+				if err != nil {
+					return err
+				}
+				for _, d := range docs {
+					if sp := strings.TrimSpace(d.Path); sp != "" {
+						docPaths = append(docPaths, sp)
+					}
+					if s.Spool.OutputDir != "" {
+						if op := strings.TrimSpace(s.Spool.OutputPath(jobID, d.FileName)); op != "" {
+							outPaths = append(outPaths, op)
+						}
+					}
+				}
+			}
+			cleanups = append(cleanups, cleanupPrinter{printerID: p.ID, docPaths: docPaths, outPaths: outPaths})
+		}
+		return nil
+	})
+
+	if len(candidates) == 0 {
+		return
+	}
+
+	// Best-effort file cleanup before deleting DB rows to avoid orphan spool data.
+	for _, c := range cleanups {
+		for _, p := range c.docPaths {
+			_ = os.Remove(p)
+		}
+		for _, p := range c.outPaths {
+			_ = os.Remove(p)
+		}
+	}
+
+	_ = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
+		for _, candidate := range candidates {
+			p, err := s.Store.GetPrinterByID(ctx, tx, candidate.ID)
+			if err != nil {
+				continue
+			}
+			if !p.IsTemporary {
+				continue
+			}
+			if !force {
+				if p.State == 4 {
+					continue
+				}
+				if !p.UpdatedAt.Before(unusedBefore) {
+					continue
+				}
+			}
+			if err := s.Store.DeletePrinter(ctx, tx, p.ID); err != nil {
+				return err
 			}
 		}
 		return nil

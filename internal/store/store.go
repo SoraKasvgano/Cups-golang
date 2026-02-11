@@ -122,7 +122,7 @@ func (s *Store) EnsureAdminUser(ctx context.Context) error {
 
 func (s *Store) ListPrinters(ctx context.Context, tx *sql.Tx) ([]model.Printer, error) {
 	rows, err := tx.QueryContext(ctx, `
-        SELECT id, name, uri, ppd_name, location, info, geo_location, organization, organizational_unit, state, accepting, shared, is_default, job_sheets_default, default_options, created_at, updated_at
+        SELECT id, name, uri, ppd_name, location, info, geo_location, organization, organizational_unit, state, accepting, shared, is_temporary, is_default, job_sheets_default, default_options, created_at, updated_at
         FROM printers
         ORDER BY name
     `)
@@ -136,15 +136,17 @@ func (s *Store) ListPrinters(ctx context.Context, tx *sql.Tx) ([]model.Printer, 
 		var p model.Printer
 		var accepting int
 		var shared int
+		var temporary int
 		var isDefault int
 		var jobSheets string
 		var defaultOptions string
 		var ppdName string
-		if err := rows.Scan(&p.ID, &p.Name, &p.URI, &ppdName, &p.Location, &p.Info, &p.Geo, &p.Org, &p.OrgUnit, &p.State, &accepting, &shared, &isDefault, &jobSheets, &defaultOptions, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.URI, &ppdName, &p.Location, &p.Info, &p.Geo, &p.Org, &p.OrgUnit, &p.State, &accepting, &shared, &temporary, &isDefault, &jobSheets, &defaultOptions, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return nil, err
 		}
 		p.Accepting = accepting != 0
 		p.Shared = shared != 0
+		p.IsTemporary = temporary != 0
 		p.IsDefault = isDefault != 0
 		p.PPDName = strings.TrimSpace(ppdName)
 		if strings.TrimSpace(jobSheets) == "" {
@@ -155,6 +157,57 @@ func (s *Store) ListPrinters(ctx context.Context, tx *sql.Tx) ([]model.Printer, 
 		printers = append(printers, p)
 	}
 	return printers, rows.Err()
+}
+
+func (s *Store) ListTemporaryPrinters(ctx context.Context, tx *sql.Tx, force bool, unusedBefore time.Time, limit int) ([]model.Printer, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	query := `
+        SELECT id, name, uri, ppd_name, location, info, geo_location, organization, organizational_unit, state, accepting, shared, is_temporary, is_default, job_sheets_default, default_options, created_at, updated_at
+        FROM printers
+        WHERE is_temporary = 1
+    `
+	args := []any{}
+	if !force {
+		query += " AND state != 4 AND updated_at < ?"
+		args = append(args, unusedBefore.UTC())
+	}
+	query += " ORDER BY updated_at LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []model.Printer{}
+	for rows.Next() {
+		var p model.Printer
+		var accepting int
+		var shared int
+		var temporary int
+		var isDefault int
+		var jobSheets string
+		var defaultOptions string
+		var ppdName string
+		if err := rows.Scan(&p.ID, &p.Name, &p.URI, &ppdName, &p.Location, &p.Info, &p.Geo, &p.Org, &p.OrgUnit, &p.State, &accepting, &shared, &temporary, &isDefault, &jobSheets, &defaultOptions, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return nil, err
+		}
+		p.Accepting = accepting != 0
+		p.Shared = shared != 0
+		p.IsTemporary = temporary != 0
+		p.IsDefault = isDefault != 0
+		p.PPDName = strings.TrimSpace(ppdName)
+		if strings.TrimSpace(jobSheets) == "" {
+			jobSheets = "none"
+		}
+		p.JobSheetsDefault = jobSheets
+		p.DefaultOptions = defaultOptions
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) CreateClass(ctx context.Context, tx *sql.Tx, name, location, info string, accepting bool, isDefault bool, memberPrinterIDs []int64) (model.Class, error) {
@@ -296,7 +349,7 @@ func (s *Store) GetClassByName(ctx context.Context, tx *sql.Tx, name string) (mo
 
 func (s *Store) ListClassMembers(ctx context.Context, tx *sql.Tx, classID int64) ([]model.Printer, error) {
 	rows, err := tx.QueryContext(ctx, `
-        SELECT p.id, p.name, p.uri, p.location, p.info, p.geo_location, p.organization, p.organizational_unit, p.state, p.accepting, p.shared, p.is_default, p.job_sheets_default, p.default_options, p.created_at, p.updated_at
+        SELECT p.id, p.name, p.uri, p.ppd_name, p.location, p.info, p.geo_location, p.organization, p.organizational_unit, p.state, p.accepting, p.shared, p.is_temporary, p.is_default, p.job_sheets_default, p.default_options, p.created_at, p.updated_at
         FROM class_members cm
         JOIN printers p ON p.id = cm.printer_id
         WHERE cm.class_id = ?
@@ -311,15 +364,17 @@ func (s *Store) ListClassMembers(ctx context.Context, tx *sql.Tx, classID int64)
 		var p model.Printer
 		var accepting int
 		var shared int
+		var temporary int
 		var isDefault int
 		var jobSheets string
 		var defaultOptions string
 		var ppdName string
-		if err := rows.Scan(&p.ID, &p.Name, &p.URI, &ppdName, &p.Location, &p.Info, &p.Geo, &p.Org, &p.OrgUnit, &p.State, &accepting, &shared, &isDefault, &jobSheets, &defaultOptions, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.URI, &ppdName, &p.Location, &p.Info, &p.Geo, &p.Org, &p.OrgUnit, &p.State, &accepting, &shared, &temporary, &isDefault, &jobSheets, &defaultOptions, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return nil, err
 		}
 		p.Accepting = accepting != 0
 		p.Shared = shared != 0
+		p.IsTemporary = temporary != 0
 		p.IsDefault = isDefault != 0
 		p.PPDName = strings.TrimSpace(ppdName)
 		if strings.TrimSpace(jobSheets) == "" {
@@ -399,19 +454,21 @@ func (s *Store) GetPrinterByName(ctx context.Context, tx *sql.Tx, name string) (
 	var accepting int
 	var isDefault int
 	var shared int
+	var temporary int
 	var jobSheets string
 	var defaultOptions string
 	var ppdName string
 	err := tx.QueryRowContext(ctx, `
-        SELECT id, name, uri, ppd_name, location, info, geo_location, organization, organizational_unit, state, accepting, shared, is_default, job_sheets_default, default_options, created_at, updated_at
+        SELECT id, name, uri, ppd_name, location, info, geo_location, organization, organizational_unit, state, accepting, shared, is_temporary, is_default, job_sheets_default, default_options, created_at, updated_at
         FROM printers
         WHERE name = ?
-    `, name).Scan(&p.ID, &p.Name, &p.URI, &ppdName, &p.Location, &p.Info, &p.Geo, &p.Org, &p.OrgUnit, &p.State, &accepting, &shared, &isDefault, &jobSheets, &defaultOptions, &p.CreatedAt, &p.UpdatedAt)
+    `, name).Scan(&p.ID, &p.Name, &p.URI, &ppdName, &p.Location, &p.Info, &p.Geo, &p.Org, &p.OrgUnit, &p.State, &accepting, &shared, &temporary, &isDefault, &jobSheets, &defaultOptions, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return model.Printer{}, err
 	}
 	p.Accepting = accepting != 0
 	p.Shared = shared != 0
+	p.IsTemporary = temporary != 0
 	p.IsDefault = isDefault != 0
 	p.PPDName = strings.TrimSpace(ppdName)
 	if strings.TrimSpace(jobSheets) == "" {
@@ -427,19 +484,21 @@ func (s *Store) GetPrinterByID(ctx context.Context, tx *sql.Tx, id int64) (model
 	var accepting int
 	var isDefault int
 	var shared int
+	var temporary int
 	var jobSheets string
 	var defaultOptions string
 	var ppdName string
 	err := tx.QueryRowContext(ctx, `
-        SELECT id, name, uri, ppd_name, location, info, geo_location, organization, organizational_unit, state, accepting, shared, is_default, job_sheets_default, default_options, created_at, updated_at
+        SELECT id, name, uri, ppd_name, location, info, geo_location, organization, organizational_unit, state, accepting, shared, is_temporary, is_default, job_sheets_default, default_options, created_at, updated_at
         FROM printers
         WHERE id = ?
-    `, id).Scan(&p.ID, &p.Name, &p.URI, &ppdName, &p.Location, &p.Info, &p.Geo, &p.Org, &p.OrgUnit, &p.State, &accepting, &shared, &isDefault, &jobSheets, &defaultOptions, &p.CreatedAt, &p.UpdatedAt)
+    `, id).Scan(&p.ID, &p.Name, &p.URI, &ppdName, &p.Location, &p.Info, &p.Geo, &p.Org, &p.OrgUnit, &p.State, &accepting, &shared, &temporary, &isDefault, &jobSheets, &defaultOptions, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return model.Printer{}, err
 	}
 	p.Accepting = accepting != 0
 	p.Shared = shared != 0
+	p.IsTemporary = temporary != 0
 	p.IsDefault = isDefault != 0
 	p.PPDName = strings.TrimSpace(ppdName)
 	if strings.TrimSpace(jobSheets) == "" {
@@ -448,6 +507,76 @@ func (s *Store) GetPrinterByID(ctx context.Context, tx *sql.Tx, id int64) (model
 	p.JobSheetsDefault = jobSheets
 	p.DefaultOptions = defaultOptions
 	return p, nil
+}
+
+func (s *Store) GetPrinterByURI(ctx context.Context, tx *sql.Tx, uri string) (model.Printer, error) {
+	var p model.Printer
+	var accepting int
+	var isDefault int
+	var shared int
+	var temporary int
+	var jobSheets string
+	var defaultOptions string
+	var ppdName string
+	err := tx.QueryRowContext(ctx, `
+        SELECT id, name, uri, ppd_name, location, info, geo_location, organization, organizational_unit, state, accepting, shared, is_temporary, is_default, job_sheets_default, default_options, created_at, updated_at
+        FROM printers
+        WHERE uri = ?
+    `, uri).Scan(&p.ID, &p.Name, &p.URI, &ppdName, &p.Location, &p.Info, &p.Geo, &p.Org, &p.OrgUnit, &p.State, &accepting, &shared, &temporary, &isDefault, &jobSheets, &defaultOptions, &p.CreatedAt, &p.UpdatedAt)
+	if err != nil {
+		return model.Printer{}, err
+	}
+	p.Accepting = accepting != 0
+	p.Shared = shared != 0
+	p.IsTemporary = temporary != 0
+	p.IsDefault = isDefault != 0
+	p.PPDName = strings.TrimSpace(ppdName)
+	if strings.TrimSpace(jobSheets) == "" {
+		jobSheets = "none"
+	}
+	p.JobSheetsDefault = jobSheets
+	p.DefaultOptions = defaultOptions
+	return p, nil
+}
+
+func (s *Store) TouchPrinter(ctx context.Context, tx *sql.Tx, id int64) error {
+	_, err := tx.ExecContext(ctx, `
+        UPDATE printers
+        SET updated_at = ?
+        WHERE id = ?
+    `, time.Now().UTC(), id)
+	return err
+}
+
+func (s *Store) UpdatePrinterTemporary(ctx context.Context, tx *sql.Tx, id int64, temporary bool) error {
+	val := 0
+	if temporary {
+		val = 1
+	}
+	_, err := tx.ExecContext(ctx, `
+        UPDATE printers
+        SET is_temporary = ?, updated_at = ?
+        WHERE id = ?
+    `, val, time.Now().UTC(), id)
+	return err
+}
+
+func (s *Store) DeleteTemporaryPrinters(ctx context.Context, tx *sql.Tx, force bool, unusedBefore time.Time) (int64, error) {
+	stmt := `DELETE FROM printers WHERE is_temporary = 1`
+	args := []any{}
+	if !force {
+		stmt += ` AND state != 4 AND updated_at < ?`
+		args = append(args, unusedBefore.UTC())
+	}
+	res, err := tx.ExecContext(ctx, stmt, args...)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, nil
+	}
+	return n, nil
 }
 
 func (s *Store) CreateJob(ctx context.Context, tx *sql.Tx, printerID int64, name, user, originHost, options string) (model.Job, error) {

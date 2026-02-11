@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"path"
 	"regexp"
 	"sort"
@@ -352,12 +353,57 @@ func (s *Server) createClassFromForm(r *http.Request) error {
 }
 
 func (s *Server) deletePrinterByName(r *http.Request, name string) error {
-	return s.Store.WithTx(r.Context(), false, func(tx *sql.Tx) error {
-		p, err := s.Store.GetPrinterByName(r.Context(), tx, name)
+	ctx := r.Context()
+	var printer model.Printer
+	docPaths := []string{}
+	outPaths := []string{}
+
+	// Gather file paths first so we can delete them even though DB deletes cascade.
+	if err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
+		var err error
+		printer, err = s.Store.GetPrinterByName(ctx, tx, name)
 		if err != nil {
 			return err
 		}
-		return s.Store.DeletePrinter(r.Context(), tx, p.ID)
+		jobIDs, err := s.Store.ListJobIDsByPrinter(ctx, tx, printer.ID)
+		if err != nil {
+			return err
+		}
+		for _, jobID := range jobIDs {
+			docs, err := s.Store.ListDocumentsByJob(ctx, tx, jobID)
+			if err != nil {
+				return err
+			}
+			for _, d := range docs {
+				if p := strings.TrimSpace(d.Path); p != "" {
+					docPaths = append(docPaths, p)
+				}
+				if s.Spool.OutputDir != "" {
+					if op := strings.TrimSpace(s.Spool.OutputPath(jobID, d.FileName)); op != "" {
+						outPaths = append(outPaths, op)
+					}
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	for _, p := range docPaths {
+		_ = os.Remove(p)
+	}
+	for _, p := range outPaths {
+		_ = os.Remove(p)
+	}
+
+	return s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
+		// Re-check the printer still exists before deleting.
+		p, err := s.Store.GetPrinterByID(ctx, tx, printer.ID)
+		if err != nil {
+			return err
+		}
+		return s.Store.DeletePrinter(ctx, tx, p.ID)
 	})
 }
 

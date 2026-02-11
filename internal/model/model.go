@@ -18,6 +18,7 @@ type Printer struct {
 	State            int
 	Accepting        bool
 	Shared           bool
+	IsTemporary      bool
 	IsDefault        bool
 	JobSheetsDefault string
 	DefaultOptions   string
