@@ -13,6 +13,8 @@ type LocationRule struct {
 	AuthType     string
 	RequireUser  bool
 	RequireAdmin bool
+	RequireUsers  []string
+	RequireGroups []string
 	Order        string
 	AllowAll     bool
 	DenyAll      bool
@@ -35,6 +37,8 @@ type LimitRule struct {
 	RequireUser  bool
 	RequireOwner bool
 	RequireAdmin bool
+	RequireUsers  []string
+	RequireGroups []string
 	Order        string
 	AllowAll     bool
 	DenyAll      bool
@@ -266,15 +270,37 @@ func applyLocationDirective(target *LocationRule, parts []string) {
 		}
 	case "Require":
 		if len(parts) > 1 {
-			if parts[1] == "user" {
+			switch parts[1] {
+			case "valid-user":
+				target.RequireUser = true
+			case "user":
 				target.RequireUser = true
 				for _, token := range parts[2:] {
-					if token == "@SYSTEM" || token == "admin" {
+					token = strings.TrimSpace(token)
+					if token == "" {
+						continue
+					}
+					switch token {
+					case "@SYSTEM", "admin":
 						target.RequireAdmin = true
+					default:
+						target.RequireUsers = append(target.RequireUsers, token)
 					}
 				}
-			} else if parts[1] == "group" {
-				target.RequireAdmin = true
+			case "group":
+				target.RequireUser = true
+				for _, token := range parts[2:] {
+					token = strings.TrimSpace(token)
+					if token == "" {
+						continue
+					}
+					switch token {
+					case "@SYSTEM", "admin":
+						target.RequireAdmin = true
+					default:
+						target.RequireGroups = append(target.RequireGroups, token)
+					}
+				}
 			}
 		}
 	case "Order":
@@ -311,18 +337,39 @@ func applyLimitDirective(target *LimitRule, parts []string) {
 		}
 	case "Require":
 		if len(parts) > 1 {
-			if parts[1] == "user" {
+			switch parts[1] {
+			case "valid-user":
+				target.RequireUser = true
+			case "user":
 				target.RequireUser = true
 				for _, token := range parts[2:] {
+					token = strings.TrimSpace(token)
+					if token == "" {
+						continue
+					}
 					switch token {
 					case "@OWNER":
 						target.RequireOwner = true
 					case "@SYSTEM", "admin":
 						target.RequireAdmin = true
+					default:
+						target.RequireUsers = append(target.RequireUsers, token)
 					}
 				}
-			} else if parts[1] == "group" {
-				target.RequireAdmin = true
+			case "group":
+				target.RequireUser = true
+				for _, token := range parts[2:] {
+					token = strings.TrimSpace(token)
+					if token == "" {
+						continue
+					}
+					switch token {
+					case "@SYSTEM", "admin":
+						target.RequireAdmin = true
+					default:
+						target.RequireGroups = append(target.RequireGroups, token)
+					}
+				}
 			}
 		}
 	case "Order":
@@ -445,4 +492,3 @@ func opAliases(op string) []string {
 	}
 	return aliases
 }
-

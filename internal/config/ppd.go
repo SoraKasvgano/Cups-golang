@@ -230,9 +230,11 @@ func LoadPPD(path string) (*PPD, error) {
 				ppd.MaxCopies = n
 			}
 		}
-		if strings.HasPrefix(line, "*ManualCopies:") {
-			val := strings.TrimSpace(strings.Trim(line[len("*ManualCopies:"):], " \""))
-			ppd.ManualCopies = strings.EqualFold(val, "true") || val == "1" || strings.EqualFold(val, "yes")
+		if strings.HasPrefix(line, "*ManualCopies:") || strings.HasPrefix(line, "*cupsManualCopies:") {
+			if idx := strings.Index(line, ":"); idx != -1 {
+				val := strings.TrimSpace(strings.Trim(line[idx+1:], " \""))
+				ppd.ManualCopies = strings.EqualFold(val, "true") || val == "1" || strings.EqualFold(val, "yes")
+			}
 		}
 		if strings.HasPrefix(line, "*cupsMandatory:") {
 			val := strings.TrimSpace(strings.Trim(line[len("*cupsMandatory:"):], " \""))
@@ -436,16 +438,36 @@ func LoadPPD(path string) (*PPD, error) {
 				if size, exists := ppd.PageSizes[name]; exists {
 					size.Left = l
 					size.Bottom = b
-					size.Right = r
-					size.Top = t
+					// PPD ImageableArea provides coordinates (left/bottom/right/top) in points
+					// from the lower-left corner. For margin-based IPP attributes we keep
+					// left/bottom as-is (they are margins) and convert right/top coordinates
+					// into right/top margins when we know the paper dimensions.
+					if size.Width > 0 && size.Length > 0 {
+						if rm := size.Width - r; rm >= 0 {
+							size.Right = rm
+						} else {
+							size.Right = 0
+						}
+						if tm := size.Length - t; tm >= 0 {
+							size.Top = tm
+						} else {
+							size.Top = 0
+						}
+					} else {
+						// Fallback: keep raw values when page dimensions are unknown.
+						size.Right = r
+						size.Top = t
+					}
 					ppd.PageSizes[name] = size
 				} else {
 					ppd.PageSizes[name] = PPDPageSize{
 						Name:   name,
 						Left:   l,
 						Bottom: b,
-						Right:  r,
-						Top:    t,
+						// Without a corresponding *PageSize entry we cannot convert right/top
+						// coordinates into margins.
+						Right: r,
+						Top:   t,
 					}
 				}
 			}
@@ -497,6 +519,13 @@ func LoadPPD(path string) (*PPD, error) {
 				}
 				if key == "Resolution" {
 					ppd.Resolutions = appendIfMissing(ppd.Resolutions, choice)
+				}
+				if key == "cupsPrintQuality" {
+					if xres, yres, ok := parsePPDHWResolution(line); ok {
+						if res := resolutionChoiceFromDPI(xres, yres); res != "" {
+							ppd.Resolutions = appendIfMissing(ppd.Resolutions, res)
+						}
+					}
 				}
 				if key == "ColorModel" || key == "ColorMode" || key == "ColorSpace" {
 					ppd.ColorSpaces = appendIfMissing(ppd.ColorSpaces, choice)
@@ -829,8 +858,32 @@ func parsePPDOrderDependency(line string) (PPDOrderDependency, bool) {
 }
 
 var pageSizeRe = regexp.MustCompile(`(?i)pagesize\s*\[\s*([0-9.]+)\s+([0-9.]+)\s*\]`)
-var imageableAreaRe = regexp.MustCompile(`(?i)^\\*ImageableArea\\s+([^:]+):\\s*\"?\\s*([0-9.]+)\\s+([0-9.]+)\\s+([0-9.]+)\\s+([0-9.]+)\\s*\"?`)
-var hwMarginsRe = regexp.MustCompile(`(?i)^\\*HWMargins:\\s*\"?\\s*([0-9.]+)\\s+([0-9.]+)\\s+([0-9.]+)\\s+([0-9.]+)\\s*\"?`)
+var imageableAreaRe = regexp.MustCompile(`(?i)^\*ImageableArea\s+([^:]+):\s*\"?\s*([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s*\"?`)
+var hwMarginsRe = regexp.MustCompile(`(?i)^\*HWMargins:\s*\"?\s*([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s*\"?`)
+var hwResolutionRe = regexp.MustCompile(`(?i)hwresolution\s*\[\s*([0-9]+)\s+([0-9]+)\s*\]`)
+
+func parsePPDHWResolution(line string) (int, int, bool) {
+	matches := hwResolutionRe.FindStringSubmatch(line)
+	if len(matches) < 3 {
+		return 0, 0, false
+	}
+	x, err1 := strconv.Atoi(matches[1])
+	y, err2 := strconv.Atoi(matches[2])
+	if err1 != nil || err2 != nil || x <= 0 || y <= 0 {
+		return 0, 0, false
+	}
+	return x, y, true
+}
+
+func resolutionChoiceFromDPI(xres, yres int) string {
+	if xres <= 0 || yres <= 0 {
+		return ""
+	}
+	if xres == yres {
+		return fmt.Sprintf("%ddpi", xres)
+	}
+	return fmt.Sprintf("%dx%ddpi", xres, yres)
+}
 
 func parsePPDPageSize(line string) (PPDPageSize, bool) {
 	if !strings.HasPrefix(line, "*PageSize ") {

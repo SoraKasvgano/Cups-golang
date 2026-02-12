@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -357,6 +358,7 @@ func (s *Server) deletePrinterByName(r *http.Request, name string) error {
 	var printer model.Printer
 	docPaths := []string{}
 	outPaths := []string{}
+	ppdToRemove := ""
 
 	// Gather file paths first so we can delete them even though DB deletes cascade.
 	if err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
@@ -385,6 +387,13 @@ func (s *Server) deletePrinterByName(r *http.Request, name string) error {
 				}
 			}
 		}
+		// Queue-specific PPD files are named like "<printer>.ppd" in CUPS.
+		if ppdName := strings.TrimSpace(printer.PPDName); ppdName != "" && !strings.EqualFold(ppdName, model.DefaultPPDName) {
+			base := filepath.Base(ppdName)
+			if strings.EqualFold(base, printer.Name+".ppd") {
+				ppdToRemove = base
+			}
+		}
 		return nil
 	}); err != nil {
 		return err
@@ -395,6 +404,9 @@ func (s *Server) deletePrinterByName(r *http.Request, name string) error {
 	}
 	for _, p := range outPaths {
 		_ = os.Remove(p)
+	}
+	if ppdToRemove != "" {
+		_ = os.Remove(safePPDPath(s.Config.PPDDir, ppdToRemove))
 	}
 
 	return s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {

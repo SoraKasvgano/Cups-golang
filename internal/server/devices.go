@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"net"
 	"os"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"github.com/hashicorp/mdns"
 
 	"cupsgolang/internal/backend"
+	"cupsgolang/internal/store"
 )
 
 type Device struct {
@@ -20,6 +22,111 @@ type Device struct {
 	Class    string
 	DeviceID string
 	Location string
+}
+
+const deviceCacheTTL = 45 * time.Second
+
+func discoverDevices(ctx context.Context, st *store.Store, useCache bool) []Device {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if st != nil {
+		if useCache {
+			if cached := loadDeviceCache(ctx, st); len(cached) > 0 {
+				return cached
+			}
+		}
+		_ = st.WithTx(ctx, false, func(tx *sql.Tx) error {
+			_ = st.PruneDeviceCache(ctx, tx, 24*time.Hour)
+			return nil
+		})
+	}
+
+	devices := []Device{}
+	devices = append(devices, discoverLocalDevices(ctx)...)
+	devices = append(devices, discoverNetworkIPP(ctx)...)
+	devices = append(devices, discoverMDNSIPP(ctx)...)
+	devices = uniqueDevices(devices)
+
+	if st != nil && len(devices) > 0 {
+		persistDeviceCache(ctx, st, devices)
+	}
+	return devices
+}
+
+func loadDeviceCache(ctx context.Context, st *store.Store) []Device {
+	if st == nil {
+		return nil
+	}
+	items := []store.DeviceCacheEntry{}
+	_ = st.WithTx(ctx, true, func(tx *sql.Tx) error {
+		var err error
+		items, err = st.ListDeviceCache(ctx, tx, deviceCacheTTL, 4096)
+		return err
+	})
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]Device, 0, len(items))
+	for _, item := range items {
+		if strings.TrimSpace(item.URI) == "" {
+			continue
+		}
+		out = append(out, Device{
+			URI:      item.URI,
+			Info:     item.Info,
+			Make:     item.MakeModel,
+			Class:    item.Class,
+			DeviceID: item.DeviceID,
+			Location: item.Location,
+		})
+	}
+	return uniqueDevices(out)
+}
+
+func persistDeviceCache(ctx context.Context, st *store.Store, devices []Device) {
+	if st == nil || len(devices) == 0 {
+		return
+	}
+	now := time.Now().UTC()
+	_ = st.WithTx(ctx, false, func(tx *sql.Tx) error {
+		for _, d := range devices {
+			if strings.TrimSpace(d.URI) == "" {
+				continue
+			}
+			_ = st.UpsertDeviceCache(ctx, tx, store.DeviceCacheEntry{
+				URI:       d.URI,
+				Info:      d.Info,
+				MakeModel: d.Make,
+				Class:     d.Class,
+				DeviceID:  d.DeviceID,
+				Location:  d.Location,
+				UpdatedAt: now,
+			})
+		}
+		return st.PruneDeviceCache(ctx, tx, 24*time.Hour)
+	})
+}
+
+func uniqueDevices(in []Device) []Device {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	out := make([]Device, 0, len(in))
+	for _, d := range in {
+		uri := strings.TrimSpace(d.URI)
+		if uri == "" {
+			continue
+		}
+		key := strings.ToLower(uri)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, d)
+	}
+	return out
 }
 
 func discoverLocalDevices(ctx context.Context) []Device {

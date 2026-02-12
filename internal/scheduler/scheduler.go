@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +17,7 @@ import (
 
 	"cupsgolang/internal/backend"
 	"cupsgolang/internal/config"
+	"cupsgolang/internal/logging"
 	"cupsgolang/internal/model"
 	"cupsgolang/internal/spool"
 	"cupsgolang/internal/store"
@@ -140,21 +142,20 @@ func (s *Scheduler) processOnce(ctx context.Context) {
 			failReason = "document-unprintable-error"
 		}
 		for _, doc := range docList {
-			if s.Spool.OutputDir == "" {
-				continue
-			}
 			outPath := s.Spool.OutputPath(job.ID, doc.FileName)
 			if outPath == "" {
 				continue
 			}
 			if err := s.processDocument(ctx, job, printer, doc, outPath); err != nil {
 				failed = true
-				failReason = "job-stopped"
+				failReason = failureReasonForError(err)
 				break
 			}
 		}
 
-		_ = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
+		finalState := 0
+		pageResult := ""
+		err = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
 			if failed {
 				if handled, err := s.applyErrorPolicy(ctx, tx, job, printer, opts, failReason); err != nil {
 					return err
@@ -169,10 +170,36 @@ func (s *Scheduler) processOnce(ctx context.Context) {
 				if failReason == "job-stopped" {
 					state = 6
 				}
-				return s.Store.UpdateJobState(ctx, tx, job.ID, state, failReason, &completed)
+				if err := s.Store.UpdateJobState(ctx, tx, job.ID, state, failReason, &completed); err != nil {
+					return err
+				}
+				finalState = state
+				pageResult = failReason
+				return nil
 			}
 			completed := time.Now().UTC()
-			return s.Store.UpdateJobState(ctx, tx, job.ID, 9, "job-completed-successfully", &completed)
+			if err := s.Store.UpdateJobState(ctx, tx, job.ID, 9, "job-completed-successfully", &completed); err != nil {
+				return err
+			}
+			finalState = 9
+			pageResult = "ok"
+			return nil
+		})
+		if err == nil && finalState != 0 {
+			copies := optionInt(opts, "copies")
+			logging.Page(logging.PageLogLine(job.ID, job.UserName, printer.Name, job.Name, copies, pageResult))
+		}
+		_ = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
+			details := map[string]string{
+				"printer": printer.Name,
+				"result":  pageResult,
+			}
+			if failed {
+				details["status"] = "failed"
+			} else {
+				details["status"] = "completed"
+			}
+			return s.Store.AddJobEvent(ctx, tx, job.ID, "job-processed", details)
 		})
 	}
 
@@ -705,9 +732,26 @@ func (s *Scheduler) submitToBackend(ctx context.Context, printer model.Printer, 
 	}
 	b := backend.ForURI(printer.URI)
 	if b == nil {
-		return nil
+		return backend.ErrUnsupported
 	}
 	return b.SubmitJob(ctx, printer, job, doc, outPath)
+}
+
+func failureReasonForError(err error) string {
+	if err == nil {
+		return "job-completed-successfully"
+	}
+	if backend.IsUnsupported(err) || errors.Is(err, backend.ErrUnsupported) {
+		return "document-unprintable-error"
+	}
+	if backend.IsTemporary(err) {
+		return "job-stopped"
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	if strings.Contains(msg, "unsupported") || strings.Contains(msg, "unprintable") || strings.Contains(msg, "format") {
+		return "document-unprintable-error"
+	}
+	return "job-stopped"
 }
 
 func buildFilterEnv(job model.Job, printer model.Printer, doc model.Document, cfg config.Config, finalType string) []string {
@@ -789,7 +833,8 @@ func buildCupsOptions(optionsJSON string) string {
 	useTemplate := template != "" && !strings.EqualFold(template, "none")
 	parts := make([]string, 0, len(opts))
 	for k, v := range opts {
-		if strings.HasPrefix(strings.ToLower(k), "cups-") {
+		lk := strings.ToLower(k)
+		if strings.HasPrefix(lk, "cups-") || strings.HasPrefix(lk, "custom.") || strings.HasSuffix(lk, "-supplied") || lk == "job-attribute-fidelity" {
 			continue
 		}
 		if v == "" {
@@ -1202,6 +1247,7 @@ func (s *Scheduler) cleanupTemporaryPrinters(ctx context.Context, force bool) {
 		printerID int64
 		docPaths  []string
 		outPaths  []string
+		ppdPath   string
 	}
 	cleanups := []cleanupPrinter{}
 	var candidates []model.Printer
@@ -1235,7 +1281,14 @@ func (s *Scheduler) cleanupTemporaryPrinters(ctx context.Context, force bool) {
 					}
 				}
 			}
-			cleanups = append(cleanups, cleanupPrinter{printerID: p.ID, docPaths: docPaths, outPaths: outPaths})
+			ppdPath := ""
+			if ppdName := strings.TrimSpace(p.PPDName); ppdName != "" && !strings.EqualFold(ppdName, model.DefaultPPDName) {
+				base := filepath.Base(ppdName)
+				if strings.EqualFold(base, p.Name+".ppd") {
+					ppdPath = filepath.Join(s.Config.PPDDir, base)
+				}
+			}
+			cleanups = append(cleanups, cleanupPrinter{printerID: p.ID, docPaths: docPaths, outPaths: outPaths, ppdPath: ppdPath})
 		}
 		return nil
 	})
@@ -1251,6 +1304,9 @@ func (s *Scheduler) cleanupTemporaryPrinters(ctx context.Context, force bool) {
 		}
 		for _, p := range c.outPaths {
 			_ = os.Remove(p)
+		}
+		if strings.TrimSpace(c.ppdPath) != "" {
+			_ = os.Remove(c.ppdPath)
 		}
 	}
 

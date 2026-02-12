@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"cupsgolang/internal/config"
+	"cupsgolang/internal/logging"
 	"cupsgolang/internal/scheduler"
 	"cupsgolang/internal/server"
 	"cupsgolang/internal/spool"
@@ -24,23 +25,9 @@ import (
 func main() {
 	cfg := config.Load()
 	server.SetAppConfig(cfg)
+	logging.Configure(cfg.ErrorLogPath, cfg.AccessLogPath, cfg.PageLogPath, cfg.MaxLogSize)
 
-	var logFile *os.File
-	if cfg.ErrorLogPath != "" && !strings.EqualFold(cfg.ErrorLogPath, "syslog") {
-		if err := os.MkdirAll(filepath.Dir(cfg.ErrorLogPath), 0755); err != nil {
-			log.Printf("warning: failed to create log dir: %v", err)
-		} else {
-			if f, err := os.OpenFile(cfg.ErrorLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
-				logFile = f
-				log.SetOutput(f)
-			} else {
-				log.Printf("warning: failed to open error log: %v", err)
-			}
-		}
-	}
-	if logFile != nil {
-		defer logFile.Close()
-	}
+	log.SetOutput(logging.ErrorWriter())
 
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
 		log.Fatalf("failed to create data dir: %v", err)
@@ -63,6 +50,7 @@ func main() {
 		log.Fatalf("failed to open store: %v", err)
 	}
 	defer st.Close()
+	server.SetAppStore(st)
 	st.MaxEvents = cfg.MaxEvents
 
 	if err := st.EnsureDefaultPrinter(ctx); err != nil {
@@ -91,8 +79,13 @@ func main() {
 
 	policy := config.LoadPolicy(cfg.ConfDir)
 	srv := &server.Server{Config: cfg, Store: st, Spool: sp, Policy: policy}
+	if dnssdAdv, err := server.StartDNSSDAdvertiser(ctx, srv); err != nil {
+		log.Printf("warning: failed to start DNS-SD advertiser: %v", err)
+	} else if dnssdAdv != nil {
+		defer dnssdAdv.Close()
+	}
 
-	handler := srv.Handler()
+	handler := logging.HTTPAccessMiddleware(srv.Handler())
 	newServer := func(addr string) *http.Server {
 		return &http.Server{
 			Addr:         addr,
@@ -124,6 +117,17 @@ func main() {
 	if cfg.TLSEnabled {
 		hostname, _ := os.Hostname()
 		hosts := uniqueAddrs(append([]string{"localhost", cfg.ServerName, hostname}, cfg.ServerAlias...))
+		// DNS-SD commonly advertises a ".local" hostname; include common ".local" variants
+		// in the self-signed cert SANs so IPPS works out-of-the-box for mDNS clients.
+		if strings.TrimSpace(cfg.ServerName) != "" && !strings.Contains(cfg.ServerName, ".") {
+			hosts = append(hosts, cfg.ServerName+".local")
+		}
+		if strings.TrimSpace(hostname) != "" && !strings.Contains(hostname, ".") {
+			hosts = append(hosts, hostname+".local")
+		}
+		if strings.TrimSpace(cfg.DNSSDHostName) != "" {
+			hosts = append(hosts, strings.TrimSuffix(cfg.DNSSDHostName, "."))
+		}
 		certHosts := uniqueHosts(hosts)
 		cert, err := tlsutil.EnsureCertificate(cfg.TLSCertPath, cfg.TLSKeyPath, certHosts, cfg.TLSAutoGenerate)
 		if err != nil {
@@ -216,6 +220,7 @@ func uniqueHosts(hosts []string) []string {
 	out := make([]string, 0, len(hosts))
 	for _, host := range hosts {
 		host = stripPort(host)
+		host = strings.TrimSuffix(host, ".")
 		if host == "" {
 			continue
 		}

@@ -97,14 +97,14 @@ func (dnssdBackend) ListDevices(ctx context.Context) ([]Device, error) {
 func (dnssdBackend) SubmitJob(ctx context.Context, printer model.Printer, job model.Job, doc model.Document, filePath string) error {
 	target, err := resolveDNSSDTarget(ctx, printer.URI)
 	if err != nil {
-		return err
+		return WrapTemporary("dnssd-resolve", printer.URI, err)
 	}
 	if target == "" {
-		return ErrUnsupported
+		return WrapUnsupported("dnssd-resolve", printer.URI, ErrUnsupported)
 	}
 	b := ForURI(target)
 	if b == nil {
-		return ErrUnsupported
+		return WrapUnsupported("dnssd-submit", printer.URI, ErrUnsupported)
 	}
 	cp := printer
 	cp.URI = target
@@ -112,14 +112,33 @@ func (dnssdBackend) SubmitJob(ctx context.Context, printer model.Printer, job mo
 }
 
 func (dnssdBackend) QuerySupplies(ctx context.Context, printer model.Printer) (SupplyStatus, error) {
-	return SupplyStatus{State: "unknown"}, nil
+	var lastErr error
+	if target, err := resolveDNSSDTarget(ctx, printer.URI); err == nil && strings.TrimSpace(target) != "" {
+		resolved := printer
+		resolved.URI = target
+		if b := ForURI(target); b != nil && !strings.EqualFold(uriScheme(target), "dnssd") {
+			if status, qerr := b.QuerySupplies(ctx, resolved); qerr == nil {
+				if status.State != "unknown" || len(status.Details) > 0 {
+					return status, nil
+				}
+			} else {
+				lastErr = qerr
+			}
+		}
+		if status, qerr, ok := querySuppliesViaSNMP(ctx, resolved); ok {
+			if qerr == nil || status.State != "unknown" || len(status.Details) > 0 {
+				return status, qerr
+			}
+			if lastErr == nil {
+				lastErr = qerr
+			}
+		}
+	}
+	if status, err, ok := querySuppliesViaSNMP(ctx, printer); ok {
+		return status, err
+	}
+	return SupplyStatus{State: "unknown"}, lastErr
 }
-
-var ErrUnsupported = errorString("backend not supported")
-
-type errorString string
-
-func (e errorString) Error() string { return string(e) }
 
 func parseTxtRecords(records []string) map[string]string {
 	out := map[string]string{}
@@ -151,6 +170,16 @@ func buildIPPURI(service, host string, port int, name string, txt map[string]str
 	}
 	resource = strings.TrimPrefix(resource, "/")
 	return scheme + "://" + host + ":" + strconv.Itoa(port) + "/" + resource
+}
+
+func uriScheme(rawURI string) string {
+	if u, err := url.Parse(strings.TrimSpace(rawURI)); err == nil {
+		return strings.ToLower(strings.TrimSpace(u.Scheme))
+	}
+	if idx := strings.Index(rawURI, ":"); idx > 0 {
+		return strings.ToLower(strings.TrimSpace(rawURI[:idx]))
+	}
+	return ""
 }
 
 func buildDNSSDDeviceURI(service, instance, domain string, txt map[string]string) string {

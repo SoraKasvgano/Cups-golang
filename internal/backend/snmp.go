@@ -70,7 +70,7 @@ func (snmpBackend) ListDevices(ctx context.Context) ([]Device, error) {
 }
 
 func (snmpBackend) SubmitJob(ctx context.Context, printer model.Printer, job model.Job, doc model.Document, filePath string) error {
-	return ErrUnsupported
+	return WrapUnsupported("snmp-submit", printer.URI, ErrUnsupported)
 }
 
 func (snmpBackend) QuerySupplies(ctx context.Context, printer model.Printer) (SupplyStatus, error) {

@@ -29,28 +29,31 @@ func listUSBDevices() ([]Device, error) {
 
 func submitUSBJob(printer model.Printer, filePath string) error {
 	if filePath == "" {
-		return ErrUnsupported
+		return WrapUnsupported("usb-submit", printer.URI, ErrUnsupported)
 	}
 	devPath := usbDevicePath(printer.URI)
 	if devPath == "" {
-		return ErrUnsupported
+		return WrapUnsupported("usb-submit", printer.URI, ErrUnsupported)
 	}
 	in, err := os.Open(filePath)
 	if err != nil {
-		return err
+		return WrapPermanent("usb-open", printer.URI, err)
 	}
 	defer in.Close()
 
 	out, err := os.OpenFile(devPath, os.O_WRONLY, 0600)
 	if err != nil {
-		return err
+		return WrapTemporary("usb-open-device", printer.URI, err)
 	}
 	defer out.Close()
 
 	if _, err := io.Copy(out, in); err != nil {
-		return err
+		return WrapTemporary("usb-write", printer.URI, err)
 	}
-	return out.Sync()
+	if err := out.Sync(); err != nil {
+		return WrapTemporary("usb-sync", printer.URI, err)
+	}
+	return nil
 }
 
 func usbDevicePath(uri string) string {

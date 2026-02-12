@@ -48,14 +48,18 @@ func (s Spool) Save(jobID int64, fileName string, r io.Reader) (string, int64, e
 }
 
 func (s Spool) OutputPath(jobID int64, fileName string) string {
-	if s.OutputDir == "" {
+	outDir := s.OutputDir
+	if outDir == "" {
+		outDir = s.Dir
+	}
+	if outDir == "" {
 		return ""
 	}
 	base := fmt.Sprintf("job-%d", jobID)
 	if fileName != "" {
 		base = base + "-" + sanitizeFileName(fileName)
 	}
-	return filepath.Join(s.OutputDir, base)
+	return filepath.Join(outDir, base)
 }
 
 func sanitizeFileName(name string) string {

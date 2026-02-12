@@ -16,11 +16,13 @@ import (
 var errShowHelp = errors.New("show-help")
 
 type options struct {
-	server   string
-	encrypt  bool
-	user     string
-	reason   string
-	printers []string
+	server  string
+	encrypt bool
+	user    string
+	cancel  bool
+	release bool
+	reason  string
+	dests   []string
 }
 
 func main() {
@@ -30,32 +32,36 @@ func main() {
 		return
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "cupsreject:", err)
+		fmt.Fprintln(os.Stderr, "cupsenable:", err)
 		os.Exit(1)
 	}
-	if len(opts.printers) == 0 {
+	if len(opts.dests) == 0 {
 		return
 	}
+
 	client := cupsclient.NewFromConfig(
 		cupsclient.WithServer(opts.server),
 		cupsclient.WithTLS(opts.encrypt),
 		cupsclient.WithUser(opts.user),
 	)
-	for _, p := range opts.printers {
-		if err := rejectJobs(client, p, opts.reason); err != nil {
-			fmt.Fprintln(os.Stderr, "cupsreject:", err)
+
+	for _, d := range opts.dests {
+		if err := doEnable(client, d, opts); err != nil {
+			fmt.Fprintln(os.Stderr, "cupsenable:", err)
 			os.Exit(1)
 		}
 	}
 }
 
 func usage() {
-	fmt.Println("Usage: cupsreject [options] destination(s)")
+	fmt.Println("Usage: cupsenable [options] destination(s)")
 	fmt.Println("Options:")
 	fmt.Println("-E                      Encrypt connection")
 	fmt.Println("-h server[:port]        Connect to server")
 	fmt.Println("-r reason               Set printer-state-message")
 	fmt.Println("-U username             Authenticate as user")
+	fmt.Println("-c                      Cancel jobs after enabling")
+	fmt.Println("--release               Release held jobs")
 }
 
 func parseArgs(args []string) (options, error) {
@@ -67,6 +73,10 @@ func parseArgs(args []string) (options, error) {
 		}
 		if arg == "--help" {
 			return opts, errShowHelp
+		}
+		if arg == "--release" {
+			opts.release = true
+			continue
 		}
 		if strings.HasPrefix(arg, "--") {
 			return opts, fmt.Errorf("unknown option %q", arg)
@@ -108,25 +118,42 @@ func parseArgs(args []string) (options, error) {
 						return opts, err
 					}
 					opts.reason = strings.TrimSpace(v)
+				case 'c':
+					opts.cancel = true
 				default:
 					return opts, fmt.Errorf("unknown option \"-%c\"", ch)
 				}
 			}
 			continue
 		}
-		opts.printers = append(opts.printers, arg)
+		opts.dests = append(opts.dests, arg)
 	}
 	return opts, nil
 }
 
-func rejectJobs(client *cupsclient.Client, name, reason string) error {
-	req := goipp.NewRequest(goipp.DefaultVersion, goipp.OpCupsRejectJobs, uint32(time.Now().UnixNano()))
+func doEnable(client *cupsclient.Client, name string, opts options) error {
+	op := goipp.OpResumePrinter
+	if opts.release {
+		op = goipp.OpReleaseHeldNewJobs
+	}
+	req := goipp.NewRequest(goipp.DefaultVersion, op, uint32(time.Now().UnixNano()))
 	req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
 	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
 	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(client.PrinterURI(name))))
-	if strings.TrimSpace(reason) != "" {
-		req.Operation.Add(goipp.MakeAttribute("printer-state-message", goipp.TagText, goipp.String(strings.TrimSpace(reason))))
+	if opts.reason != "" {
+		req.Operation.Add(goipp.MakeAttribute("printer-state-message", goipp.TagText, goipp.String(opts.reason)))
 	}
-	_, err := client.Send(context.Background(), req, nil)
+	if _, err := client.Send(context.Background(), req, nil); err != nil {
+		return err
+	}
+
+	if !opts.cancel {
+		return nil
+	}
+	purge := goipp.NewRequest(goipp.DefaultVersion, goipp.OpPurgeJobs, uint32(time.Now().UnixNano()))
+	purge.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
+	purge.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
+	purge.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(client.PrinterURI(name))))
+	_, err := client.Send(context.Background(), purge, nil)
 	return err
 }

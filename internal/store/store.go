@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +33,16 @@ type DocumentStats struct {
 	Count     int
 	SizeBytes int64
 	MimeType  string
+}
+
+type DeviceCacheEntry struct {
+	URI       string
+	Info      string
+	MakeModel string
+	Class     string
+	DeviceID  string
+	Location  string
+	UpdatedAt time.Time
 }
 
 var ErrJobCompleted = errors.New("job completed")
@@ -592,6 +603,10 @@ func (s *Store) CreateJob(ctx context.Context, tx *sql.Tx, printerID int64, name
 	if err != nil {
 		return model.Job{}, err
 	}
+	_ = s.AddJobEvent(ctx, tx, id, "job-created", map[string]string{
+		"state":  "3",
+		"reason": "job-incoming",
+	})
 	_ = s.addNotificationForJob(ctx, tx, id, "job-created")
 	return model.Job{
 		ID:          id,
@@ -736,6 +751,10 @@ func (s *Store) UpdateJobState(ctx context.Context, tx *sql.Tx, jobID int64, sta
         WHERE id = ?
     `, state, reason, completed, jobID)
 	if err == nil {
+		_ = s.AddJobEvent(ctx, tx, jobID, reason, map[string]string{
+			"state":  strconv.Itoa(state),
+			"reason": reason,
+		})
 		_ = s.addNotificationForJob(ctx, tx, jobID, "job-state-changed")
 		switch state {
 		case 9:
@@ -795,6 +814,10 @@ func (s *Store) MoveJob(ctx context.Context, tx *sql.Tx, jobID int64, printerID 
 	job.State = 3
 	job.StateReason = "job-moved"
 	job.CompletedAt = nil
+	_ = s.AddJobEvent(ctx, tx, jobID, "job-moved", map[string]string{
+		"state":  "3",
+		"reason": "job-moved",
+	})
 	_ = s.addNotificationForJob(ctx, tx, jobID, "job-config-changed")
 	_ = s.addNotificationForJob(ctx, tx, jobID, "job-state-changed")
 	return job, nil
@@ -1019,6 +1042,24 @@ func (s *Store) UpdatePrinterSharing(ctx context.Context, tx *sql.Tx, id int64, 
 	return err
 }
 
+func (s *Store) UpdatePrinterURI(ctx context.Context, tx *sql.Tx, id int64, uri string) error {
+	uri = strings.TrimSpace(uri)
+	if uri == "" {
+		return fmt.Errorf("empty printer uri")
+	}
+	_, err := tx.ExecContext(ctx, `
+        UPDATE printers
+        SET uri = ?, updated_at = ?
+        WHERE id = ?
+    `, uri, time.Now().UTC(), id)
+	if err == nil {
+		_ = s.addNotificationForPrinter(ctx, tx, id, "printer-changed")
+		_ = s.addNotificationForPrinter(ctx, tx, id, "printer-config-changed")
+		_ = s.addNotificationForPrinter(ctx, tx, id, "printer-modified")
+	}
+	return err
+}
+
 func (s *Store) UpdatePrinterPPDName(ctx context.Context, tx *sql.Tx, id int64, ppdName string) error {
 	ppdName = strings.TrimSpace(ppdName)
 	if ppdName == "" {
@@ -1060,6 +1101,22 @@ func (s *Store) UpdatePrinterDefaultOptions(ctx context.Context, tx *sql.Tx, id 
         SET default_options = ?, updated_at = ?
         WHERE id = ?
     `, optionsJSON, time.Now().UTC(), id)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM printer_options WHERE printer_id = ?`, id); err != nil {
+		return err
+	}
+	parsed := map[string]string{}
+	if strings.TrimSpace(optionsJSON) != "" {
+		if err := json.Unmarshal([]byte(optionsJSON), &parsed); err == nil {
+			for k, v := range parsed {
+				if err := s.SetPrinterOption(ctx, tx, id, k, v); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	if err == nil {
 		_ = s.addNotificationForPrinter(ctx, tx, id, "printer-changed")
 		_ = s.addNotificationForPrinter(ctx, tx, id, "printer-config-changed")
@@ -1541,6 +1598,136 @@ func (s *Store) PruneExpiredSubscriptions(ctx context.Context, tx *sql.Tx) error
         WHERE lease_seconds > 0
           AND (strftime('%s', created_at) + lease_seconds) <= strftime('%s', ?)
     `, now)
+	return err
+}
+
+func (s *Store) AddJobEvent(ctx context.Context, tx *sql.Tx, jobID int64, event string, details map[string]string) error {
+	now := time.Now().UTC()
+	if strings.TrimSpace(event) == "" {
+		event = "job-state-changed"
+	}
+	raw := ""
+	if len(details) > 0 {
+		if b, err := json.Marshal(details); err == nil {
+			raw = string(b)
+		}
+	}
+	_, err := tx.ExecContext(ctx, `
+        INSERT INTO job_events (job_id, event, details, created_at)
+        VALUES (?, ?, ?, ?)
+    `, jobID, event, raw, now)
+	return err
+}
+
+func (s *Store) SetPrinterOption(ctx context.Context, tx *sql.Tx, printerID int64, key, value string) error {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `
+        INSERT INTO printer_options (printer_id, option_key, option_value, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(printer_id, option_key)
+        DO UPDATE SET option_value = excluded.option_value, updated_at = excluded.updated_at
+    `, printerID, key, value, time.Now().UTC())
+	return err
+}
+
+func (s *Store) SetPPDCache(ctx context.Context, tx *sql.Tx, ppdName, ppdHash, ippAttrs string) error {
+	ppdName = strings.TrimSpace(ppdName)
+	if ppdName == "" {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `
+        INSERT INTO ppd_cache (ppd_name, ppd_hash, ipp_attrs, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(ppd_name)
+        DO UPDATE SET ppd_hash = excluded.ppd_hash, ipp_attrs = excluded.ipp_attrs, updated_at = excluded.updated_at
+    `, ppdName, ppdHash, ippAttrs, time.Now().UTC())
+	return err
+}
+
+func (s *Store) GetPPDCache(ctx context.Context, tx *sql.Tx, ppdName string) (ppdHash string, ippAttrs string, updatedAt time.Time, ok bool, err error) {
+	ppdName = strings.TrimSpace(ppdName)
+	if ppdName == "" {
+		return "", "", time.Time{}, false, nil
+	}
+	err = tx.QueryRowContext(ctx, `
+        SELECT ppd_hash, ipp_attrs, updated_at
+        FROM ppd_cache
+        WHERE ppd_name = ?
+    `, ppdName).Scan(&ppdHash, &ippAttrs, &updatedAt)
+	if err == sql.ErrNoRows {
+		return "", "", time.Time{}, false, nil
+	}
+	if err != nil {
+		return "", "", time.Time{}, false, err
+	}
+	return ppdHash, ippAttrs, updatedAt, true, nil
+}
+
+func (s *Store) UpsertDeviceCache(ctx context.Context, tx *sql.Tx, entry DeviceCacheEntry) error {
+	entry.URI = strings.TrimSpace(entry.URI)
+	if entry.URI == "" {
+		return nil
+	}
+	if entry.UpdatedAt.IsZero() {
+		entry.UpdatedAt = time.Now().UTC()
+	}
+	_, err := tx.ExecContext(ctx, `
+        INSERT INTO device_cache (uri, info, make_model, device_class, device_id, location, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(uri)
+        DO UPDATE SET
+          info = excluded.info,
+          make_model = excluded.make_model,
+          device_class = excluded.device_class,
+          device_id = excluded.device_id,
+          location = excluded.location,
+          updated_at = excluded.updated_at
+    `, entry.URI, entry.Info, entry.MakeModel, entry.Class, entry.DeviceID, entry.Location, entry.UpdatedAt)
+	return err
+}
+
+func (s *Store) ListDeviceCache(ctx context.Context, tx *sql.Tx, freshWithin time.Duration, limit int) ([]DeviceCacheEntry, error) {
+	if limit <= 0 {
+		limit = 1024
+	}
+	query := `
+        SELECT uri, info, make_model, device_class, device_id, location, updated_at
+        FROM device_cache
+    `
+	args := []any{}
+	if freshWithin > 0 {
+		query += ` WHERE updated_at >= ?`
+		args = append(args, time.Now().UTC().Add(-freshWithin))
+	}
+	query += ` ORDER BY updated_at DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []DeviceCacheEntry{}
+	for rows.Next() {
+		var item DeviceCacheEntry
+		if err := rows.Scan(&item.URI, &item.Info, &item.MakeModel, &item.Class, &item.DeviceID, &item.Location, &item.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) PruneDeviceCache(ctx context.Context, tx *sql.Tx, olderThan time.Duration) error {
+	if olderThan <= 0 {
+		return nil
+	}
+	threshold := time.Now().UTC().Add(-olderThan)
+	_, err := tx.ExecContext(ctx, `DELETE FROM device_cache WHERE updated_at < ?`, threshold)
 	return err
 }
 

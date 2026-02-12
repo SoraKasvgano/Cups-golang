@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -24,10 +25,13 @@ type options struct {
 	showAccepting bool
 	showJobs      bool
 	showDevices   bool
+	showForms     bool
 	showSummary   bool
 	showAll       bool
 	showHost      bool
 	showRanking   bool
+	showPaper     bool
+	showCharsets  bool
 	longStatus    int
 	showClasses   bool
 	showAllDests  bool
@@ -55,7 +59,7 @@ func main() {
 		opts.showStatus = true
 		opts.showPrinters = true
 	}
-	if !opts.showDefault && !opts.showStatus && !opts.showPrinters && !opts.showAccepting && !opts.showJobs && !opts.showDevices && !opts.showClasses && !opts.showAllDests {
+	if !opts.showDefault && !opts.showStatus && !opts.showPrinters && !opts.showAccepting && !opts.showJobs && !opts.showDevices && !opts.showForms && !opts.showClasses && !opts.showAllDests {
 		opts.showJobs = true
 		if len(opts.userFilter) == 0 {
 			opts.userFilter = []string{client.User}
@@ -80,7 +84,7 @@ func main() {
 
 	var printers []printerInfo
 	var printersErr error
-	if opts.showPrinters || opts.showAccepting || opts.showDevices || opts.showAllDests {
+	if opts.showPrinters || opts.showAccepting || opts.showDevices || opts.showAllDests || opts.showPaper || opts.showCharsets {
 		printers, printersErr = fetchPrinters(client)
 		if printersErr != nil {
 			fail(printersErr)
@@ -95,8 +99,14 @@ func main() {
 	if opts.showDevices {
 		printDevices(printers, opts.printerFilter)
 	}
+	if opts.showPaper {
+		printPaperTypes(printers, opts.printerFilter)
+	}
+	if opts.showCharsets {
+		printCharsets(printers, opts.printerFilter)
+	}
 	if opts.showAllDests {
-		printDestinations(printers)
+		printDestinations(printers, opts.longStatus)
 	}
 	if opts.showClasses {
 		if err := printClasses(client, opts.printerFilter, opts.longStatus > 0); err != nil {
@@ -119,79 +129,125 @@ func parseArgs(args []string) options {
 	opts := options{}
 	seenOther := false
 	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch arg {
-		case "-h":
-			if seenOther {
-				fail(fmt.Errorf("-h must appear before all other options"))
+		arg := strings.TrimSpace(args[i])
+		if arg == "" {
+			continue
+		}
+		if arg == "--help" {
+			usage()
+		}
+		if arg == "--" {
+			for j := i + 1; j < len(args); j++ {
+				dest := strings.TrimSpace(args[j])
+				if dest == "" {
+					continue
+				}
+				opts.showJobs = true
+				opts.printerFilter = append(opts.printerFilter, parseListArg(dest)...)
 			}
-			if i+1 >= len(args) {
-				fail(fmt.Errorf("missing argument for -h"))
-			}
-			i++
-			opts.server = args[i]
-		case "-E":
-			opts.encrypt = true
-		case "-U":
-			if i+1 >= len(args) {
-				fail(fmt.Errorf("missing argument for -U"))
-			}
-			i++
-			opts.user = args[i]
-		case "-H":
-			opts.showHost = true
-		case "-R":
-			opts.showRanking = true
-		case "-D":
-			if opts.longStatus < 1 {
-				opts.longStatus = 1
-			}
-		case "-l":
-			opts.longStatus = 2
-		case "-W":
-			if i+1 >= len(args) {
-				fail(fmt.Errorf("missing argument for -W"))
-			}
-			i++
-			opts.whichJobs = strings.ToLower(strings.TrimSpace(args[i]))
-			switch opts.whichJobs {
-			case "completed", "not-completed", "successful", "all":
-			default:
-				fail(fmt.Errorf("need \"completed\", \"not-completed\", \"successful\", or \"all\" after -W"))
-			}
-		case "-d":
-			opts.showDefault = true
-		case "-r":
-			opts.showStatus = true
-		case "-p":
-			opts.showPrinters = true
-			opts.printerFilter = append(opts.printerFilter, parseListArg(peekArg(args, &i))...)
-		case "-a":
-			opts.showAccepting = true
-			opts.printerFilter = append(opts.printerFilter, parseListArg(peekArg(args, &i))...)
-		case "-o":
+			break
+		}
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
 			opts.showJobs = true
-			opts.printerFilter = append(opts.printerFilter, parseListArg(peekArg(args, &i))...)
-		case "-u":
-			opts.showJobs = true
-			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+			opts.printerFilter = append(opts.printerFilter, parseListArg(arg)...)
+			seenOther = true
+			continue
+		}
+
+		short := strings.TrimPrefix(arg, "-")
+		for pos := 0; pos < len(short); pos++ {
+			ch := short[pos]
+			rest := short[pos+1:]
+			consumeRequired := func(name string) string {
+				if rest != "" {
+					pos = len(short)
+					return rest
+				}
+				if i+1 >= len(args) {
+					fail(fmt.Errorf("missing argument for -%s", name))
+				}
 				i++
-				opts.userFilter = append(opts.userFilter, parseListArg(args[i])...)
+				return args[i]
 			}
-		case "-v":
-			opts.showDevices = true
-			opts.printerFilter = append(opts.printerFilter, parseListArg(peekArg(args, &i))...)
-		case "-c":
-			opts.showClasses = true
-			if next := peekArg(args, &i); next != "" {
-				opts.printerFilter = append(opts.printerFilter, parseListArg(next)...)
+			consumeOptional := func() string {
+				if rest != "" {
+					pos = len(short)
+					return rest
+				}
+				if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+					i++
+					return args[i]
+				}
+				return ""
 			}
-		case "-e":
-			opts.showAllDests = true
-		case "-s":
-			opts.showSummary = true
-		case "-t":
-			opts.showAll = true
+
+			switch ch {
+			case 'h':
+				if seenOther {
+					fail(fmt.Errorf("-h must appear before all other options"))
+				}
+				opts.server = strings.TrimSpace(consumeRequired("h"))
+			case 'E':
+				opts.encrypt = true
+			case 'U':
+				opts.user = strings.TrimSpace(consumeRequired("U"))
+			case 'H':
+				opts.showHost = true
+			case 'R':
+				opts.showRanking = true
+			case 'D':
+				if opts.longStatus < 1 {
+					opts.longStatus = 1
+				}
+			case 'l':
+				opts.longStatus = 2
+			case 'W':
+				opts.whichJobs = strings.ToLower(strings.TrimSpace(consumeRequired("W")))
+				switch opts.whichJobs {
+				case "completed", "not-completed", "successful", "all":
+				default:
+					fail(fmt.Errorf("need \"completed\", \"not-completed\", \"successful\", or \"all\" after -W"))
+				}
+			case 'd':
+				opts.showDefault = true
+			case 'r':
+				opts.showStatus = true
+			case 'p':
+				opts.showPrinters = true
+				opts.printerFilter = append(opts.printerFilter, parseListArg(consumeOptional())...)
+			case 'a':
+				opts.showAccepting = true
+				opts.printerFilter = append(opts.printerFilter, parseListArg(consumeOptional())...)
+			case 'o':
+				opts.showJobs = true
+				opts.printerFilter = append(opts.printerFilter, parseListArg(consumeOptional())...)
+			case 'u':
+				opts.showJobs = true
+				opts.userFilter = append(opts.userFilter, parseListArg(consumeOptional())...)
+			case 'v':
+				opts.showDevices = true
+				opts.printerFilter = append(opts.printerFilter, parseListArg(consumeOptional())...)
+			case 'c':
+				opts.showClasses = true
+				opts.printerFilter = append(opts.printerFilter, parseListArg(consumeOptional())...)
+			case 'f':
+				opts.showForms = true
+				_ = consumeOptional()
+			case 'e':
+				opts.showAllDests = true
+			case 's':
+				opts.showSummary = true
+			case 't':
+				opts.showAll = true
+			case 'P':
+				opts.showPaper = true
+				opts.printerFilter = append(opts.printerFilter, parseListArg(consumeOptional())...)
+			case 'S':
+				opts.showCharsets = true
+				opts.printerFilter = append(opts.printerFilter, parseListArg(consumeOptional())...)
+			default:
+				fail(fmt.Errorf("unknown option \"-%c\"", ch))
+			}
 		}
 		if arg != "-h" && arg != "-E" && arg != "-U" {
 			seenOther = true
@@ -200,16 +256,32 @@ func parseArgs(args []string) options {
 	return opts
 }
 
-func peekArg(args []string, idx *int) string {
-	if *idx+1 >= len(args) {
-		return ""
-	}
-	next := args[*idx+1]
-	if strings.HasPrefix(next, "-") {
-		return ""
-	}
-	*idx++
-	return next
+func usage() {
+	fmt.Fprintln(os.Stderr, "Usage: lpstat [options] [destination(s)]")
+	fmt.Fprintln(os.Stderr, "Options:")
+	fmt.Fprintln(os.Stderr, "  -a [destinations]   Show acceptance status")
+	fmt.Fprintln(os.Stderr, "  -c [classes]        Show classes")
+	fmt.Fprintln(os.Stderr, "  -d                  Show default destination")
+	fmt.Fprintln(os.Stderr, "  -e                  Show destinations")
+	fmt.Fprintln(os.Stderr, "  -f [forms]          Show forms (compatibility no-op)")
+	fmt.Fprintln(os.Stderr, "  -h server[:port]    Specify server")
+	fmt.Fprintln(os.Stderr, "  -H                  Show server host")
+	fmt.Fprintln(os.Stderr, "  -l                  Show long status")
+	fmt.Fprintln(os.Stderr, "  -o [destinations]   Show jobs")
+	fmt.Fprintln(os.Stderr, "  -p [destinations]   Show printers")
+	fmt.Fprintln(os.Stderr, "  -P [destinations]   Show paper types")
+	fmt.Fprintln(os.Stderr, "  -r                  Show scheduler status")
+	fmt.Fprintln(os.Stderr, "  -R                  Show job ranking")
+	fmt.Fprintln(os.Stderr, "  -s                  Show summary")
+	fmt.Fprintln(os.Stderr, "  -S [destinations]   Show charsets")
+	fmt.Fprintln(os.Stderr, "  -t                  Show all status")
+	fmt.Fprintln(os.Stderr, "  -u [users]          Show jobs for users")
+	fmt.Fprintln(os.Stderr, "  -U username         Specify username")
+	fmt.Fprintln(os.Stderr, "  -v [destinations]   Show devices")
+	fmt.Fprintln(os.Stderr, "  -W which-jobs       completed|not-completed|successful|all")
+	fmt.Fprintln(os.Stderr, "  -D                  Show descriptions")
+	fmt.Fprintln(os.Stderr, "  -E                  Encrypt connection")
+	os.Exit(1)
 }
 
 func parseListArg(value string) []string {
@@ -269,9 +341,12 @@ type printerInfo struct {
 	ptype       int
 	makeModel   string
 	uri         string
+	temporary   bool
 	allowed     []string
 	denied      []string
 	reasons     []string
+	media       []string
+	charsets    []string
 }
 
 func fetchPrinters(client *cupsclient.Client) ([]printerInfo, error) {
@@ -291,8 +366,11 @@ func fetchPrinters(client *cupsclient.Client) ([]printerInfo, error) {
 		goipp.String("printer-info"),
 		goipp.String("printer-make-and-model"),
 		goipp.String("printer-uri-supported"),
+		goipp.String("printer-is-temporary"),
 		goipp.String("requesting-user-name-allowed"),
 		goipp.String("requesting-user-name-denied"),
+		goipp.String("media-supported"),
+		goipp.String("charset-supported"),
 	))
 	resp, err := client.Send(context.Background(), req, nil)
 	if err != nil {
@@ -318,9 +396,12 @@ func fetchPrinters(client *cupsclient.Client) ([]printerInfo, error) {
 		ptype := parseInt(findAttr(g.Attrs, "printer-type"))
 		makeModel := findAttr(g.Attrs, "printer-make-and-model")
 		uri := findAttr(g.Attrs, "printer-uri-supported")
+		temporary := strings.EqualFold(findAttr(g.Attrs, "printer-is-temporary"), "true")
 		allowed := attrStrings(g.Attrs, "requesting-user-name-allowed")
 		denied := attrStrings(g.Attrs, "requesting-user-name-denied")
 		reasons := attrStrings(g.Attrs, "printer-state-reasons")
+		media := attrStrings(g.Attrs, "media-supported")
+		charsets := attrStrings(g.Attrs, "charset-supported")
 		printers = append(printers, printerInfo{
 			name:        name,
 			state:       state,
@@ -334,9 +415,12 @@ func fetchPrinters(client *cupsclient.Client) ([]printerInfo, error) {
 			ptype:       ptype,
 			makeModel:   makeModel,
 			uri:         uri,
+			temporary:   temporary,
 			allowed:     allowed,
 			denied:      denied,
 			reasons:     reasons,
+			media:       media,
+			charsets:    charsets,
 		})
 	}
 	return printers, nil
@@ -439,10 +523,80 @@ func printDevices(printers []printerInfo, filter []string) {
 	}
 }
 
-func printDestinations(printers []printerInfo) {
+func printPaperTypes(printers []printerInfo, filter []string) {
 	for _, p := range printers {
+		if !matchesFilter(filter, p.name) {
+			continue
+		}
+		fmt.Printf("printer %s supports:\n", p.name)
+		if len(p.media) == 0 {
+			fmt.Println("	application/octet-stream")
+			continue
+		}
+		for _, media := range p.media {
+			media = strings.TrimSpace(media)
+			if media == "" {
+				continue
+			}
+			fmt.Printf("	%s\n", media)
+		}
+	}
+}
+
+func printCharsets(printers []printerInfo, filter []string) {
+	for _, p := range printers {
+		if !matchesFilter(filter, p.name) {
+			continue
+		}
+		fmt.Printf("printer %s accepts charsets:\n", p.name)
+		if len(p.charsets) == 0 {
+			fmt.Println("	utf-8")
+			continue
+		}
+		for _, cs := range p.charsets {
+			cs = strings.TrimSpace(cs)
+			if cs == "" {
+				continue
+			}
+			fmt.Printf("	%s\n", cs)
+		}
+	}
+}
+
+func printDestinations(printers []printerInfo, longStatus int) {
+	if len(printers) == 0 {
+		return
+	}
+	sorted := append([]printerInfo(nil), printers...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		left := strings.ToLower(strings.TrimSpace(sorted[i].name))
+		right := strings.ToLower(strings.TrimSpace(sorted[j].name))
+		return left < right
+	})
+	for _, p := range sorted {
+		if longStatus > 0 {
+			fmt.Printf("%s %s %s %s\n", p.name, destinationType(p), valueOrNone(strings.TrimSpace(p.uri)), valueOrNone(strings.TrimSpace(p.deviceURI)))
+			continue
+		}
 		fmt.Println(p.name)
 	}
+}
+
+func destinationType(p printerInfo) string {
+	if p.temporary {
+		return "temporary"
+	}
+	if strings.TrimSpace(p.uri) != "" {
+		return "permanent"
+	}
+	return "network"
+}
+
+func valueOrNone(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "none"
+	}
+	return value
 }
 
 func printClasses(client *cupsclient.Client, filter []string, longListing bool) error {

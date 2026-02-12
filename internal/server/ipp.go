@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -40,25 +41,28 @@ import (
 )
 
 var (
-	mimeOnce         sync.Once
-	mimeTypes        []string
-	mimeExt          map[string]string
-	errPPDConstraint = errors.New("ppd-constraint-violation")
-	errUnsupported   = errors.New("unsupported-attribute-value")
-	errConflicting   = errors.New("conflicting-attributes")
-	policyNamesOnce  sync.Once
-	policyNames      []string
-	stringsLangOnce  sync.Once
-	stringsLangs     []string
-	pwgMediaOnce     sync.Once
-	pwgMediaByName   map[string]mediaSize
-	pwgMediaByDims   map[string]string
-	finishingsOnce   sync.Once
-	finishingsAll    []int
-	errNotAuthorized = errors.New("not-authorized")
-	errNotPossible   = errors.New("not-possible")
-	errBadRequest    = errors.New("bad-request")
-	errTooManySubs   = errors.New("too-many-subscriptions")
+	mimeOnce          sync.Once
+	mimeDB            *config.MimeDB
+	mimeTypes         []string
+	mimeExt           map[string]string
+	printerFormatOnce sync.Map
+	errPPDConstraint  = errors.New("ppd-constraint-violation")
+	errUnsupported    = errors.New("unsupported-attribute-value")
+	errConflicting    = errors.New("conflicting-attributes")
+	policyNamesOnce   sync.Once
+	policyNames       []string
+	stringsLangOnce   sync.Once
+	stringsLangs      []string
+	pwgMediaOnce      sync.Once
+	pwgMediaByName    map[string]mediaSize
+	pwgMediaByDims    map[string]string
+	pwgMediaPPDByDims map[string]string
+	finishingsOnce    sync.Once
+	finishingsAll     []int
+	errNotAuthorized  = errors.New("not-authorized")
+	errNotPossible    = errors.New("not-possible")
+	errBadRequest     = errors.New("bad-request")
+	errTooManySubs    = errors.New("too-many-subscriptions")
 )
 
 var readOnlyJobAttrs = map[string]bool{
@@ -466,7 +470,7 @@ func (s *Server) enforceIPPOpPolicy(ctx context.Context, r *http.Request, req *g
 		if limit.DenyAll || !s.Policy.AllowedByLimit(limit, remoteIP) {
 			return &ippHTTPError{status: http.StatusForbidden}
 		}
-		if !(limit.RequireUser || limit.RequireOwner || limit.RequireAdmin) {
+		if !limitRequiresAuth(limit) {
 			continue
 		}
 
@@ -479,19 +483,7 @@ func (s *Server) enforceIPPOpPolicy(ctx context.Context, r *http.Request, req *g
 		if !ok {
 			return &ippHTTPError{status: http.StatusUnauthorized, authType: authType}
 		}
-
-		allowed := false
-		if limit.RequireUser && !limit.RequireOwner && !limit.RequireAdmin {
-			allowed = true
-		}
-		if !allowed && limit.RequireOwner && strings.TrimSpace(c.owner) != "" &&
-			strings.EqualFold(strings.TrimSpace(u.Username), strings.TrimSpace(c.owner)) {
-			allowed = true
-		}
-		if !allowed && limit.RequireAdmin && u.IsAdmin {
-			allowed = true
-		}
-		if !allowed {
+		if !userAllowedByLimit(u, c.owner, limit) {
 			return &ippHTTPError{status: http.StatusForbidden}
 		}
 	}
@@ -512,7 +504,7 @@ func (s *Server) enforceHTTPLocationPolicy(ctx context.Context, r *http.Request)
 			if limit.DenyAll || !s.Policy.AllowedByLimit(limit, remoteIP) {
 				return &ippHTTPError{status: http.StatusForbidden}
 			}
-			if limit.RequireUser || limit.RequireAdmin {
+			if limitRequiresAuth(limit) {
 				authType := s.normalizeAuthType(limit.AuthType)
 				if authType == "" {
 					authType = strings.TrimSpace(s.Config.DefaultAuthType)
@@ -521,11 +513,11 @@ func (s *Server) enforceHTTPLocationPolicy(ctx context.Context, r *http.Request)
 				if !ok {
 					return &ippHTTPError{status: http.StatusUnauthorized, authType: authType}
 				}
-				if limit.RequireAdmin && !u.IsAdmin {
+				if !userAllowedByLimit(u, "", limit) {
 					return &ippHTTPError{status: http.StatusForbidden}
 				}
 			}
-		} else if rule.RequireUser || rule.RequireAdmin {
+		} else if locationRequiresAuth(rule) {
 			authType := s.normalizeAuthType(rule.AuthType)
 			if authType == "" {
 				authType = strings.TrimSpace(s.Config.DefaultAuthType)
@@ -534,7 +526,7 @@ func (s *Server) enforceHTTPLocationPolicy(ctx context.Context, r *http.Request)
 			if !ok {
 				return &ippHTTPError{status: http.StatusUnauthorized, authType: authType}
 			}
-			if rule.RequireAdmin && !u.IsAdmin {
+			if !userAllowedByLocation(u, rule) {
 				return &ippHTTPError{status: http.StatusForbidden}
 			}
 		}
@@ -809,10 +801,10 @@ func (s *Server) handleGetPrinterAttributes(ctx context.Context, r *http.Request
 			members, err = s.Store.ListClassMembers(ctx, tx, dest.Class.ID)
 			return err
 		})
-		authInfo := authInfoRequiredForRequest(s, r)
+		authInfo := s.authInfoRequiredForDestination(true, dest.Class.Name, dest.Class.DefaultOptions)
 		addClassAttributes(ctx, resp, dest.Class, members, r, req, s.Store, s.Config, authInfo)
 	} else {
-		authInfo := authInfoRequiredForRequest(s, r)
+		authInfo := s.authInfoRequiredForDestination(false, dest.Printer.Name, dest.Printer.DefaultOptions)
 		addPrinterAttributes(ctx, resp, dest.Printer, r, req, s.Store, s.Config, authInfo)
 	}
 	return resp, nil
@@ -931,9 +923,7 @@ func (s *Server) handleSetPrinterAttributes(ctx context.Context, r *http.Request
 				defaultOpts["job-sheets"] = jobSheetsDefault
 			}
 			merged := parseJobOptions(printer.DefaultOptions)
-			for k, v := range defaultOpts {
-				merged[k] = v
-			}
+			applyDefaultOptionUpdates(merged, defaultOpts)
 			if b, err := json.Marshal(merged); err == nil {
 				if err := s.Store.UpdatePrinterDefaultOptions(ctx, tx, printer.ID, string(b)); err != nil {
 					return err
@@ -949,7 +939,7 @@ func (s *Server) handleSetPrinterAttributes(ctx context.Context, r *http.Request
 	updated, _ := s.resolvePrinter(ctx, r, req)
 	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
 	addOperationDefaults(resp)
-	authInfo := authInfoRequiredForRequest(s, r)
+	authInfo := s.authInfoRequiredForDestination(false, updated.Name, updated.DefaultOptions)
 	addPrinterAttributes(ctx, resp, updated, r, req, s.Store, s.Config, authInfo)
 	return resp, nil
 }
@@ -1037,7 +1027,6 @@ func (s *Server) handleCupsGetPrinters(ctx context.Context, r *http.Request, req
 	groups := make(goipp.Groups, 0, len(entries)+1)
 	groups = append(groups, goipp.Group{Tag: goipp.TagOperationGroup, Attrs: buildOperationDefaults()})
 	count := 0
-	authInfo := authInfoRequiredForRequest(s, r)
 	for i := start; i < len(entries) && count < limit; i++ {
 		e := entries[i]
 		effectiveShared := shareServer
@@ -1067,11 +1056,13 @@ func (s *Server) handleCupsGetPrinters(ctx context.Context, r *http.Request, req
 		}
 		if printerType != 0 || printerMask != 0 {
 			if e.isClass {
+				authInfo := s.authInfoRequiredForDestination(true, e.class.Name, e.class.DefaultOptions)
 				ptype := computeClassType(e.class, shareServer, authInfo)
 				if (ptype & printerMask) != printerType {
 					continue
 				}
 			} else {
+				authInfo := s.authInfoRequiredForDestination(false, e.printer.Name, e.printer.DefaultOptions)
 				ppd, _ := loadPPDForPrinter(e.printer)
 				caps := computePrinterCaps(ppd, parseJobOptions(e.printer.DefaultOptions))
 				ptype := computePrinterType(e.printer, caps, ppd, false, authInfo)
@@ -1090,11 +1081,13 @@ func (s *Server) handleCupsGetPrinters(ctx context.Context, r *http.Request, req
 			}
 		}
 		if e.isClass {
+			authInfo := s.authInfoRequiredForDestination(true, e.class.Name, e.class.DefaultOptions)
 			attrs := classAttributesWithMembers(ctx, e.class, e.members, r, req, s.Store, s.Config, authInfo)
 			groups = append(groups, goipp.Group{Tag: goipp.TagPrinterGroup, Attrs: attrs})
 			count++
 			continue
 		}
+		authInfo := s.authInfoRequiredForDestination(false, e.printer.Name, e.printer.DefaultOptions)
 		attrs := buildPrinterAttributes(ctx, e.printer, r, req, s.Store, s.Config, authInfo)
 		groups = append(groups, goipp.Group{Tag: goipp.TagPrinterGroup, Attrs: attrs})
 		count++
@@ -1163,7 +1156,6 @@ func (s *Server) handleCupsGetClasses(ctx context.Context, r *http.Request, req 
 	groups := make(goipp.Groups, 0, len(classes)+1)
 	groups = append(groups, goipp.Group{Tag: goipp.TagOperationGroup, Attrs: buildOperationDefaults()})
 	count := 0
-	authInfo := authInfoRequiredForRequest(s, r)
 	for i := start; i < len(classes) && count < limit; i++ {
 		c := classes[i]
 		if !local && !shareServer {
@@ -1176,6 +1168,7 @@ func (s *Server) handleCupsGetClasses(ctx context.Context, r *http.Request, req 
 			continue
 		}
 		if printerType != 0 || printerMask != 0 {
+			authInfo := s.authInfoRequiredForDestination(true, c.Name, c.DefaultOptions)
 			ptype := computeClassType(c, shareServer, authInfo)
 			if (ptype & printerMask) != printerType {
 				continue
@@ -1184,6 +1177,7 @@ func (s *Server) handleCupsGetClasses(ctx context.Context, r *http.Request, req 
 		if username != "" && !s.userAllowedForClass(ctx, c, username) {
 			continue
 		}
+		authInfo := s.authInfoRequiredForDestination(true, c.Name, c.DefaultOptions)
 		attrs := classAttributesWithMembers(ctx, c, memberMap[c.ID], r, req, s.Store, s.Config, authInfo)
 		groups = append(groups, goipp.Group{Tag: goipp.TagPrinterGroup, Attrs: attrs})
 		count++
@@ -1212,10 +1206,22 @@ func (s *Server) handleCupsGetDevices(ctx context.Context, r *http.Request, req 
 		defer cancel()
 	}
 
-	devices := []Device{}
-	devices = append(devices, discoverLocalDevices(ctxDiscover)...)
-	devices = append(devices, discoverNetworkIPP(ctxDiscover)...)
-	devices = append(devices, discoverMDNSIPP(ctxDiscover)...)
+	devices := discoverDevices(ctxDiscover, s.Store, true)
+	sort.SliceStable(devices, func(i, j int) bool {
+		leftInfo := strings.ToLower(strings.TrimSpace(devices[i].Info))
+		rightInfo := strings.ToLower(strings.TrimSpace(devices[j].Info))
+		if leftInfo != rightInfo {
+			return leftInfo < rightInfo
+		}
+		leftClass := strings.ToLower(strings.TrimSpace(devices[i].Class))
+		rightClass := strings.ToLower(strings.TrimSpace(devices[j].Class))
+		if leftClass != rightClass {
+			return leftClass < rightClass
+		}
+		leftURI := strings.ToLower(strings.TrimSpace(devices[i].URI))
+		rightURI := strings.ToLower(strings.TrimSpace(devices[j].URI))
+		return leftURI < rightURI
+	})
 
 	groups := make(goipp.Groups, 0, len(devices)+1)
 	groups = append(groups, goipp.Group{Tag: goipp.TagOperationGroup, Attrs: buildOperationDefaults()})
@@ -1296,7 +1302,7 @@ func (s *Server) handleCupsGetPpds(ctx context.Context, r *http.Request, req *go
 	}
 	entries := make([]ppdEntry, 0, len(names))
 	for _, name := range names {
-		ppd, err := config.LoadPPD(filepath.Join(ppdDir, name))
+		ppd, err := loadPPDForListing(name, ppdDir)
 		if err != nil || ppd == nil {
 			if name == model.DefaultPPDName {
 				ppd = &config.PPD{
@@ -1528,6 +1534,7 @@ func (s *Server) handleCupsCreateLocalPrinter(ctx context.Context, r *http.Reque
 	var printer model.Printer
 	alreadyExists := false
 	existsName := ""
+	createdNew := false
 	err := s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
 		// Prefer name match (CUPS does name match first).
 		if p, err := s.Store.GetPrinterByName(ctx, tx, name); err == nil {
@@ -1563,6 +1570,7 @@ func (s *Server) handleCupsCreateLocalPrinter(ctx context.Context, r *http.Reque
 			return err
 		}
 		printer = p
+		createdNew = true
 		if err := s.Store.UpdatePrinterTemporary(ctx, tx, printer.ID, true); err != nil {
 			return err
 		}
@@ -1584,12 +1592,134 @@ func (s *Server) handleCupsCreateLocalPrinter(ctx context.Context, r *http.Reque
 		return nil, err
 	}
 
+	// Existing queues return immediately.
+	if alreadyExists || !createdNew {
+		resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
+		addOperationDefaults(resp)
+		if alreadyExists {
+			msg := fmt.Sprintf("Printer \"%s\" already exists.", existsName)
+			resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String(msg)))
+		}
+		resp.Printer.Add(goipp.MakeAttribute("printer-is-accepting-jobs", goipp.TagBoolean, goipp.Boolean(printer.Accepting)))
+		resp.Printer.Add(goipp.MakeAttribute("printer-state", goipp.TagEnum, goipp.Integer(printer.State)))
+		resp.Printer.Add(goipp.MakeAttribute("printer-state-reasons", goipp.TagKeyword, goipp.String(printerStateReason(printer))))
+		resp.Printer.Add(goipp.MakeAttribute("printer-uri-supported", goipp.TagURI, goipp.String(printerURIFor(printer, r))))
+		return resp, nil
+	}
+
+	// CUPS resolves mDNS URIs and generates a queue-specific PPD from the target
+	// printer's IPP response. If this step fails, the temporary queue is removed.
+	resolvedURI := strings.TrimSpace(printer.URI)
+	if strings.Contains(resolvedURI, "._tcp") || strings.HasPrefix(strings.ToLower(resolvedURI), "dnssd://") {
+		u, rerr := resolveMDNSURI(ctx, resolvedURI)
+		if rerr != nil {
+			_ = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
+				p, err2 := s.Store.GetPrinterByID(ctx, tx, printer.ID)
+				if err2 == nil && p.IsTemporary {
+					_ = s.Store.DeletePrinter(ctx, tx, p.ID)
+				}
+				return nil
+			})
+			resp := goipp.NewResponse(req.Version, goipp.StatusErrorDevice, req.RequestID)
+			addOperationDefaults(resp)
+			resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String(rerr.Error())))
+			return resp, nil
+		}
+		if strings.TrimSpace(u) != "" {
+			resolvedURI = localizeDeviceURIForLocalQueue(u, s.Config)
+		}
+	}
+
+	supported, err := getPrinterAttributesForLocalQueue(ctx, resolvedURI)
+	if err != nil {
+		// Best-effort cleanup of the temporary queue on failure.
+		_ = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
+			p, err2 := s.Store.GetPrinterByID(ctx, tx, printer.ID)
+			if err2 == nil && p.IsTemporary {
+				_ = s.Store.DeletePrinter(ctx, tx, p.ID)
+			}
+			return nil
+		})
+
+		resp := goipp.NewResponse(req.Version, goipp.StatusErrorDevice, req.RequestID)
+		addOperationDefaults(resp)
+		resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String(err.Error())))
+		return resp, nil
+	}
+
+	ppdName, err := generatePPDFromIPP(s.Config.PPDDir, printer.Name, supported)
+	if err != nil {
+		_ = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
+			p, err2 := s.Store.GetPrinterByID(ctx, tx, printer.ID)
+			if err2 == nil && p.IsTemporary {
+				_ = s.Store.DeletePrinter(ctx, tx, p.ID)
+			}
+			return nil
+		})
+		resp := goipp.NewResponse(req.Version, goipp.StatusErrorDevice, req.RequestID)
+		addOperationDefaults(resp)
+		resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String(err.Error())))
+		return resp, nil
+	}
+
+	remoteInfo := strings.TrimSpace(attrString(supported.Printer, "printer-info"))
+	remoteLocation := strings.TrimSpace(attrString(supported.Printer, "printer-location"))
+	remoteGeo := strings.TrimSpace(attrString(supported.Printer, "printer-geo-location"))
+	err = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
+		p, err := s.Store.GetPrinterByID(ctx, tx, printer.ID)
+		if err != nil {
+			return err
+		}
+		if !p.IsTemporary {
+			return fmt.Errorf("printer no longer temporary")
+		}
+		if strings.TrimSpace(resolvedURI) != "" && !strings.EqualFold(strings.TrimSpace(resolvedURI), strings.TrimSpace(p.URI)) {
+			if err := s.Store.UpdatePrinterURI(ctx, tx, p.ID, resolvedURI); err != nil {
+				return err
+			}
+			p.URI = resolvedURI
+		}
+		if err := s.Store.UpdatePrinterPPDName(ctx, tx, p.ID, ppdName); err != nil {
+			return err
+		}
+		p.PPDName = ppdName
+
+		var infoPtr, locPtr, geoPtr *string
+		if strings.TrimSpace(p.Info) == "" && remoteInfo != "" {
+			infoPtr = &remoteInfo
+			p.Info = remoteInfo
+		}
+		if strings.TrimSpace(p.Location) == "" && remoteLocation != "" {
+			locPtr = &remoteLocation
+			p.Location = remoteLocation
+		}
+		if strings.TrimSpace(p.Geo) == "" && remoteGeo != "" {
+			geoPtr = &remoteGeo
+			p.Geo = remoteGeo
+		}
+		if infoPtr != nil || locPtr != nil || geoPtr != nil {
+			if err := s.Store.UpdatePrinterAttributes(ctx, tx, p.ID, infoPtr, locPtr, geoPtr, nil, nil); err != nil {
+				return err
+			}
+		}
+		printer = p
+		return nil
+	})
+	if err != nil {
+		_ = os.Remove(safePPDPath(s.Config.PPDDir, ppdName))
+		_ = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
+			p, err2 := s.Store.GetPrinterByID(ctx, tx, printer.ID)
+			if err2 == nil && p.IsTemporary {
+				_ = s.Store.DeletePrinter(ctx, tx, p.ID)
+			}
+			return nil
+		})
+		return nil, err
+	}
+
 	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
 	addOperationDefaults(resp)
-	if alreadyExists {
-		msg := fmt.Sprintf("Printer \"%s\" already exists.", existsName)
-		resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String(msg)))
-	}
+	resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String("Local printer created.")))
 	resp.Printer.Add(goipp.MakeAttribute("printer-is-accepting-jobs", goipp.TagBoolean, goipp.Boolean(printer.Accepting)))
 	resp.Printer.Add(goipp.MakeAttribute("printer-state", goipp.TagEnum, goipp.Integer(printer.State)))
 	resp.Printer.Add(goipp.MakeAttribute("printer-state-reasons", goipp.TagKeyword, goipp.String(printerStateReason(printer))))
@@ -1863,9 +1993,7 @@ func (s *Server) handleCupsAddModifyPrinter(ctx context.Context, r *http.Request
 				defaultOpts["job-sheets"] = jobSheetsDefault
 			}
 			merged := parseJobOptions(printer.DefaultOptions)
-			for k, v := range defaultOpts {
-				merged[k] = v
-			}
+			applyDefaultOptionUpdates(merged, defaultOpts)
 			if b, err := json.Marshal(merged); err == nil {
 				if err := s.Store.UpdatePrinterDefaultOptions(ctx, tx, printer.ID, string(b)); err != nil {
 					return err
@@ -1880,7 +2008,7 @@ func (s *Server) handleCupsAddModifyPrinter(ctx context.Context, r *http.Request
 	}
 	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
 	addOperationDefaults(resp)
-	authInfo := authInfoRequiredForRequest(s, r)
+	authInfo := s.authInfoRequiredForDestination(false, printer.Name, printer.DefaultOptions)
 	addPrinterAttributes(ctx, resp, printer, r, req, s.Store, s.Config, authInfo)
 	return resp, nil
 }
@@ -1897,6 +2025,7 @@ func (s *Server) handleCupsDeletePrinter(ctx context.Context, r *http.Request, r
 	var printer model.Printer
 	docPaths := []string{}
 	outPaths := []string{}
+	ppdToRemove := ""
 
 	// Collect document/output paths first so we don't orphan spool files after the
 	// DB rows cascade-delete.
@@ -1926,6 +2055,13 @@ func (s *Server) handleCupsDeletePrinter(ctx context.Context, r *http.Request, r
 				}
 			}
 		}
+		// Queue-specific PPD files are named like "<printer>.ppd" in CUPS.
+		if ppdName := strings.TrimSpace(printer.PPDName); ppdName != "" && !strings.EqualFold(ppdName, model.DefaultPPDName) {
+			base := filepath.Base(ppdName)
+			if strings.EqualFold(base, printer.Name+".ppd") {
+				ppdToRemove = base
+			}
+		}
 		return nil
 	})
 	if err == nil {
@@ -1934,6 +2070,9 @@ func (s *Server) handleCupsDeletePrinter(ctx context.Context, r *http.Request, r
 		}
 		for _, p := range outPaths {
 			_ = os.Remove(p)
+		}
+		if ppdToRemove != "" {
+			_ = os.Remove(safePPDPath(s.Config.PPDDir, ppdToRemove))
 		}
 		err = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
 			// Re-check the printer still exists before deleting.
@@ -2031,9 +2170,7 @@ func (s *Server) handleCupsAddModifyClass(ctx context.Context, r *http.Request, 
 				defaultOpts["job-sheets"] = jobSheetsDefault
 			}
 			merged := parseJobOptions(class.DefaultOptions)
-			for k, v := range defaultOpts {
-				merged[k] = v
-			}
+			applyDefaultOptionUpdates(merged, defaultOpts)
 			if b, err := json.Marshal(merged); err == nil {
 				if err := s.Store.UpdateClassDefaultOptions(ctx, tx, class.ID, string(b)); err != nil {
 					return err
@@ -2054,7 +2191,7 @@ func (s *Server) handleCupsAddModifyClass(ctx context.Context, r *http.Request, 
 		members, err = s.Store.ListClassMembers(ctx, tx, class.ID)
 		return err
 	})
-	authInfo := authInfoRequiredForRequest(s, r)
+	authInfo := s.authInfoRequiredForDestination(true, class.Name, class.DefaultOptions)
 	addClassAttributes(ctx, resp, class, members, r, req, s.Store, s.Config, authInfo)
 	return resp, nil
 }
@@ -2101,10 +2238,10 @@ func (s *Server) handleCupsGetDefault(ctx context.Context, r *http.Request, req 
 			members, err = s.Store.ListClassMembers(ctx, tx, dest.Class.ID)
 			return err
 		})
-		authInfo := authInfoRequiredForRequest(s, r)
+		authInfo := s.authInfoRequiredForDestination(true, dest.Class.Name, dest.Class.DefaultOptions)
 		addClassAttributes(ctx, resp, dest.Class, members, r, req, s.Store, s.Config, authInfo)
 	} else {
-		authInfo := authInfoRequiredForRequest(s, r)
+		authInfo := s.authInfoRequiredForDestination(false, dest.Printer.Name, dest.Printer.DefaultOptions)
 		addPrinterAttributes(ctx, resp, dest.Printer, r, req, s.Store, s.Config, authInfo)
 	}
 	return resp, nil
@@ -2704,12 +2841,14 @@ func (s *Server) handlePrintJob(ctx context.Context, r *http.Request, req *goipp
 	if docName == "" {
 		docName = jobName
 	}
+	ppdForFormats, _ := loadPPDForPrinter(printer)
+	supportedFormats := supportedDocumentFormatsForPrinter(printer, ppdForFormats)
 	if strings.EqualFold(documentFormat, "application/octet-stream") {
-		if detected := detectDocumentFormat(docName); detected != "" && isDocumentFormatSupported(detected) {
+		if detected := detectDocumentFormat(docName); detected != "" && isDocumentFormatSupportedInList(supportedFormats, detected) {
 			documentFormat = detected
 		}
 	}
-	if !isDocumentFormatSupported(documentFormat) {
+	if !isDocumentFormatSupportedInList(supportedFormats, documentFormat) {
 		resp := goipp.NewResponse(req.Version, goipp.StatusErrorDocumentFormatNotSupported, req.RequestID)
 		addOperationDefaults(resp)
 		resp.Unsupported.Add(goipp.MakeAttribute("document-format", goipp.TagMimeType, goipp.String(documentFormat)))
@@ -2963,12 +3102,14 @@ func (s *Server) handleSendDocument(ctx context.Context, r *http.Request, req *g
 	if docName == "" {
 		docName = job.Name
 	}
+	ppdForFormats, _ := loadPPDForPrinter(printer)
+	supportedFormats := supportedDocumentFormatsForPrinter(printer, ppdForFormats)
 	if strings.EqualFold(documentFormat, "application/octet-stream") {
-		if detected := detectDocumentFormat(docName); detected != "" && isDocumentFormatSupported(detected) {
+		if detected := detectDocumentFormat(docName); detected != "" && isDocumentFormatSupportedInList(supportedFormats, detected) {
 			documentFormat = detected
 		}
 	}
-	if !isDocumentFormatSupported(documentFormat) {
+	if !isDocumentFormatSupportedInList(supportedFormats, documentFormat) {
 		resp := goipp.NewResponse(req.Version, goipp.StatusErrorDocumentFormatNotSupported, req.RequestID)
 		addOperationDefaults(resp)
 		resp.Unsupported.Add(goipp.MakeAttribute("document-format", goipp.TagMimeType, goipp.String(documentFormat)))
@@ -4553,12 +4694,13 @@ func (s *Server) handleValidateDocument(ctx context.Context, r *http.Request, re
 		docFormat = "application/octet-stream"
 	}
 	docName := strings.TrimSpace(attrString(req.Operation, "document-name"))
+	supportedFormats := s.documentFormatsForRequest(ctx, r, req)
 	if strings.EqualFold(docFormat, "application/octet-stream") {
-		if detected := detectDocumentFormat(docName); detected != "" && isDocumentFormatSupported(detected) {
+		if detected := detectDocumentFormat(docName); detected != "" && isDocumentFormatSupportedInList(supportedFormats, detected) {
 			docFormat = detected
 		}
 	}
-	if !isDocumentFormatSupported(docFormat) {
+	if !isDocumentFormatSupportedInList(supportedFormats, docFormat) {
 		resp := goipp.NewResponse(req.Version, goipp.StatusErrorDocumentFormatNotSupported, req.RequestID)
 		addOperationDefaults(resp)
 		resp.Unsupported.Add(goipp.MakeAttribute("document-format", goipp.TagMimeType, goipp.String(docFormat)))
@@ -4567,6 +4709,19 @@ func (s *Server) handleValidateDocument(ctx context.Context, r *http.Request, re
 	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
 	addOperationDefaults(resp)
 	return resp, nil
+}
+
+func (s *Server) documentFormatsForRequest(ctx context.Context, r *http.Request, req *goipp.Message) []string {
+	dest, err := s.resolveDestination(ctx, r, req)
+	if err != nil {
+		return supportedDocumentFormats()
+	}
+	if dest.IsClass {
+		// CUPS class destinations advertise and validate raw-only document formats.
+		return []string{"application/octet-stream", "application/vnd.cups-raw"}
+	}
+	ppd, _ := loadPPDForPrinter(dest.Printer)
+	return supportedDocumentFormatsForPrinter(dest.Printer, ppd)
 }
 
 func (s *Server) handleCupsAuthenticateJob(ctx context.Context, r *http.Request, req *goipp.Message) (*goipp.Message, error) {
@@ -5111,7 +5266,7 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	uri := printerURIFor(printer, r)
 	attrs := goipp.Attributes{}
 	ppd, _ := loadPPDForPrinter(printer)
-	documentFormats := supportedDocumentFormats()
+	documentFormats := supportedDocumentFormatsForPrinter(printer, ppd)
 	shareServer := serverIsSharingPrinters(cfg, st, r)
 	share := printer.Shared
 	jobSheetsDefault := strings.TrimSpace(printer.JobSheetsDefault)
@@ -5413,12 +5568,7 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	} else {
 		attrs.Add(goipp.MakeAttribute("orientation-requested-default", goipp.TagNoValue, goipp.Void{}))
 	}
-	attrs.Add(makeKeywordsAttr("job-settable-attributes-supported", []string{
-		"copies", "finishings", "job-hold-until", "job-name", "job-priority", "media",
-		"media-col", "multiple-document-handling", "number-up", "output-bin",
-		"orientation-requested", "page-ranges", "print-color-mode", "print-quality",
-		"printer-resolution", "sides",
-	}))
+	attrs.Add(makeKeywordsAttr("job-settable-attributes-supported", jobSettableAttributesSupported()))
 	attrs.Add(makeKeywordsAttr("job-creation-attributes-supported", []string{
 		"copies", "finishings", "finishings-col", "ipp-attribute-fidelity", "job-hold-until",
 		"job-name", "job-priority", "job-sheets", "media", "media-col",
@@ -5445,10 +5595,7 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 			attrs.Add(makeKeywordsAttr("printer-mandatory-job-attributes", mandatory))
 		}
 	}
-	attrs.Add(makeKeywordsAttr("printer-settable-attributes-supported", []string{
-		"printer-geo-location", "printer-info", "printer-location", "printer-organization",
-		"printer-organizational-unit",
-	}))
+	attrs.Add(makeKeywordsAttr("printer-settable-attributes-supported", printerSettableAttributesForDestination(false)))
 	errorPolicies := printerErrorPolicySupported(false)
 	opPolicies := supportedOpPolicies()
 	portMonitors := portMonitorSupported(ppd)
@@ -5738,16 +5885,8 @@ func buildClassAttributes(ctx context.Context, class model.Class, r *http.Reques
 	}
 	attrs.Add(goipp.MakeAttribute("print-quality-default", goipp.TagEnum, goipp.Integer(printQualityDefault)))
 	attrs.Add(makeKeywordsAttr("printer-get-attributes-supported", []string{"document-format"}))
-	attrs.Add(makeKeywordsAttr("printer-settable-attributes-supported", []string{
-		"printer-geo-location", "printer-info", "printer-location", "printer-organization",
-		"printer-organizational-unit",
-	}))
-	attrs.Add(makeKeywordsAttr("job-settable-attributes-supported", []string{
-		"copies", "finishings", "job-hold-until", "job-name", "job-priority", "media",
-		"media-col", "multiple-document-handling", "number-up", "output-bin",
-		"orientation-requested", "page-ranges", "print-color-mode", "print-quality",
-		"printer-resolution", "sides",
-	}))
+	attrs.Add(makeKeywordsAttr("printer-settable-attributes-supported", printerSettableAttributesForDestination(true)))
+	attrs.Add(makeKeywordsAttr("job-settable-attributes-supported", jobSettableAttributesSupported()))
 	attrs.Add(makeKeywordsAttr("job-creation-attributes-supported", []string{
 		"copies", "finishings", "finishings-col", "ipp-attribute-fidelity", "job-hold-until",
 		"job-name", "job-priority", "job-sheets", "media", "media-col",
@@ -7036,18 +7175,33 @@ func collectPrinterDefaultOptions(attrs goipp.Attributes) (map[string]string, st
 			continue
 		}
 		name := strings.ToLower(strings.TrimSpace(attr.Name))
+		deleteAttr := attr.Values[0].T == goipp.TagDeleteAttr
 		if name == "" {
 			continue
 		}
 		switch name {
 		case "printer-is-shared":
+			if deleteAttr {
+				sharedPtr = nil
+				continue
+			}
 			val := isTruthy(attr.Values[0].V.String())
 			sharedPtr = &val
 			continue
 		case "printer-error-policy", "printer-op-policy", "port-monitor":
+			if deleteAttr {
+				opts[name] = ""
+				continue
+			}
 			opts[name] = strings.TrimSpace(attr.Values[0].V.String())
 			continue
 		case "job-sheets-default", "job-sheets":
+			if deleteAttr {
+				jobSheetsDefault = ""
+				jobSheetsOk = true
+				opts["job-sheets"] = ""
+				continue
+			}
 			if sawJobSheetsCol {
 				continue
 			}
@@ -7056,6 +7210,16 @@ func collectPrinterDefaultOptions(attrs goipp.Attributes) (map[string]string, st
 			opts["job-sheets"] = jobSheetsDefault
 			continue
 		case "job-sheets-col-default", "job-sheets-col":
+			if deleteAttr {
+				sawJobSheetsCol = true
+				jobSheetsDefault = ""
+				jobSheetsOk = true
+				opts["job-sheets"] = ""
+				opts["job-sheets-col-media"] = ""
+				opts["job-sheets-col-media-type"] = ""
+				opts["job-sheets-col-media-source"] = ""
+				continue
+			}
 			if col, ok := attr.Values[0].V.(goipp.Collection); ok {
 				sawJobSheetsCol = true
 				if vals := collectionStrings(col, "job-sheets"); len(vals) > 0 {
@@ -7080,6 +7244,12 @@ func collectPrinterDefaultOptions(attrs goipp.Attributes) (map[string]string, st
 			}
 			continue
 		case "media-col-default", "media-col":
+			if deleteAttr {
+				opts["media"] = ""
+				opts["media-type"] = ""
+				opts["media-source"] = ""
+				continue
+			}
 			if col, ok := attr.Values[0].V.(goipp.Collection); ok {
 				if name := mediaSizeNameFromCollection(col, nil); name != "" {
 					opts["media"] = name
@@ -7093,6 +7263,11 @@ func collectPrinterDefaultOptions(attrs goipp.Attributes) (map[string]string, st
 			}
 			continue
 		case "finishings-col-default", "finishings-col":
+			if deleteAttr {
+				opts["finishing-template"] = ""
+				opts["finishings"] = ""
+				continue
+			}
 			if col, ok := attr.Values[0].V.(goipp.Collection); ok {
 				if templates := collectionStrings(col, "finishing-template"); len(templates) > 0 {
 					opts["finishing-template"] = templates[0]
@@ -7103,6 +7278,11 @@ func collectPrinterDefaultOptions(attrs goipp.Attributes) (map[string]string, st
 			}
 			continue
 		case "output-mode-default":
+			if deleteAttr {
+				opts["output-mode"] = ""
+				opts["print-color-mode"] = ""
+				continue
+			}
 			mode := strings.ToLower(strings.TrimSpace(attr.Values[0].V.String()))
 			if mapped := outputModeForColorMode(mode); mapped != "" {
 				mode = mapped
@@ -7115,6 +7295,10 @@ func collectPrinterDefaultOptions(attrs goipp.Attributes) (map[string]string, st
 			}
 			continue
 		case "print-quality-default":
+			if deleteAttr {
+				opts["print-quality"] = ""
+				continue
+			}
 			if n, ok := parsePrintQualityValue(attr.Values[0].V.String()); ok {
 				opts["print-quality"] = strconv.Itoa(n)
 			} else {
@@ -7125,6 +7309,10 @@ func collectPrinterDefaultOptions(attrs goipp.Attributes) (map[string]string, st
 		if strings.HasSuffix(name, "-default") {
 			base := strings.TrimSuffix(name, "-default")
 			if base == "" {
+				continue
+			}
+			if deleteAttr {
+				opts[base] = ""
 				continue
 			}
 			if len(attr.Values) > 1 {
@@ -7146,6 +7334,23 @@ func parseJobOptions(optionsJSON string) map[string]string {
 		return map[string]string{}
 	}
 	return opts
+}
+
+func applyDefaultOptionUpdates(target map[string]string, updates map[string]string) {
+	if len(updates) == 0 {
+		return
+	}
+	for k, v := range updates {
+		key := strings.TrimSpace(k)
+		if key == "" {
+			continue
+		}
+		if strings.TrimSpace(v) == "" {
+			delete(target, key)
+			continue
+		}
+		target[key] = v
+	}
 }
 
 func mergeJobOptions(existing string, updates map[string]string) string {
@@ -7356,6 +7561,9 @@ func applyPrinterDefaults(opts map[string]string, printer model.Printer) map[str
 		"port-monitor":         true,
 	}
 	for k, v := range defaults {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(k)), "custom.") {
+			continue
+		}
 		if strings.TrimSpace(v) == "" {
 			continue
 		}
@@ -7812,11 +8020,17 @@ func computePrinterCaps(ppd *config.PPD, defaultOpts map[string]string) printerC
 		}
 		if ppd.ColorDevice || hasColorOptions(ppd) {
 			caps.colorModes = []string{"monochrome", "color"}
-			if ppd.DefaultColorSpace != "" {
-				if !strings.Contains(strings.ToLower(ppd.DefaultColorSpace), "gray") {
-					caps.colorDefault = "color"
-				} else {
+			defColor := strings.TrimSpace(ppd.DefaultColorSpace)
+			if defColor == "" {
+				// IPP Everywhere PPDs generated by CUPS use DefaultColorModel.
+				defColor = firstNonEmpty(ppd.Defaults["ColorModel"], ppd.Defaults["ColorMode"], ppd.Defaults["ColorSpace"])
+			}
+			if defColor != "" {
+				lc := strings.ToLower(defColor)
+				if strings.Contains(lc, "gray") || strings.Contains(lc, "mono") {
 					caps.colorDefault = "monochrome"
+				} else {
+					caps.colorDefault = "color"
 				}
 			} else if ppd.ColorDevice {
 				caps.colorDefault = "color"
@@ -8245,12 +8459,16 @@ func normalizeSchemeSet(values []string) map[string]bool {
 		return nil
 	}
 	out := map[string]bool{}
-	for _, v := range values {
-		name := strings.ToLower(strings.TrimSpace(v))
-		if name == "" {
-			continue
+	for _, raw := range values {
+		for _, part := range strings.FieldsFunc(raw, func(r rune) bool {
+			return r == ',' || r == ';' || r == '	' || r == 10 || r == 13 || r == ' '
+		}) {
+			name := strings.ToLower(strings.TrimSpace(part))
+			if name == "" {
+				continue
+			}
+			out[name] = true
 		}
-		out[name] = true
 	}
 	if len(out) == 0 {
 		return nil
@@ -8340,6 +8558,7 @@ func loadPPDForPrinter(printer model.Printer) (*config.PPD, error) {
 		ppdName = model.DefaultPPDName
 	}
 	ppdPath := safePPDPath(appConfig().PPDDir, ppdName)
+	refreshPPDCache(ppdName, ppdPath)
 	ppd, err := config.LoadPPD(ppdPath)
 	if err == nil {
 		return ppd, nil
@@ -8351,6 +8570,61 @@ func loadPPDForPrinter(printer model.Printer) (*config.PPD, error) {
 		}
 	}
 	return nil, err
+}
+
+func loadPPDForListing(ppdName string, ppdDir string) (*config.PPD, error) {
+	ppdName = strings.TrimSpace(ppdName)
+	if ppdName == "" {
+		return nil, os.ErrNotExist
+	}
+	ppdPath := safePPDPath(ppdDir, ppdName)
+	refreshPPDCache(ppdName, ppdPath)
+	return config.LoadPPD(ppdPath)
+}
+
+func refreshPPDCache(ppdName, ppdPath string) {
+	st := appStore()
+	if st == nil {
+		return
+	}
+	ppdName = strings.TrimSpace(ppdName)
+	if ppdName == "" || strings.TrimSpace(ppdPath) == "" {
+		return
+	}
+	hash, size, mtime, ok := ppdFileCacheMetadata(ppdPath)
+	if !ok {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = st.WithTx(ctx, false, func(tx *sql.Tx) error {
+		cachedHash, cachedAttrs, _, exists, err := st.GetPPDCache(ctx, tx, ppdName)
+		if err != nil {
+			return nil
+		}
+		payload := parsePPDCachePayload(cachedAttrs)
+		if exists && cachedHash == hash && payload.Size == size && payload.MTime == mtime {
+			if len(payload.Formats) > 0 {
+				key := ppdFormatCacheKey(ppdName, hash)
+				printerFormatOnce.Store(key, cloneStringSlice(payload.Formats))
+			}
+			return nil
+		}
+		next := ppdCachePayload{Size: size, MTime: mtime}
+		if exists && cachedHash == hash && len(payload.Formats) > 0 {
+			next.Formats = payload.Formats
+		}
+		raw := marshalPPDCachePayload(next)
+		if err := st.SetPPDCache(ctx, tx, ppdName, hash, raw); err != nil {
+			return nil
+		}
+		if len(next.Formats) > 0 {
+			key := ppdFormatCacheKey(ppdName, hash)
+			printerFormatOnce.Store(key, cloneStringSlice(next.Formats))
+		}
+		return nil
+	})
 }
 
 func listPPDNames(dir string) []string {
@@ -8660,6 +8934,7 @@ func validateIppOptions(req *goipp.Message, printer model.Printer) (*ippWarning,
 	}
 
 	ppd, _ := loadPPDForPrinter(printer)
+	documentFormats := supportedDocumentFormatsForPrinter(printer, ppd)
 	defaultOpts := parseJobOptions(printer.DefaultOptions)
 	caps := computePrinterCaps(ppd, defaultOpts)
 	finishingsTemplates := caps.finishingTemplates
@@ -8697,7 +8972,7 @@ func validateIppOptions(req *goipp.Message, printer model.Printer) (*ippWarning,
 		}
 		switch attr.Name {
 		case "document-format":
-			if !isDocumentFormatSupported(attr.Values[0].V.String()) {
+			if !isDocumentFormatSupportedInList(documentFormats, attr.Values[0].V.String()) {
 				return errUnsupported
 			}
 		case "copies":
@@ -9651,7 +9926,7 @@ func (s *Server) selectClassMember(ctx context.Context, classID int64) (model.Pr
 		return model.Printer{}, sql.ErrNoRows
 	}
 	var selected model.Printer
-	err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
+	err := s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
 		members, err := s.Store.ListClassMembers(ctx, tx, classID)
 		if err != nil {
 			return err
@@ -9659,13 +9934,36 @@ func (s *Server) selectClassMember(ctx context.Context, classID int64) (model.Pr
 		if len(members) == 0 {
 			return sql.ErrNoRows
 		}
+
+		eligible := make([]model.Printer, 0, len(members))
 		for _, p := range members {
-			if p.Accepting {
-				selected = p
-				return nil
+			// Match CUPS behavior: choose an accepting/enabled queue.
+			if p.Accepting && p.State != 5 {
+				eligible = append(eligible, p)
 			}
 		}
-		return sql.ErrNoRows
+		if len(eligible) == 0 {
+			return sql.ErrNoRows
+		}
+
+		// Round-robin between class members (persistent across restarts).
+		key := fmt.Sprintf("class.%d.last_printer_id", classID)
+		last, err := s.Store.GetSetting(ctx, tx, key, "")
+		if err != nil {
+			return err
+		}
+		start := 0
+		if lastID, err := strconv.ParseInt(strings.TrimSpace(last), 10, 64); err == nil && lastID > 0 {
+			for i, p := range eligible {
+				if p.ID == lastID {
+					start = (i + 1) % len(eligible)
+					break
+				}
+			}
+		}
+		selected = eligible[start]
+		_ = s.Store.SetSetting(ctx, tx, key, strconv.FormatInt(selected.ID, 10))
+		return nil
 	})
 	return selected, err
 }
@@ -11017,6 +11315,20 @@ func lookupMediaNameByDims(x, y int) string {
 	return ""
 }
 
+func lookupMediaPPDNameByDims(x, y int) string {
+	pwgMediaOnce.Do(loadPWGMediaTable)
+	if len(pwgMediaPPDByDims) == 0 {
+		return ""
+	}
+	if name, ok := pwgMediaPPDByDims[mediaDimsKey(x, y)]; ok {
+		return name
+	}
+	if name, ok := pwgMediaPPDByDims[mediaDimsKey(y, x)]; ok {
+		return name
+	}
+	return ""
+}
+
 func mediaDimsKey(x, y int) string {
 	return strconv.Itoa(x) + "x" + strconv.Itoa(y)
 }
@@ -11024,14 +11336,19 @@ func mediaDimsKey(x, y int) string {
 func loadPWGMediaTable() {
 	pwgMediaByName = map[string]mediaSize{}
 	pwgMediaByDims = map[string]string{}
+	pwgMediaPPDByDims = map[string]string{}
 	if path := findPWGMediaFile(); path != "" {
 		_ = parsePWGMediaFile(path)
 	}
 	if len(pwgMediaByName) == 0 {
 		addPWGMediaName("A4", 21000, 29700, true)
+		addPWGMediaPPDName("A4", 21000, 29700)
 		addPWGMediaName("Letter", 21590, 27940, true)
+		addPWGMediaPPDName("Letter", 21590, 27940)
 		addPWGMediaName("Legal", 21590, 35560, true)
+		addPWGMediaPPDName("Legal", 21590, 35560)
 		addPWGMediaName("A5", 14800, 21000, true)
+		addPWGMediaPPDName("A5", 14800, 21000)
 	}
 }
 
@@ -11094,6 +11411,7 @@ func parsePWGMediaFile(path string) error {
 		addPWGMediaName(pwg, x, y, true)
 		addPWGMediaName(legacy, x, y, false)
 		addPWGMediaName(ppd, x, y, false)
+		addPWGMediaPPDName(ppd, x, y)
 	}
 	return sc.Err()
 }
@@ -11172,6 +11490,16 @@ func addPWGMediaName(name string, x, y int, preferDims bool) {
 	dimsKey := mediaDimsKey(x, y)
 	if preferDims || pwgMediaByDims[dimsKey] == "" {
 		pwgMediaByDims[dimsKey] = name
+	}
+}
+
+func addPWGMediaPPDName(name string, x, y int) {
+	if strings.TrimSpace(name) == "" {
+		return
+	}
+	dimsKey := mediaDimsKey(x, y)
+	if pwgMediaPPDByDims[dimsKey] == "" {
+		pwgMediaPPDByDims[dimsKey] = name
 	}
 }
 
@@ -11854,36 +12182,499 @@ func jobPresetsSupportedFromPPD(ppd *config.PPD) []goipp.Collection {
 	return out
 }
 
+type ppdCachePayload struct {
+	Size    string   `json:"size,omitempty"`
+	MTime   string   `json:"mtime,omitempty"`
+	Formats []string `json:"formats,omitempty"`
+}
+
+func supportedMimeDB() *config.MimeDB {
+	_ = supportedDocumentFormats()
+	return mimeDB
+}
+
 func supportedDocumentFormats() []string {
 	mimeOnce.Do(func() {
+		mimeTypes = nil
+		mimeExt = map[string]string{}
 		db, err := config.LoadMimeDB(appConfig().ConfDir)
-		if err != nil || db == nil || len(db.Types) == 0 {
+		if err != nil || db == nil {
+			mimeDB = nil
 			mimeTypes = []string{"application/octet-stream", "application/vnd.cups-raw"}
-			mimeExt = map[string]string{}
 			return
 		}
-		mimeExt = map[string]string{}
+		mimeDB = db
 		for ext, mt := range db.ExtToType {
+			ext = strings.TrimSpace(ext)
+			mt = strings.TrimSpace(mt)
 			if ext == "" || mt == "" {
 				continue
 			}
-			mimeExt[strings.ToLower(ext)] = mt
+			mimeExt[strings.ToLower(ext)] = strings.ToLower(mt)
 		}
+		all := make([]string, 0, len(db.Types)+2)
 		for mt := range db.Types {
-			mimeTypes = append(mimeTypes, mt)
+			all = append(all, mt)
 		}
-		if !stringInList("application/octet-stream", mimeTypes) {
-			mimeTypes = append(mimeTypes, "application/octet-stream")
-		}
-		if !stringInList("application/vnd.cups-raw", mimeTypes) {
-			mimeTypes = append(mimeTypes, "application/vnd.cups-raw")
-		}
-		sort.Strings(mimeTypes)
-		if len(mimeTypes) == 0 {
-			mimeTypes = []string{"application/octet-stream", "application/vnd.cups-raw"}
-		}
+		mimeTypes = normalizeDocumentFormats(all)
 	})
-	return mimeTypes
+	return cloneStringSlice(mimeTypes)
+}
+
+func normalizeDocumentFormats(formats []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(formats)+2)
+	add := func(value string) {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" || seen[value] {
+			return
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	for _, mt := range formats {
+		add(mt)
+	}
+	add("application/octet-stream")
+	add("application/vnd.cups-raw")
+	sort.Strings(out)
+	if len(out) == 0 {
+		return []string{"application/octet-stream", "application/vnd.cups-raw"}
+	}
+	return out
+}
+
+func cloneStringSlice(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, len(values))
+	copy(out, values)
+	return out
+}
+
+func ppdFormatCacheKey(ppdName, ppdHash string) string {
+	return strings.ToLower(strings.TrimSpace(ppdName)) + "|" + strings.TrimSpace(ppdHash)
+}
+
+func parsePPDCachePayload(raw string) ppdCachePayload {
+	payload := ppdCachePayload{}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return payload
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err == nil {
+		payload.Size = strings.TrimSpace(payload.Size)
+		payload.MTime = strings.TrimSpace(payload.MTime)
+		if len(payload.Formats) > 0 {
+			payload.Formats = normalizeDocumentFormats(payload.Formats)
+		}
+		return payload
+	}
+	legacy := map[string]any{}
+	if err := json.Unmarshal([]byte(raw), &legacy); err != nil {
+		return ppdCachePayload{}
+	}
+	if size, ok := legacy["size"]; ok {
+		payload.Size = strings.TrimSpace(fmt.Sprint(size))
+	}
+	if mtime, ok := legacy["mtime"]; ok {
+		payload.MTime = strings.TrimSpace(fmt.Sprint(mtime))
+	}
+	if formats, ok := legacy["formats"]; ok {
+		switch v := formats.(type) {
+		case []any:
+			items := make([]string, 0, len(v))
+			for _, item := range v {
+				items = append(items, fmt.Sprint(item))
+			}
+			if len(items) > 0 {
+				payload.Formats = normalizeDocumentFormats(items)
+			}
+		case []string:
+			if len(v) > 0 {
+				payload.Formats = normalizeDocumentFormats(v)
+			}
+		}
+	}
+	return payload
+}
+
+func marshalPPDCachePayload(payload ppdCachePayload) string {
+	payload.Size = strings.TrimSpace(payload.Size)
+	payload.MTime = strings.TrimSpace(payload.MTime)
+	if len(payload.Formats) > 0 {
+		payload.Formats = normalizeDocumentFormats(payload.Formats)
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+func ppdFileCacheMetadata(ppdPath string) (hash, size, mtime string, ok bool) {
+	info, err := os.Stat(ppdPath)
+	if err != nil {
+		return "", "", "", false
+	}
+	raw, err := os.ReadFile(ppdPath)
+	if err != nil {
+		return "", "", "", false
+	}
+	hash = fmt.Sprintf("%x", md5.Sum(raw))
+	size = strconv.FormatInt(info.Size(), 10)
+	mtime = info.ModTime().UTC().Format(time.RFC3339Nano)
+	return hash, size, mtime, true
+}
+
+func ppdFilterConvs(ppd *config.PPD) ([]config.MimeConv, map[string]bool, bool) {
+	extra := []config.MimeConv{}
+	destSet := map[string]bool{}
+	if ppd == nil {
+		return extra, destSet, false
+	}
+	hasFilter2 := false
+	for _, f := range ppd.Filters {
+		if strings.TrimSpace(f.Dest) != "" {
+			hasFilter2 = true
+			break
+		}
+	}
+	hasFilters := false
+	for _, f := range ppd.Filters {
+		source := strings.TrimSpace(f.Source)
+		dest := strings.TrimSpace(f.Dest)
+		if source == "" {
+			continue
+		}
+		if hasFilter2 && dest == "" {
+			continue
+		}
+		extra = append(extra, config.MimeConv{
+			Source:  source,
+			Dest:    dest,
+			Cost:    f.Cost,
+			Program: f.Program,
+		})
+		hasFilters = true
+		if dest != "" {
+			destSet[dest] = true
+		}
+	}
+	return extra, destSet, hasFilters
+}
+
+func selectMimePipeline(db *config.MimeDB, src string, extra []config.MimeConv, destSet map[string]bool) ([]config.MimeConv, string) {
+	if db == nil || strings.TrimSpace(src) == "" {
+		return nil, ""
+	}
+	candidates := make([]string, 0, len(destSet)+1)
+	for dest := range destSet {
+		candidates = append(candidates, dest)
+	}
+	candidates = append(candidates, "application/octet-stream")
+	seen := map[string]bool{}
+	var best []config.MimeConv
+	bestCost := -1
+	bestDest := ""
+	for _, dest := range candidates {
+		dest = strings.TrimSpace(dest)
+		if dest == "" || seen[dest] {
+			continue
+		}
+		seen[dest] = true
+		convs := findMimePipeline(db, src, dest, extra)
+		if len(convs) == 0 {
+			continue
+		}
+		cost := mimePipelineCost(convs)
+		if bestCost == -1 || cost < bestCost {
+			bestCost = cost
+			best = convs
+			bestDest = dest
+		}
+	}
+	return best, bestDest
+}
+
+func mimePipelineCost(convs []config.MimeConv) int {
+	total := 0
+	for _, conv := range convs {
+		if conv.Cost > 0 {
+			total += conv.Cost
+		} else {
+			total++
+		}
+	}
+	return total
+}
+
+func filterProgramAvailable(program string) bool {
+	program = strings.TrimSpace(program)
+	if program == "" || program == "-" {
+		return true
+	}
+	parts := strings.Fields(program)
+	if len(parts) == 0 {
+		return true
+	}
+	cmd := parts[0]
+	if strings.Contains(cmd, "/") || strings.Contains(cmd, "\\\\") || filepath.IsAbs(cmd) {
+		return executablePathExists(cmd)
+	}
+	if dir := strings.TrimSpace(appConfig().FilterDir); dir != "" {
+		if candidate, ok := lookupExecutableInDir(dir, cmd); ok {
+			return executablePathExists(candidate)
+		}
+	}
+	_, err := exec.LookPath(cmd)
+	return err == nil
+}
+
+func lookupExecutableInDir(dir, name string) (string, bool) {
+	if strings.TrimSpace(dir) == "" || strings.TrimSpace(name) == "" {
+		return "", false
+	}
+	candidates := []string{filepath.Join(dir, name)}
+	if runtime.GOOS == "windows" && filepath.Ext(name) == "" {
+		for _, ext := range []string{".exe", ".cmd", ".bat", ".com"} {
+			candidates = append(candidates, filepath.Join(dir, name+ext))
+		}
+	}
+	for _, candidate := range candidates {
+		if executablePathExists(candidate) {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+func executablePathExists(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		ext := strings.ToLower(filepath.Ext(path))
+		switch ext {
+		case ".exe", ".cmd", ".bat", ".com":
+			return true
+		default:
+			return false
+		}
+	}
+	return info.Mode()&0111 != 0
+}
+
+func findMimePipeline(db *config.MimeDB, src, dst string, extra []config.MimeConv) []config.MimeConv {
+	if db == nil || src == "" || dst == "" {
+		return nil
+	}
+	if src == dst {
+		return nil
+	}
+	type edge struct {
+		to   string
+		conv config.MimeConv
+	}
+	graph := map[string][]edge{}
+	allConvs := append([]config.MimeConv{}, db.Convs...)
+	if len(extra) > 0 {
+		allConvs = append(allConvs, extra...)
+	}
+	for _, conv := range allConvs {
+		source := strings.TrimSpace(conv.Source)
+		dest := strings.TrimSpace(conv.Dest)
+		if source == "" {
+			continue
+		}
+		if !filterProgramAvailable(conv.Program) {
+			continue
+		}
+		if dest == "" {
+			dest = dst
+		}
+		if dest == "" {
+			continue
+		}
+		convCopy := conv
+		convCopy.Source = source
+		convCopy.Dest = dest
+		graph[source] = append(graph[source], edge{to: dest, conv: convCopy})
+	}
+	dist := map[string]int{src: 0}
+	prev := map[string]edge{}
+	visited := map[string]bool{}
+	queue := []string{src}
+	for len(queue) > 0 {
+		sort.Slice(queue, func(i, j int) bool { return dist[queue[i]] < dist[queue[j]] })
+		node := queue[0]
+		queue = queue[1:]
+		if visited[node] {
+			continue
+		}
+		visited[node] = true
+		if node == dst {
+			break
+		}
+		for _, e := range graph[node] {
+			if visited[e.to] {
+				continue
+			}
+			cost := dist[node] + e.conv.Cost
+			if cur, ok := dist[e.to]; !ok || cost < cur {
+				dist[e.to] = cost
+				prev[e.to] = e
+				queue = append(queue, e.to)
+			}
+		}
+	}
+	if _, ok := dist[dst]; !ok {
+		return nil
+	}
+	path := []config.MimeConv{}
+	cur := dst
+	for cur != src {
+		e, ok := prev[cur]
+		if !ok {
+			return nil
+		}
+		path = append([]config.MimeConv{e.conv}, path...)
+		cur = e.conv.Source
+	}
+	return path
+}
+
+func canAcceptDocumentFormat(format string, db *config.MimeDB, extra []config.MimeConv, destSet map[string]bool) bool {
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format == "" || format == "application/octet-stream" || format == "application/vnd.cups-raw" {
+		return true
+	}
+	for dest := range destSet {
+		if strings.EqualFold(dest, format) {
+			return true
+		}
+	}
+	convs, _ := selectMimePipeline(db, format, extra, destSet)
+	return len(convs) > 0
+}
+
+func deriveDocumentFormatsForPPD(base []string, db *config.MimeDB, ppd *config.PPD) []string {
+	base = normalizeDocumentFormats(base)
+	extra, destSet, hasFilters := ppdFilterConvs(ppd)
+	if !hasFilters {
+		return normalizeDocumentFormats(nil)
+	}
+	if db == nil {
+		fallback := make([]string, 0, len(extra))
+		for _, conv := range extra {
+			fallback = append(fallback, conv.Source)
+		}
+		return normalizeDocumentFormats(fallback)
+	}
+	formats := make([]string, 0, len(base))
+	for _, format := range base {
+		if canAcceptDocumentFormat(format, db, extra, destSet) {
+			formats = append(formats, format)
+		}
+	}
+	return normalizeDocumentFormats(formats)
+}
+
+func loadCachedDocumentFormats(ppdName, ppdHash string) []string {
+	ppdName = strings.TrimSpace(ppdName)
+	ppdHash = strings.TrimSpace(ppdHash)
+	if ppdName == "" || ppdHash == "" {
+		return nil
+	}
+	st := appStore()
+	if st == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	formats := []string{}
+	_ = st.WithTx(ctx, true, func(tx *sql.Tx) error {
+		cachedHash, cachedAttrs, _, ok, err := st.GetPPDCache(ctx, tx, ppdName)
+		if err != nil || !ok || cachedHash != ppdHash {
+			return nil
+		}
+		payload := parsePPDCachePayload(cachedAttrs)
+		if len(payload.Formats) == 0 {
+			return nil
+		}
+		formats = normalizeDocumentFormats(payload.Formats)
+		return nil
+	})
+	return formats
+}
+
+func storeCachedDocumentFormats(ppdName, ppdHash, size, mtime string, formats []string) {
+	ppdName = strings.TrimSpace(ppdName)
+	ppdHash = strings.TrimSpace(ppdHash)
+	if ppdName == "" || ppdHash == "" {
+		return
+	}
+	st := appStore()
+	if st == nil {
+		return
+	}
+	payload := ppdCachePayload{
+		Size:    strings.TrimSpace(size),
+		MTime:   strings.TrimSpace(mtime),
+		Formats: normalizeDocumentFormats(formats),
+	}
+	raw := marshalPPDCachePayload(payload)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = st.WithTx(ctx, false, func(tx *sql.Tx) error {
+		return st.SetPPDCache(ctx, tx, ppdName, ppdHash, raw)
+	})
+}
+
+func supportedDocumentFormatsForPPD(ppdName, ppdPath string, ppd *config.PPD) []string {
+	base := supportedDocumentFormats()
+	if ppd == nil {
+		return base
+	}
+	hash, size, mtime, ok := ppdFileCacheMetadata(ppdPath)
+	if ok {
+		cacheKey := ppdFormatCacheKey(ppdName, hash)
+		if cached, found := printerFormatOnce.Load(cacheKey); found {
+			if values, valid := cached.([]string); valid && len(values) > 0 {
+				return cloneStringSlice(values)
+			}
+		}
+		if cached := loadCachedDocumentFormats(ppdName, hash); len(cached) > 0 {
+			printerFormatOnce.Store(cacheKey, cloneStringSlice(cached))
+			return cached
+		}
+	}
+	derived := deriveDocumentFormatsForPPD(base, supportedMimeDB(), ppd)
+	if ok {
+		cacheKey := ppdFormatCacheKey(ppdName, hash)
+		printerFormatOnce.Store(cacheKey, cloneStringSlice(derived))
+		storeCachedDocumentFormats(ppdName, hash, size, mtime, derived)
+	}
+	return derived
+}
+
+func supportedDocumentFormatsForPrinter(printer model.Printer, ppd *config.PPD) []string {
+	ppdName := strings.TrimSpace(printer.PPDName)
+	if ppdName == "" {
+		ppdName = model.DefaultPPDName
+	}
+	ppdPath := safePPDPath(appConfig().PPDDir, ppdName)
+	if _, err := os.Stat(ppdPath); err != nil && ppdName != model.DefaultPPDName {
+		ppdName = model.DefaultPPDName
+		ppdPath = safePPDPath(appConfig().PPDDir, ppdName)
+	}
+	return supportedDocumentFormatsForPPD(ppdName, ppdPath, ppd)
 }
 
 func preferredDocumentFormat(formats []string) string {
@@ -12085,14 +12876,12 @@ func clampLeaseDuration(lease int64, cfg config.Config) int64 {
 	return lease
 }
 
-func isDocumentFormatSupported(format string) bool {
-	if format == "" || format == "application/octet-stream" {
+func isDocumentFormatSupportedInList(formats []string, format string) bool {
+	format = strings.TrimSpace(format)
+	if format == "" || strings.EqualFold(format, "application/octet-stream") || strings.EqualFold(format, "application/vnd.cups-raw") {
 		return true
 	}
-	if strings.EqualFold(format, "application/vnd.cups-raw") {
-		return true
-	}
-	for _, mt := range supportedDocumentFormats() {
+	for _, mt := range formats {
 		if strings.EqualFold(mt, format) {
 			return true
 		}
@@ -12100,16 +12889,55 @@ func isDocumentFormatSupported(format string) bool {
 	return false
 }
 
+func isDocumentFormatSupportedForPrinter(printer model.Printer, format string) bool {
+	ppd, _ := loadPPDForPrinter(printer)
+	return isDocumentFormatSupportedInList(supportedDocumentFormatsForPrinter(printer, ppd), format)
+}
+
+func isDocumentFormatSupported(format string) bool {
+	return isDocumentFormatSupportedInList(supportedDocumentFormats(), format)
+}
+
+func jobSettableAttributesSupported() []string {
+	return []string{
+		"copies", "finishings", "job-cancel-after", "job-hold-until", "job-name", "job-priority",
+		"job-sheets", "job-sheets-col", "media", "media-col", "multiple-document-handling",
+		"number-up", "number-up-layout", "orientation-requested", "output-bin", "page-delivery",
+		"page-ranges", "print-as-raster", "print-color-mode", "print-quality", "print-scaling",
+		"printer-resolution", "sides",
+	}
+}
+
+func printerSettableAttributesSupported() []string {
+	return []string{
+		"job-cancel-after-default", "job-hold-until-default", "job-priority-default", "job-sheets-default",
+		"media-default", "media-col-default", "media-source-default", "media-type-default",
+		"number-up-default", "orientation-requested-default", "output-bin-default", "output-mode-default",
+		"port-monitor", "print-color-mode-default", "print-quality-default", "printer-error-policy",
+		"printer-geo-location", "printer-info", "printer-is-shared", "printer-location",
+		"printer-op-policy", "printer-organization", "printer-organizational-unit", "printer-resolution-default",
+	}
+}
+
+func printerSettableAttributesForDestination(isClass bool) []string {
+	keys := make([]string, 0, len(printerSettableAttributesSupported()))
+	for _, key := range printerSettableAttributesSupported() {
+		if isClass && strings.EqualFold(key, "printer-is-shared") {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	return keys
+}
+
 func supportedValueAttributes(printer model.Printer, isClass bool) goipp.Attributes {
+	_ = printer
 	attrs := goipp.Attributes{}
 	// CUPS returns admin-defined integer values (0) to indicate settable
 	// attributes for Set-Printer-Attributes.
-	attrs.Add(goipp.MakeAttribute("printer-geo-location", goipp.TagAdminDefine, goipp.Integer(0)))
-	attrs.Add(goipp.MakeAttribute("printer-info", goipp.TagAdminDefine, goipp.Integer(0)))
-	attrs.Add(goipp.MakeAttribute("printer-location", goipp.TagAdminDefine, goipp.Integer(0)))
-	attrs.Add(goipp.MakeAttribute("printer-organization", goipp.TagAdminDefine, goipp.Integer(0)))
-	attrs.Add(goipp.MakeAttribute("printer-organizational-unit", goipp.TagAdminDefine, goipp.Integer(0)))
-
+	for _, key := range printerSettableAttributesForDestination(isClass) {
+		attrs.Add(goipp.MakeAttribute(key, goipp.TagAdminDefine, goipp.Integer(0)))
+	}
 	return attrs
 }
 

@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -36,11 +37,15 @@ func (ippBackend) ListDevices(ctx context.Context) ([]Device, error) {
 
 func (ippBackend) SubmitJob(ctx context.Context, printer model.Printer, job model.Job, doc model.Document, filePath string) error {
 	if printer.URI == "" {
-		return errors.New("missing printer URI")
+		return WrapPermanent("ipp-submit", printer.URI, errors.New("missing printer URI"))
+	}
+	httpURL, err := ippTransportURL(printer.URI)
+	if err != nil {
+		return WrapUnsupported("ipp-submit", printer.URI, err)
 	}
 	f, err := os.Open(filePath)
 	if err != nil {
-		return err
+		return WrapPermanent("ipp-submit", printer.URI, err)
 	}
 	defer f.Close()
 
@@ -70,13 +75,13 @@ func (ippBackend) SubmitJob(ctx context.Context, printer model.Printer, job mode
 
 	payload, err := req.EncodeBytes()
 	if err != nil {
-		return err
+		return WrapPermanent("ipp-encode", printer.URI, err)
 	}
 
 	body := io.MultiReader(bytes.NewBuffer(payload), f)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, printer.URI, body)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, httpURL, body)
 	if err != nil {
-		return err
+		return WrapPermanent("ipp-request", printer.URI, err)
 	}
 	httpReq.Header.Set("Content-Type", goipp.ContentType)
 	httpReq.Header.Set("Accept", goipp.ContentType)
@@ -87,24 +92,421 @@ func (ippBackend) SubmitJob(ctx context.Context, printer model.Printer, job mode
 		defer resp.Body.Close()
 	}
 	if err != nil {
-		return err
+		return WrapTemporary("ipp-submit", printer.URI, err)
 	}
 	if resp.StatusCode/100 != 2 {
-		return errors.New(resp.Status)
+		if resp.StatusCode >= 500 {
+			return WrapTemporary("ipp-submit", printer.URI, errors.New(resp.Status))
+		}
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusNotImplemented {
+			return WrapUnsupported("ipp-submit", printer.URI, errors.New(resp.Status))
+		}
+		return WrapPermanent("ipp-submit", printer.URI, errors.New(resp.Status))
 	}
 	ippResp := &goipp.Message{}
 	if err := ippResp.Decode(resp.Body); err != nil {
-		return err
+		return WrapPermanent("ipp-decode", printer.URI, err)
 	}
 	status := goipp.Status(ippResp.Code)
 	if status >= goipp.StatusRedirectionOtherSite {
-		return errors.New(status.String())
+		s := int(status)
+		err := errors.New(status.String())
+		switch {
+		case s >= int(goipp.StatusErrorInternal):
+			return WrapTemporary("ipp-submit", printer.URI, err)
+		case status == goipp.StatusErrorDocumentFormatNotSupported || status == goipp.StatusErrorDocumentUnprintable || status == goipp.StatusErrorAttributesOrValues:
+			return WrapUnsupported("ipp-submit", printer.URI, err)
+		default:
+			return WrapPermanent("ipp-submit", printer.URI, err)
+		}
 	}
 	return nil
 }
 
 func (ippBackend) QuerySupplies(ctx context.Context, printer model.Printer) (SupplyStatus, error) {
-	return SupplyStatus{State: "unknown"}, nil
+	if strings.TrimSpace(printer.URI) == "" {
+		return SupplyStatus{State: "unknown"}, nil
+	}
+	httpURL, err := ippTransportURL(printer.URI)
+	if err != nil {
+		return SupplyStatus{State: "unknown"}, WrapUnsupported("ipp-supplies", printer.URI, err)
+	}
+
+	req := goipp.NewRequest(goipp.DefaultVersion, goipp.OpGetPrinterAttributes, uint32(time.Now().UnixNano()))
+	req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
+	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
+	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(printer.URI)))
+	req.Operation.Add(goipp.MakeAttr("requested-attributes", goipp.TagKeyword,
+		goipp.String("printer-state-reasons"),
+		goipp.String("printer-alert"),
+		goipp.String("printer-supply"),
+		goipp.String("printer-supply-description"),
+		goipp.String("marker-names"),
+		goipp.String("marker-types"),
+		goipp.String("marker-colors"),
+		goipp.String("marker-levels"),
+		goipp.String("marker-high-levels"),
+		goipp.String("marker-low-levels"),
+	))
+	payload, err := req.EncodeBytes()
+	if err != nil {
+		return SupplyStatus{State: "unknown"}, WrapPermanent("ipp-supplies", printer.URI, err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, httpURL, bytes.NewReader(payload))
+	if err != nil {
+		return SupplyStatus{State: "unknown"}, WrapPermanent("ipp-supplies", printer.URI, err)
+	}
+	httpReq.Header.Set("Content-Type", goipp.ContentType)
+	httpReq.Header.Set("Accept", goipp.ContentType)
+
+	client := &http.Client{Transport: ippTransport(printer.URI)}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return SupplyStatus{State: "unknown"}, WrapTemporary("ipp-supplies", printer.URI, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode/100 != 2 {
+		if resp.StatusCode >= 500 {
+			return SupplyStatus{State: "unknown"}, WrapTemporary("ipp-supplies", printer.URI, errors.New(resp.Status))
+		}
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusNotImplemented {
+			return SupplyStatus{State: "unknown"}, WrapUnsupported("ipp-supplies", printer.URI, errors.New(resp.Status))
+		}
+		return SupplyStatus{State: "unknown"}, WrapPermanent("ipp-supplies", printer.URI, errors.New(resp.Status))
+	}
+
+	ippResp := &goipp.Message{}
+	if err := ippResp.Decode(resp.Body); err != nil {
+		return SupplyStatus{State: "unknown"}, WrapPermanent("ipp-supplies", printer.URI, err)
+	}
+	status := goipp.Status(ippResp.Code)
+	if status >= goipp.StatusRedirectionOtherSite {
+		s := int(status)
+		err := errors.New(status.String())
+		switch {
+		case s >= int(goipp.StatusErrorInternal):
+			return SupplyStatus{State: "unknown"}, WrapTemporary("ipp-supplies", printer.URI, err)
+		case status == goipp.StatusErrorAttributesOrValues || status == goipp.StatusErrorOperationNotSupported:
+			return SupplyStatus{State: "unknown"}, WrapUnsupported("ipp-supplies", printer.URI, err)
+		default:
+			return SupplyStatus{State: "unknown"}, WrapPermanent("ipp-supplies", printer.URI, err)
+		}
+	}
+
+	attrs := ippResp.Printer
+	if len(attrs) == 0 {
+		for _, g := range ippResp.Groups {
+			if g.Tag == goipp.TagPrinterGroup {
+				attrs = append(attrs, g.Attrs...)
+			}
+		}
+	}
+	statusOut := ippSuppliesFromAttributes(attrs)
+	if statusOut.State != "unknown" || len(statusOut.Details) > 0 {
+		return statusOut, nil
+	}
+	if snmpStatus, snmpErr, ok := querySuppliesViaSNMP(ctx, printer); ok {
+		if snmpErr == nil || snmpStatus.State != "unknown" || len(snmpStatus.Details) > 0 {
+			return snmpStatus, snmpErr
+		}
+	}
+	return statusOut, nil
+}
+
+func ippSuppliesFromAttributes(attrs goipp.Attributes) SupplyStatus {
+	details := map[string]string{}
+	if len(attrs) == 0 {
+		return SupplyStatus{State: "unknown", Details: details}
+	}
+
+	supplyRaw := ippAttrStrings(attrs, "printer-supply")
+	supplyDesc := ippAttrStrings(attrs, "printer-supply-description")
+	for i, raw := range supplyRaw {
+		idx := i + 1
+		if parsed := parseSupplyIndex(raw); parsed > 0 {
+			idx = parsed
+		}
+		mergePrinterSupplyEntry(details, idx, raw)
+	}
+	for i, desc := range supplyDesc {
+		if desc == "" {
+			continue
+		}
+		idx := i + 1
+		setSupplyDetail(details, idx, "desc", desc)
+	}
+
+	names := ippAttrStrings(attrs, "marker-names")
+	types := ippAttrStrings(attrs, "marker-types")
+	colors := ippAttrStrings(attrs, "marker-colors")
+	levels := ippAttrInts(attrs, "marker-levels")
+	highs := ippAttrInts(attrs, "marker-high-levels")
+	count := maxInts(len(names), len(types), len(colors), len(levels), len(highs))
+	for i := 0; i < count; i++ {
+		idx := i + 1
+		desc := strings.TrimSpace(getAt(names, i))
+		if desc == "" {
+			desc = strings.TrimSpace(getAt(types, i))
+		}
+		if desc == "" {
+			desc = strings.TrimSpace(getAt(colors, i))
+		}
+		if desc != "" {
+			setSupplyDetail(details, idx, "desc", desc)
+		}
+		if i < len(levels) {
+			level := levels[i]
+			if level >= 0 {
+				setSupplyDetail(details, idx, "level", strconv.Itoa(level))
+			}
+			high := 0
+			if i < len(highs) {
+				high = highs[i]
+			}
+			if high > 0 {
+				setSupplyDetail(details, idx, "max", strconv.Itoa(high))
+				setSupplyDetail(details, idx, "percent", strconv.Itoa(clampPercent((level*100)/high)))
+			} else if level >= 0 && level <= 100 {
+				setSupplyDetail(details, idx, "max", "100")
+				setSupplyDetail(details, idx, "percent", strconv.Itoa(level))
+			}
+		}
+	}
+
+	state := supplyStateFromDetails(details)
+	if reason := ippSupplyStateFromReasons(ippAttrStrings(attrs, "printer-state-reasons"), ippAttrStrings(attrs, "printer-alert")); reason != "" {
+		state = reason
+	}
+	if state == "" {
+		if len(details) == 0 {
+			state = "unknown"
+		} else {
+			state = "ok"
+		}
+	}
+	return SupplyStatus{State: state, Details: details}
+}
+
+func parseSupplyIndex(raw string) int {
+	pairs := parseSupplyPairs(raw)
+	if v := strings.TrimSpace(pairs["index"]); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	if v := strings.TrimSpace(pairs["marker-index"]); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+func mergePrinterSupplyEntry(details map[string]string, idx int, raw string) {
+	if idx <= 0 {
+		return
+	}
+	pairs := parseSupplyPairs(raw)
+	for key, val := range pairs {
+		if val == "" {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "description", "desc", "name":
+			setSupplyDetail(details, idx, "desc", val)
+		case "level":
+			if n, err := strconv.Atoi(val); err == nil {
+				setSupplyDetail(details, idx, "level", strconv.Itoa(n))
+			}
+		case "max", "maxcapacity", "capacity", "max-capacity":
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				setSupplyDetail(details, idx, "max", strconv.Itoa(n))
+			}
+		case "percent", "percentage":
+			if n, err := strconv.Atoi(val); err == nil {
+				setSupplyDetail(details, idx, "percent", strconv.Itoa(clampPercent(n)))
+			}
+		}
+	}
+	maxVal, maxOK := supplyDetailInt(details, idx, "max")
+	levelVal, levelOK := supplyDetailInt(details, idx, "level")
+	if maxOK && levelOK && maxVal > 0 {
+		setSupplyDetail(details, idx, "percent", strconv.Itoa(clampPercent((levelVal*100)/maxVal)))
+	}
+}
+
+func parseSupplyPairs(raw string) map[string]string {
+	pairs := map[string]string{}
+	for _, token := range strings.Split(raw, ";") {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		if strings.Contains(token, "=") {
+			parts := strings.SplitN(token, "=", 2)
+			key := strings.ToLower(strings.TrimSpace(parts[0]))
+			val := ""
+			if len(parts) == 2 {
+				val = strings.TrimSpace(parts[1])
+			}
+			pairs[key] = val
+			continue
+		}
+		if _, exists := pairs["index"]; !exists {
+			pairs["index"] = token
+		}
+	}
+	return pairs
+}
+
+func setSupplyDetail(details map[string]string, idx int, key, value string) {
+	if details == nil || idx <= 0 {
+		return
+	}
+	key = strings.TrimSpace(strings.ToLower(key))
+	value = strings.TrimSpace(value)
+	if key == "" || value == "" {
+		return
+	}
+	details[fmt.Sprintf("supply.%d.%s", idx, key)] = value
+}
+
+func supplyDetailInt(details map[string]string, idx int, key string) (int, bool) {
+	if details == nil || idx <= 0 {
+		return 0, false
+	}
+	v := strings.TrimSpace(details[fmt.Sprintf("supply.%d.%s", idx, key)])
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+func supplyStateFromDetails(details map[string]string) string {
+	if len(details) == 0 {
+		return ""
+	}
+	lowest := 101
+	found := false
+	for key, raw := range details {
+		if !strings.HasSuffix(key, ".percent") {
+			continue
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil {
+			continue
+		}
+		n = clampPercent(n)
+		if n < lowest {
+			lowest = n
+		}
+		found = true
+	}
+	if !found {
+		return ""
+	}
+	if lowest <= 0 {
+		return "empty"
+	}
+	if lowest <= 10 {
+		return "low"
+	}
+	return "ok"
+}
+
+func ippSupplyStateFromReasons(reasons []string, alerts []string) string {
+	combined := append([]string{}, reasons...)
+	combined = append(combined, alerts...)
+	for _, raw := range combined {
+		v := strings.ToLower(strings.TrimSpace(raw))
+		if v == "" {
+			continue
+		}
+		if strings.Contains(v, "supply-empty") || strings.Contains(v, "toner-empty") || strings.Contains(v, "marker-empty") {
+			return "empty"
+		}
+		if strings.Contains(v, "supply-low") || strings.Contains(v, "toner-low") || strings.Contains(v, "marker-low") {
+			return "low"
+		}
+	}
+	return ""
+}
+
+func ippAttrStrings(attrs goipp.Attributes, name string) []string {
+	out := []string{}
+	for _, attr := range attrs {
+		if !strings.EqualFold(attr.Name, name) {
+			continue
+		}
+		for _, value := range attr.Values {
+			raw := strings.TrimSpace(value.V.String())
+			if raw != "" {
+				out = append(out, raw)
+			}
+		}
+	}
+	return out
+}
+
+func ippAttrInts(attrs goipp.Attributes, name string) []int {
+	out := []int{}
+	for _, attr := range attrs {
+		if !strings.EqualFold(attr.Name, name) {
+			continue
+		}
+		for _, value := range attr.Values {
+			if n, ok := ippValueInt(value.V); ok {
+				out = append(out, n)
+				continue
+			}
+			if n, err := strconv.Atoi(strings.TrimSpace(value.V.String())); err == nil {
+				out = append(out, n)
+			}
+		}
+	}
+	return out
+}
+
+func ippValueInt(value goipp.Value) (int, bool) {
+	switch v := value.(type) {
+	case goipp.Integer:
+		return int(v), true
+	default:
+		return 0, false
+	}
+}
+
+func getAt(values []string, idx int) string {
+	if idx < 0 || idx >= len(values) {
+		return ""
+	}
+	return values[idx]
+}
+
+func maxInts(values ...int) int {
+	max := 0
+	for _, v := range values {
+		if v > max {
+			max = v
+		}
+	}
+	return max
+}
+
+func clampPercent(v int) int {
+	if v < 0 {
+		return 0
+	}
+	if v > 100 {
+		return 100
+	}
+	return v
 }
 
 func ippTransport(uri string) *http.Transport {
@@ -112,12 +514,33 @@ func ippTransport(uri string) *http.Transport {
 	insecure := strings.ToLower(os.Getenv("CUPS_IPP_INSECURE"))
 	skipVerify := insecure == "1" || insecure == "true" || insecure == "yes" || insecure == "on"
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
-	if u != nil && strings.EqualFold(u.Scheme, "ipps") && skipVerify {
+	if u != nil && (strings.EqualFold(u.Scheme, "ipps") || strings.EqualFold(u.Scheme, "https")) && skipVerify {
 		tlsConfig.InsecureSkipVerify = true
 	}
 	return &http.Transport{
 		TLSClientConfig: tlsConfig,
 	}
+}
+
+func ippTransportURL(uri string) (string, error) {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return "", err
+	}
+	if u == nil {
+		return "", errors.New("invalid printer URI")
+	}
+	switch strings.ToLower(strings.TrimSpace(u.Scheme)) {
+	case "ipp":
+		u.Scheme = "http"
+	case "ipps":
+		u.Scheme = "https"
+	case "http", "https":
+		// Keep as-is.
+	default:
+		return "", fmt.Errorf("unsupported IPP scheme %q", u.Scheme)
+	}
+	return u.String(), nil
 }
 
 func buildJobAttributesFromOptions(optionsJSON string) []goipp.Attribute {
@@ -130,6 +553,11 @@ func buildJobAttributesFromOptions(optionsJSON string) []goipp.Attribute {
 	}
 	template := strings.TrimSpace(opts["finishing-template"])
 	ignoreFinishings := template != "" && !strings.EqualFold(template, "none")
+
+	// Avoid mutating the map during iteration below.
+	if mode := strings.ToLower(strings.TrimSpace(opts["output-mode"])); (mode == "color" || mode == "monochrome") && strings.TrimSpace(opts["print-color-mode"]) == "" {
+		opts["print-color-mode"] = mode
+	}
 	out := []goipp.Attribute{}
 	if ignoreFinishings {
 		col := goipp.Collection{}
@@ -137,29 +565,24 @@ func buildJobAttributesFromOptions(optionsJSON string) []goipp.Attribute {
 		out = append(out, goipp.MakeAttribute("finishings-col", goipp.TagBeginCollection, col))
 	}
 	for k, v := range opts {
+		lk := strings.ToLower(strings.TrimSpace(k))
+		if strings.HasPrefix(lk, "cups-") || strings.HasPrefix(lk, "custom.") || strings.HasSuffix(lk, "-supplied") || lk == "job-attribute-fidelity" {
+			continue
+		}
 		if v == "" {
 			continue
 		}
-		if k == "finishing-template" {
+		if lk == "finishing-template" || lk == "output-mode" {
 			continue
 		}
-		if k == "output-mode" {
-			mode := strings.ToLower(strings.TrimSpace(v))
-			if mode == "color" || mode == "monochrome" {
-				if _, ok := opts["print-color-mode"]; !ok {
-					opts["print-color-mode"] = mode
-				}
-			}
-			continue
-		}
-		switch k {
+		switch lk {
 		case "copies", "job-priority", "number-up", "number-of-retries", "retry-interval", "retry-time-out", "job-cancel-after":
 			if n, err := strconv.Atoi(v); err == nil {
-				out = append(out, goipp.MakeAttribute(k, goipp.TagInteger, goipp.Integer(n)))
+				out = append(out, goipp.MakeAttribute(lk, goipp.TagInteger, goipp.Integer(n)))
 			}
 		case "print-quality", "orientation-requested":
 			if n, err := strconv.Atoi(v); err == nil {
-				out = append(out, goipp.MakeAttribute(k, goipp.TagEnum, goipp.Integer(n)))
+				out = append(out, goipp.MakeAttribute(lk, goipp.TagEnum, goipp.Integer(n)))
 			}
 		case "finishings":
 			if ignoreFinishings {
@@ -170,11 +593,9 @@ func buildJobAttributesFromOptions(optionsJSON string) []goipp.Attribute {
 				for _, n := range enums {
 					vals = append(vals, goipp.Integer(n))
 				}
-				out = append(out, goipp.MakeAttr(k, goipp.TagEnum, vals[0], vals[1:]...))
+				out = append(out, goipp.MakeAttr(lk, goipp.TagEnum, vals[0], vals[1:]...))
 			} else if n, err := strconv.Atoi(v); err == nil {
-				out = append(out, goipp.MakeAttribute(k, goipp.TagEnum, goipp.Integer(n)))
-			} else {
-				out = append(out, goipp.MakeAttribute(k, goipp.TagKeyword, goipp.String(v)))
+				out = append(out, goipp.MakeAttribute(lk, goipp.TagEnum, goipp.Integer(n)))
 			}
 		case "page-ranges":
 			if ranges, ok := parseRangesList(v); ok {
@@ -182,30 +603,43 @@ func buildJobAttributesFromOptions(optionsJSON string) []goipp.Attribute {
 				for _, r := range ranges {
 					vals = append(vals, r)
 				}
-				out = append(out, goipp.MakeAttr(k, goipp.TagRange, vals[0], vals[1:]...))
-			} else {
-				out = append(out, goipp.MakeAttribute(k, goipp.TagKeyword, goipp.String(v)))
+				out = append(out, goipp.MakeAttr(lk, goipp.TagRange, vals[0], vals[1:]...))
 			}
 		case "job-sheets":
 			parts := splitList(v, 2)
-			if len(parts) == 1 {
-				out = append(out, goipp.MakeAttribute(k, goipp.TagKeyword, goipp.String(parts[0])))
-			} else if len(parts) > 1 {
+			if len(parts) > 0 {
 				vals := make([]goipp.Value, 0, len(parts))
 				for _, p := range parts {
 					vals = append(vals, goipp.String(p))
 				}
-				out = append(out, goipp.MakeAttr(k, goipp.TagKeyword, vals[0], vals[1:]...))
+				out = append(out, goipp.MakeAttr(lk, goipp.TagName, vals[0], vals[1:]...))
 			}
 		case "printer-resolution":
 			if res, ok := parseResolution(v); ok {
-				out = append(out, goipp.MakeAttribute(k, goipp.TagResolution, res))
+				out = append(out, goipp.MakeAttribute(lk, goipp.TagResolution, res))
 			}
 		default:
-			out = append(out, goipp.MakeAttribute(k, goipp.TagKeyword, goipp.String(v)))
+			if !isIPPJobTemplateKey(lk) {
+				continue
+			}
+			out = append(out, goipp.MakeAttribute(lk, goipp.TagKeyword, goipp.String(v)))
 		}
 	}
 	return out
+}
+
+func isIPPJobTemplateKey(name string) bool {
+	switch name {
+	case "media", "media-source", "media-type", "sides",
+		"print-color-mode", "output-bin",
+		"multiple-document-handling", "page-delivery", "print-scaling",
+		"number-up-layout", "print-as-raster",
+		"job-hold-until", "job-account-id", "job-accounting-user-id", "job-password",
+		"confirmation-sheet-print", "cover-sheet-info":
+		return true
+	default:
+		return false
+	}
 }
 
 func parseRange(value string) (goipp.Range, bool) {

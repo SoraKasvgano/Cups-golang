@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -12,6 +14,8 @@ import (
 
 	"cupsgolang/internal/cupsclient"
 )
+
+var errShowHelp = errors.New("show-help")
 
 type options struct {
 	printer     string
@@ -29,10 +33,18 @@ type options struct {
 	classAdd    string
 	classRemove string
 	extraOpts   map[string]string
+	removeOpts  []string
 }
 
 func main() {
-	opts := parseArgs(os.Args[1:])
+	opts, err := parseArgs(os.Args[1:])
+	if errors.Is(err, errShowHelp) {
+		usage()
+		return
+	}
+	if err != nil {
+		fail(err)
+	}
 	client := cupsclient.NewFromConfig(
 		cupsclient.WithServer(opts.server),
 		cupsclient.WithTLS(opts.encrypt),
@@ -46,7 +58,7 @@ func main() {
 		return
 	}
 
-	if opts.printer != "" || opts.deviceURI != "" || opts.description != "" || opts.location != "" {
+	if opts.printer != "" || opts.deviceURI != "" || opts.description != "" || opts.location != "" || len(opts.extraOpts) > 0 || len(opts.removeOpts) > 0 || opts.ppdFile != "" || opts.ppdName != "" {
 		if opts.printer == "" {
 			fail(fmt.Errorf("missing -p printer"))
 		}
@@ -80,107 +92,174 @@ func main() {
 	}
 }
 
+func usage() {
+	fmt.Fprintln(os.Stderr, "Usage: lpadmin [options]")
+	fmt.Fprintln(os.Stderr, "Options:")
+	fmt.Fprintln(os.Stderr, "  -E                      Encrypt connection or enable queue when used after -p")
+	fmt.Fprintln(os.Stderr, "  -h server[:port]        Connect to server")
+	fmt.Fprintln(os.Stderr, "  -U username             Authenticate as user")
+	fmt.Fprintln(os.Stderr, "  -p printer              Add/modify printer")
+	fmt.Fprintln(os.Stderr, "  -v device-uri           Set device URI")
+	fmt.Fprintln(os.Stderr, "  -m model                Set ppd-name")
+	fmt.Fprintln(os.Stderr, "  -P file                 Upload PPD file")
+	fmt.Fprintln(os.Stderr, "  -i file                 Alias for -P")
+	fmt.Fprintln(os.Stderr, "  -o name=value           Set default option")
+	fmt.Fprintln(os.Stderr, "  -R name                 Remove default option")
+	fmt.Fprintln(os.Stderr, "  -D info                 Set printer-info")
+	fmt.Fprintln(os.Stderr, "  -L location             Set printer-location")
+	fmt.Fprintln(os.Stderr, "  -c class                Add printer to class")
+	fmt.Fprintln(os.Stderr, "  -r class                Remove printer from class")
+	fmt.Fprintln(os.Stderr, "  -d printer              Set default destination")
+	fmt.Fprintln(os.Stderr, "  -x destination          Delete printer/class")
+	os.Exit(1)
+}
+
 func fail(err error) {
 	fmt.Fprintln(os.Stderr, "lpadmin:", err)
 	os.Exit(1)
 }
 
-func parseArgs(args []string) options {
+func parseArgs(args []string) (options, error) {
 	opts := options{}
-	seenDestOp := false
 	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "-h":
-			if i+1 < len(args) {
-				i++
-				opts.server = args[i]
-			}
-		case "-U":
-			if i+1 < len(args) {
-				i++
-				opts.user = args[i]
-			}
-		case "-p":
-			if i+1 < len(args) {
-				i++
-				opts.printer = args[i]
-				seenDestOp = true
-			}
-		case "-v":
-			if i+1 < len(args) {
-				i++
-				opts.deviceURI = args[i]
-				seenDestOp = true
-			}
-		case "-D":
-			if i+1 < len(args) {
-				i++
-				opts.description = args[i]
-				seenDestOp = true
-			}
-		case "-L":
-			if i+1 < len(args) {
-				i++
-				opts.location = args[i]
-				seenDestOp = true
-			}
-		case "-x":
-			if i+1 < len(args) {
-				i++
-				opts.deleteName = args[i]
-				seenDestOp = true
-			}
-		case "-P":
-			if i+1 < len(args) {
-				i++
-				opts.ppdFile = args[i]
-				seenDestOp = true
-			}
-		case "-m":
-			if i+1 < len(args) {
-				i++
-				opts.ppdName = args[i]
-				seenDestOp = true
-			}
-		case "-d":
-			if i+1 < len(args) {
-				i++
-				opts.defaultName = args[i]
-				seenDestOp = true
-			}
-		case "-E":
-			if !seenDestOp {
-				opts.encrypt = true
-			} else {
-				opts.enable = true
-			}
-		case "-o":
-			if i+1 < len(args) {
-				i++
-				name, val := parseOption(args[i])
-				if name != "" {
-					if opts.extraOpts == nil {
-						opts.extraOpts = map[string]string{}
-					}
-					opts.extraOpts[name] = val
+		arg := strings.TrimSpace(args[i])
+		if arg == "" {
+			continue
+		}
+		if arg == "--help" {
+			return opts, errShowHelp
+		}
+		if strings.HasPrefix(arg, "--") {
+			return opts, fmt.Errorf("unknown option %q", arg)
+		}
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			return opts, fmt.Errorf("unexpected argument %q", arg)
+		}
+
+		short := strings.TrimPrefix(arg, "-")
+		for pos := 0; pos < len(short); pos++ {
+			ch := short[pos]
+			rest := short[pos+1:]
+			consume := func(name byte) (string, error) {
+				if rest != "" {
+					pos = len(short)
+					return rest, nil
 				}
-				seenDestOp = true
-			}
-		case "-c":
-			if i+1 < len(args) {
+				if i+1 >= len(args) {
+					return "", fmt.Errorf("missing argument for -%c", name)
+				}
 				i++
-				opts.classAdd = args[i]
-				seenDestOp = true
+				return args[i], nil
 			}
-		case "-r":
-			if i+1 < len(args) {
-				i++
-				opts.classRemove = args[i]
-				seenDestOp = true
+			switch ch {
+			case 'h':
+				v, err := consume(ch)
+				if err != nil {
+					return opts, err
+				}
+				opts.server = strings.TrimSpace(v)
+			case 'U':
+				v, err := consume(ch)
+				if err != nil {
+					return opts, err
+				}
+				opts.user = strings.TrimSpace(v)
+			case 'p':
+				v, err := consume(ch)
+				if err != nil {
+					return opts, err
+				}
+				opts.printer = strings.TrimSpace(v)
+			case 'v':
+				v, err := consume(ch)
+				if err != nil {
+					return opts, err
+				}
+				opts.deviceURI = strings.TrimSpace(v)
+			case 'D':
+				v, err := consume(ch)
+				if err != nil {
+					return opts, err
+				}
+				opts.description = strings.TrimSpace(v)
+			case 'L':
+				v, err := consume(ch)
+				if err != nil {
+					return opts, err
+				}
+				opts.location = strings.TrimSpace(v)
+			case 'x':
+				v, err := consume(ch)
+				if err != nil {
+					return opts, err
+				}
+				opts.deleteName = strings.TrimSpace(v)
+			case 'P', 'i':
+				v, err := consume(ch)
+				if err != nil {
+					return opts, err
+				}
+				opts.ppdFile = strings.TrimSpace(v)
+			case 'm':
+				v, err := consume(ch)
+				if err != nil {
+					return opts, err
+				}
+				opts.ppdName = strings.TrimSpace(v)
+			case 'd':
+				v, err := consume(ch)
+				if err != nil {
+					return opts, err
+				}
+				opts.defaultName = strings.TrimSpace(v)
+			case 'E':
+				if strings.TrimSpace(opts.printer) == "" {
+					opts.encrypt = true
+				} else {
+					opts.enable = true
+				}
+			case 'o':
+				v, err := consume(ch)
+				if err != nil {
+					return opts, err
+				}
+				name, val := parseOption(v)
+				if name == "" {
+					return opts, fmt.Errorf("invalid -o value %q", v)
+				}
+				if opts.extraOpts == nil {
+					opts.extraOpts = map[string]string{}
+				}
+				opts.extraOpts[name] = val
+			case 'R':
+				v, err := consume(ch)
+				if err != nil {
+					return opts, err
+				}
+				for _, name := range splitList(v, 0) {
+					name = strings.TrimSpace(name)
+					if name != "" {
+						opts.removeOpts = append(opts.removeOpts, name)
+					}
+				}
+			case 'c':
+				v, err := consume(ch)
+				if err != nil {
+					return opts, err
+				}
+				opts.classAdd = strings.TrimSpace(v)
+			case 'r':
+				v, err := consume(ch)
+				if err != nil {
+					return opts, err
+				}
+				opts.classRemove = strings.TrimSpace(v)
+			default:
+				return opts, fmt.Errorf("unknown option \"-%c\"", ch)
 			}
 		}
 	}
-	return opts
+	return opts, nil
 }
 
 func addModifyPrinter(client *cupsclient.Client, opts options) error {
@@ -203,6 +282,7 @@ func addModifyPrinter(client *cupsclient.Client, opts options) error {
 		req.Printer.Add(goipp.MakeAttribute("printer-location", goipp.TagText, goipp.String(opts.location)))
 	}
 	applyLpadminOptions(req, opts.extraOpts)
+	applyLpadminRemovals(req, opts.removeOpts)
 	var payload *os.File
 	if opts.ppdFile != "" {
 		f, err := os.Open(opts.ppdFile)
@@ -237,6 +317,44 @@ func applyLpadminOptions(req *goipp.Message, opts map[string]string) {
 		}
 		req.Printer.Add(goipp.MakeAttr(attrName, tag, values[0], values[1:]...))
 	}
+}
+
+func applyLpadminRemovals(req *goipp.Message, names []string) {
+	if req == nil || len(names) == 0 {
+		return
+	}
+	seen := map[string]bool{}
+	for _, raw := range names {
+		attrName := normalizeLpadminRemoveOption(raw)
+		if attrName == "" {
+			continue
+		}
+		if seen[attrName] {
+			continue
+		}
+		seen[attrName] = true
+		req.Printer.Add(goipp.MakeAttribute(attrName, goipp.TagDeleteAttr, goipp.Void{}))
+	}
+}
+
+func normalizeLpadminRemoveOption(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return ""
+	}
+	switch name {
+	case "job-sheets":
+		return "job-sheets-default"
+	case "printer-error-policy", "printer-op-policy", "port-monitor", "printer-is-shared":
+		return name
+	}
+	if strings.HasSuffix(name, "-default") {
+		return name
+	}
+	if isJobDefaultOption(name) {
+		return name + "-default"
+	}
+	return name
 }
 
 func normalizeLpadminOption(name, value string) (string, goipp.Tag, []goipp.Value) {
@@ -427,6 +545,10 @@ func updateClassMembers(client *cupsclient.Client, printerName, classAdd, classR
 
 	memberSet := map[string]bool{}
 	for _, m := range members {
+		m = strings.TrimSpace(m)
+		if m == "" {
+			continue
+		}
 		memberSet[m] = true
 	}
 	if classAdd != "" {
@@ -474,7 +596,14 @@ func fetchClassMembers(client *cupsclient.Client, className string) ([]string, e
 		if !strings.EqualFold(name, className) {
 			continue
 		}
-		return attrValues(g.Attrs, "member-uris"), nil
+		uris := attrValues(g.Attrs, "member-uris")
+		members := make([]string, 0, len(uris))
+		for _, uri := range uris {
+			if n := destinationNameFromURI(uri); n != "" {
+				members = append(members, n)
+			}
+		}
+		return members, nil
 	}
 	return nil, nil
 }
@@ -499,4 +628,23 @@ func attrValues(attrs goipp.Attributes, name string) []string {
 		}
 	}
 	return out
+}
+
+func destinationNameFromURI(uri string) string {
+	uri = strings.TrimSpace(uri)
+	if uri == "" {
+		return ""
+	}
+	if u, err := url.Parse(uri); err == nil {
+		path := strings.Trim(u.Path, "/")
+		if path == "" {
+			return ""
+		}
+		parts := strings.Split(path, "/")
+		return strings.TrimSpace(parts[len(parts)-1])
+	}
+	if idx := strings.LastIndex(uri, "/"); idx >= 0 && idx+1 < len(uri) {
+		return strings.TrimSpace(uri[idx+1:])
+	}
+	return strings.TrimSpace(uri)
 }

@@ -118,6 +118,37 @@ func (s *Store) migrate(ctx context.Context) error {
                 updated_at DATETIME NOT NULL,
                 FOREIGN KEY (printer_id) REFERENCES printers(id) ON DELETE CASCADE
             )`,
+			`CREATE TABLE IF NOT EXISTS job_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                event TEXT NOT NULL,
+                details TEXT NOT NULL DEFAULT '',
+                created_at DATETIME NOT NULL,
+                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            )`,
+			`CREATE TABLE IF NOT EXISTS printer_options (
+                printer_id INTEGER NOT NULL,
+                option_key TEXT NOT NULL,
+                option_value TEXT NOT NULL DEFAULT '',
+                updated_at DATETIME NOT NULL,
+                PRIMARY KEY (printer_id, option_key),
+                FOREIGN KEY (printer_id) REFERENCES printers(id) ON DELETE CASCADE
+            )`,
+			`CREATE TABLE IF NOT EXISTS ppd_cache (
+                ppd_name TEXT PRIMARY KEY,
+                ppd_hash TEXT NOT NULL DEFAULT '',
+                ipp_attrs TEXT NOT NULL DEFAULT '',
+                updated_at DATETIME NOT NULL
+            )`,
+			`CREATE TABLE IF NOT EXISTS device_cache (
+                uri TEXT PRIMARY KEY,
+                info TEXT NOT NULL DEFAULT '',
+                make_model TEXT NOT NULL DEFAULT '',
+                device_class TEXT NOT NULL DEFAULT '',
+                device_id TEXT NOT NULL DEFAULT '',
+                location TEXT NOT NULL DEFAULT '',
+                updated_at DATETIME NOT NULL
+            )`,
 			`CREATE INDEX IF NOT EXISTS idx_jobs_printer_id ON jobs(printer_id)`,
 			`CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state)`,
 			`CREATE INDEX IF NOT EXISTS idx_documents_job_id ON documents(job_id)`,
@@ -128,6 +159,10 @@ func (s *Store) migrate(ctx context.Context) error {
 			`CREATE INDEX IF NOT EXISTS idx_subscriptions_job_id ON subscriptions(job_id)`,
 			`CREATE INDEX IF NOT EXISTS idx_notifications_subscription_id ON notifications(subscription_id)`,
 			`CREATE INDEX IF NOT EXISTS idx_printer_supplies_printer_id ON printer_supplies(printer_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_job_events_job_id ON job_events(job_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_job_events_created_at ON job_events(created_at)`,
+			`CREATE INDEX IF NOT EXISTS idx_printer_options_printer_id ON printer_options(printer_id)`,
+			`CREATE INDEX IF NOT EXISTS idx_device_cache_updated_at ON device_cache(updated_at)`,
 		}
 		for _, stmt := range stmts {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {

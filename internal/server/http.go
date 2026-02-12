@@ -38,17 +38,29 @@ func (s *Server) Handler() http.Handler {
 					http.Error(w, "Forbidden", http.StatusForbidden)
 					return
 				}
-				if limit.RequireUser || limit.RequireAdmin {
+				if limitRequiresAuth(limit) {
 					authType := s.authTypeForRequest(r, r.Method)
-					if !s.authorize(r, authType, limit.RequireAdmin) {
-						s.requireAuthOr401(w, r, limit.RequireAdmin, r.Method)
+					u, ok := s.authenticate(r, authType)
+					if !ok {
+						setAuthChallenge(w, authType)
+						http.Error(w, "Unauthorized", http.StatusUnauthorized)
+						return
+					}
+					if !userAllowedByLimit(u, "", limit) {
+						http.Error(w, "Forbidden", http.StatusForbidden)
 						return
 					}
 				}
-			} else if rule.RequireUser || rule.RequireAdmin {
+			} else if locationRequiresAuth(rule) {
 				authType := s.authTypeForRequest(r, r.Method)
-				if !s.authorize(r, authType, rule.RequireAdmin) {
-					s.requireAuthOr401(w, r, rule.RequireAdmin, r.Method)
+				u, ok := s.authenticate(r, authType)
+				if !ok {
+					setAuthChallenge(w, authType)
+					http.Error(w, "Unauthorized", http.StatusUnauthorized)
+					return
+				}
+				if !userAllowedByLocation(u, rule) {
+					http.Error(w, "Forbidden", http.StatusForbidden)
 					return
 				}
 			}

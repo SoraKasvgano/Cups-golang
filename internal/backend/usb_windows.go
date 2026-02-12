@@ -48,15 +48,15 @@ func listUSBDevices() ([]Device, error) {
 
 func submitUSBJob(printer model.Printer, filePath string) error {
 	if filePath == "" {
-		return ErrUnsupported
+		return WrapUnsupported("usb-submit", printer.URI, ErrUnsupported)
 	}
 	name := usbPrinterName(printer)
 	if name == "" {
-		return ErrUnsupported
+		return WrapUnsupported("usb-submit", printer.URI, ErrUnsupported)
 	}
 	handle, err := openPrinter(name)
 	if err != nil {
-		return err
+		return WrapTemporary("usb-open-printer", printer.URI, err)
 	}
 	defer closePrinter(handle)
 
@@ -66,18 +66,18 @@ func submitUSBJob(printer model.Printer, filePath string) error {
 	}
 	docID, err := startDocPrinter(handle, jobName)
 	if err != nil {
-		return err
+		return WrapTemporary("usb-start-doc", printer.URI, err)
 	}
 	defer endDocPrinter(handle, docID)
 
 	if err := startPagePrinter(handle); err != nil {
-		return err
+		return WrapTemporary("usb-start-page", printer.URI, err)
 	}
 	defer endPagePrinter(handle)
 
 	f, err := os.Open(filePath)
 	if err != nil {
-		return err
+		return WrapPermanent("usb-open", printer.URI, err)
 	}
 	defer f.Close()
 
@@ -86,14 +86,14 @@ func submitUSBJob(printer model.Printer, filePath string) error {
 		n, readErr := f.Read(buf)
 		if n > 0 {
 			if err := writePrinter(handle, buf[:n]); err != nil {
-				return err
+				return WrapTemporary("usb-write", printer.URI, err)
 			}
 		}
 		if readErr == io.EOF {
 			break
 		}
 		if readErr != nil {
-			return readErr
+			return WrapPermanent("usb-read", printer.URI, readErr)
 		}
 	}
 	return nil

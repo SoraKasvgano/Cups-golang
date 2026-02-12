@@ -31,11 +31,11 @@ func (socketBackend) ListDevices(ctx context.Context) ([]Device, error) {
 func (socketBackend) SubmitJob(ctx context.Context, printer model.Printer, job model.Job, doc model.Document, filePath string) error {
 	u, err := url.Parse(printer.URI)
 	if err != nil {
-		return err
+		return WrapUnsupported("socket-parse", printer.URI, err)
 	}
 	host := u.Host
 	if host == "" {
-		return fmt.Errorf("invalid socket uri")
+		return WrapUnsupported("socket-parse", printer.URI, fmt.Errorf("invalid socket uri"))
 	}
 	if !strings.Contains(host, ":") {
 		host = net.JoinHostPort(host, "9100")
@@ -43,7 +43,7 @@ func (socketBackend) SubmitJob(ctx context.Context, printer model.Printer, job m
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	conn, err := dialer.DialContext(ctx, "tcp", host)
 	if err != nil {
-		return err
+		return WrapTemporary("socket-connect", printer.URI, err)
 	}
 	defer conn.Close()
 	if deadline, ok := ctx.Deadline(); ok {
@@ -52,14 +52,20 @@ func (socketBackend) SubmitJob(ctx context.Context, printer model.Printer, job m
 
 	f, err := os.Open(filePath)
 	if err != nil {
-		return err
+		return WrapPermanent("socket-open", printer.URI, err)
 	}
 	defer f.Close()
 
 	_, err = io.Copy(conn, f)
-	return err
+	if err != nil {
+		return WrapTemporary("socket-write", printer.URI, err)
+	}
+	return nil
 }
 
 func (socketBackend) QuerySupplies(ctx context.Context, printer model.Printer) (SupplyStatus, error) {
+	if status, err, ok := querySuppliesViaSNMP(ctx, printer); ok {
+		return status, err
+	}
 	return SupplyStatus{State: "unknown"}, nil
 }

@@ -34,11 +34,11 @@ func (lpdBackend) ListDevices(ctx context.Context) ([]Device, error) {
 func (lpdBackend) SubmitJob(ctx context.Context, printer model.Printer, job model.Job, doc model.Document, filePath string) error {
 	u, err := url.Parse(printer.URI)
 	if err != nil {
-		return err
+		return WrapUnsupported("lpd-parse", printer.URI, err)
 	}
 	host := u.Host
 	if host == "" {
-		return fmt.Errorf("invalid lpd uri")
+		return WrapUnsupported("lpd-parse", printer.URI, fmt.Errorf("invalid lpd uri"))
 	}
 	if !strings.Contains(host, ":") {
 		host = net.JoinHostPort(host, "515")
@@ -51,7 +51,7 @@ func (lpdBackend) SubmitJob(ctx context.Context, printer model.Printer, job mode
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	conn, err := dialer.DialContext(ctx, "tcp", host)
 	if err != nil {
-		return err
+		return WrapTemporary("lpd-connect", printer.URI, err)
 	}
 	defer conn.Close()
 	if deadline, ok := ctx.Deadline(); ok {
@@ -60,7 +60,7 @@ func (lpdBackend) SubmitJob(ctx context.Context, printer model.Printer, job mode
 	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 
 	if err := lpdSendReceiveJob(rw, queue); err != nil {
-		return err
+		return WrapTemporary("lpd-send", printer.URI, err)
 	}
 
 	hostName, _ := os.Hostname()
@@ -91,15 +91,18 @@ func (lpdBackend) SubmitJob(ctx context.Context, printer model.Printer, job mode
 
 	control := buildLPDControl(hostName, user, title, dfName, banner, copies)
 	if err := lpdSendControl(rw, cfName, []byte(control)); err != nil {
-		return err
+		return WrapTemporary("lpd-control", printer.URI, err)
 	}
 	if err := lpdSendData(rw, dfName, filePath); err != nil {
-		return err
+		return WrapTemporary("lpd-data", printer.URI, err)
 	}
 	return nil
 }
 
 func (lpdBackend) QuerySupplies(ctx context.Context, printer model.Printer) (SupplyStatus, error) {
+	if status, err, ok := querySuppliesViaSNMP(ctx, printer); ok {
+		return status, err
+	}
 	return SupplyStatus{State: "unknown"}, nil
 }
 
