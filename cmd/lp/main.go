@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,27 +11,31 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	goipp "github.com/OpenPrinting/goipp"
 
 	"cupsgolang/internal/cupsclient"
 )
 
+var errShowHelp = errors.New("show-help")
+
 type options struct {
-	dest     string
-	copies   int
-	title    string
-	hold     string
-	jobID    string
-	priority int
-	user     string
-	server   string
-	encrypt  bool
-	silent   bool
-	opts     []string
-	files    []string
+	dest      string
+	copies    int
+	title     string
+	hold      string
+	jobID     string
+	priority  int
+	user      string
+	server    string
+	encrypt   bool
+	silent    bool
+	opts      []string
+	files     []string
 	docFormat string
 	raw       bool
+	warnings  []string
 }
 
 type lpOptionsFile struct {
@@ -40,10 +45,15 @@ type lpOptionsFile struct {
 
 func main() {
 	opts, err := parseArgs(os.Args[1:])
+	if errors.Is(err, errShowHelp) {
+		usage()
+		return
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "lp:", err)
 		os.Exit(1)
 	}
+	emitParseWarnings(opts)
 
 	store, err := loadLpOptions()
 	if err != nil {
@@ -128,105 +138,281 @@ func main() {
 	}
 }
 
+func emitParseWarnings(opts options) {
+	for _, warning := range opts.warnings {
+		warning = strings.TrimSpace(warning)
+		if warning == "" {
+			continue
+		}
+		fmt.Fprintln(os.Stderr, "lp: Warning -", warning)
+	}
+}
+
+func usage() {
+	fmt.Fprintln(os.Stderr, "Usage: lp [options] [--] [file ...]")
+	fmt.Fprintln(os.Stderr, "Options:")
+	fmt.Fprintln(os.Stderr, "  -E                      Encrypt connection")
+	fmt.Fprintln(os.Stderr, "  -h server[:port]        Connect to server")
+	fmt.Fprintln(os.Stderr, "  -U username             Authenticate as user")
+	fmt.Fprintln(os.Stderr, "  -d destination          Select destination")
+	fmt.Fprintln(os.Stderr, "  -n copies               Number of copies")
+	fmt.Fprintln(os.Stderr, "  -q priority             Job priority (1-100)")
+	fmt.Fprintln(os.Stderr, "  -t title                Set job title")
+	fmt.Fprintln(os.Stderr, "  -H when                Set hold-until")
+	fmt.Fprintln(os.Stderr, "  -P pages                Set page ranges")
+	fmt.Fprintln(os.Stderr, "  -o name=value           Set job option")
+	fmt.Fprintln(os.Stderr, "  -i job-id               Modify existing job")
+	fmt.Fprintln(os.Stderr, "  -m, -w                  Request notification mail")
+	fmt.Fprintln(os.Stderr, "  -s                      Silent mode")
+	os.Exit(1)
+}
+
 func parseArgs(args []string) (options, error) {
 	opts := options{}
 	seenOther := false
+	endOptions := false
 	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch arg {
-		case "-h":
-			if seenOther {
-				return opts, fmt.Errorf("-h must appear before all other options")
-			}
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("missing argument for -h")
-			}
-			i++
-			opts.server = args[i]
-		case "-E":
-			opts.encrypt = true
-		case "-U":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("missing argument for -U")
-			}
-			i++
-			opts.user = args[i]
-		case "-d":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("missing argument for -d")
-			}
-			i++
-			opts.dest = args[i]
-		case "-n":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("missing argument for -n")
-			}
-			i++
-			n, err := strconv.Atoi(args[i])
-			if err != nil {
-				return opts, fmt.Errorf("invalid copies")
-			}
-			opts.copies = n
-		case "-t":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("missing argument for -t")
-			}
-			i++
-			opts.title = args[i]
-		case "-o":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("missing argument for -o")
-			}
-			i++
-			opts.opts = append(opts.opts, args[i])
-		case "-H":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("missing argument for -H")
-			}
-			i++
-			opts.hold = args[i]
-		case "-i":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("missing argument for -i")
-			}
-			i++
-			opts.jobID = args[i]
-		case "-q":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("missing argument for -q")
-			}
-			i++
-			n, err := strconv.Atoi(args[i])
-			if err != nil {
-				return opts, fmt.Errorf("invalid priority")
-			}
-			opts.priority = n
-		case "-P":
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("missing argument for -P")
-			}
-			i++
-			opts.opts = append(opts.opts, "page-ranges="+args[i])
-		case "-m":
-			// mail when complete - not implemented, ignored.
-		case "-s":
-			opts.silent = true
-		case "--":
-			if i+1 < len(args) {
-				opts.files = append(opts.files, args[i+1:]...)
-			}
-			i = len(args)
-		default:
-			if strings.HasPrefix(arg, "-") {
+		arg := strings.TrimSpace(args[i])
+		if arg == "" {
+			continue
+		}
+		if !endOptions && arg == "--help" {
+			return opts, errShowHelp
+		}
+		if !endOptions && arg == "--" {
+			endOptions = true
+			continue
+		}
+		if !endOptions && strings.HasPrefix(arg, "-") && arg != "-" {
+			if strings.HasPrefix(arg, "--") {
 				return opts, fmt.Errorf("unknown option %s", arg)
 			}
+			short := strings.TrimPrefix(arg, "-")
+			for pos := 0; pos < len(short); pos++ {
+				ch := short[pos]
+				rest := short[pos+1:]
+				consume := func(name byte) (string, error) {
+					if rest != "" {
+						pos = len(short)
+						return rest, nil
+					}
+					if i+1 >= len(args) {
+						return "", fmt.Errorf("missing argument for -%c", name)
+					}
+					i++
+					return strings.TrimSpace(args[i]), nil
+				}
+				switch ch {
+				case 'h':
+					if seenOther {
+						return opts, fmt.Errorf("-h must appear before all other options")
+					}
+					v, err := consume(ch)
+					if err != nil {
+						return opts, err
+					}
+					opts.server = v
+				case 'E':
+					opts.encrypt = true
+				case 'U':
+					v, err := consume(ch)
+					if err != nil {
+						return opts, err
+					}
+					opts.user = v
+				case 'c':
+					// always spooled in CUPS; accepted for compatibility.
+				case 'd':
+					v, err := consume(ch)
+					if err != nil {
+						return opts, err
+					}
+					opts.dest = v
+				case 'f':
+					if _, err := consume(ch); err != nil {
+						return opts, err
+					}
+					opts.warnings = append(opts.warnings, "form option ignored.")
+				case 'y':
+					if _, err := consume(ch); err != nil {
+						return opts, err
+					}
+					opts.warnings = append(opts.warnings, "mode option ignored.")
+				case 'S':
+					if _, err := consume(ch); err != nil {
+						return opts, err
+					}
+					opts.warnings = append(opts.warnings, "character set option ignored.")
+				case 'T':
+					if _, err := consume(ch); err != nil {
+						return opts, err
+					}
+					opts.warnings = append(opts.warnings, "content type option ignored.")
+				case 'i':
+					v, err := consume(ch)
+					if err != nil {
+						return opts, err
+					}
+					if len(opts.files) > 0 {
+						return opts, fmt.Errorf("cannot print files and alter jobs simultaneously")
+					}
+					opts.jobID = v
+				case 'm', 'w':
+					appendOptionWords(&opts.opts, "notify-recipient-uri="+buildNotifyRecipientURI(opts.user))
+					opts.silent = true
+				case 'n':
+					v, err := consume(ch)
+					if err != nil {
+						return opts, err
+					}
+					n, err := strconv.Atoi(v)
+					if err != nil || n < 1 {
+						return opts, fmt.Errorf("copies must be 1 or more")
+					}
+					opts.copies = n
+				case 'o':
+					v, err := consume(ch)
+					if err != nil {
+						return opts, err
+					}
+					appendOptionWords(&opts.opts, v)
+				case 'p', 'q':
+					v, err := consume(ch)
+					if err != nil {
+						return opts, err
+					}
+					n, err := strconv.Atoi(v)
+					if err != nil || n < 1 || n > 100 {
+						return opts, fmt.Errorf("priority must be between 1 and 100")
+					}
+					opts.priority = n
+				case 's':
+					opts.silent = true
+				case 't':
+					v, err := consume(ch)
+					if err != nil {
+						return opts, err
+					}
+					opts.title = v
+				case 'H':
+					v, err := consume(ch)
+					if err != nil {
+						return opts, err
+					}
+					if strings.EqualFold(strings.TrimSpace(v), "restart") && strings.TrimSpace(opts.jobID) == "" {
+						return opts, fmt.Errorf("Need job ID (\"-i jobid\") before \"-H restart\".")
+					}
+					opts.hold = v
+				case 'P':
+					v, err := consume(ch)
+					if err != nil {
+						return opts, err
+					}
+					appendOptionWords(&opts.opts, "page-ranges="+v)
+				default:
+					return opts, fmt.Errorf("unknown option -%c", ch)
+				}
+				if ch != 'h' && ch != 'E' && ch != 'U' {
+					seenOther = true
+				}
+			}
+			continue
+		}
+
+		if arg == "-" {
+			if len(opts.files) > 0 || opts.jobID != "" {
+				return opts, fmt.Errorf("cannot print from stdin if files or a job ID are provided")
+			}
 			opts.files = append(opts.files, arg)
+			continue
 		}
-		if arg != "-h" && arg != "-E" && arg != "-U" {
-			seenOther = true
+		if opts.jobID != "" {
+			return opts, fmt.Errorf("cannot print files and alter jobs simultaneously")
 		}
+		opts.files = append(opts.files, arg)
 	}
 	return opts, nil
+}
+
+func appendOptionWords(dst *[]string, value string) {
+	if dst == nil {
+		return
+	}
+	for _, word := range splitOptionWords(value) {
+		if strings.TrimSpace(word) != "" {
+			*dst = append(*dst, word)
+		}
+	}
+}
+
+func buildNotifyRecipientURI(user string) string {
+	user = strings.TrimSpace(user)
+	if user == "" {
+		user = strings.TrimSpace(os.Getenv("CUPS_USER"))
+	}
+	if user == "" {
+		user = strings.TrimSpace(os.Getenv("USER"))
+	}
+	if user == "" {
+		user = strings.TrimSpace(os.Getenv("USERNAME"))
+	}
+	if user == "" {
+		user = "anonymous"
+	}
+	host, _ := os.Hostname()
+	host = strings.TrimSpace(host)
+	if host == "" {
+		host = "localhost"
+	}
+	return "mailto:" + user + "@" + host
+}
+
+func splitOptionWords(value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	out := []string{}
+	var current strings.Builder
+	quote := rune(0)
+	escaped := false
+	flush := func() {
+		if current.Len() == 0 {
+			return
+		}
+		out = append(out, current.String())
+		current.Reset()
+	}
+	for _, r := range value {
+		if escaped {
+			current.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+				continue
+			}
+			current.WriteRune(r)
+			continue
+		}
+		if r == '\'' || r == '"' {
+			quote = r
+			continue
+		}
+		if unicode.IsSpace(r) {
+			flush()
+			continue
+		}
+		current.WriteRune(r)
+	}
+	flush()
+	return out
 }
 
 func resolveDest(dest string, store *lpOptionsFile) string {
@@ -353,12 +539,21 @@ func sendDocument(client *cupsclient.Client, user string, jobID int, fileName st
 
 func modifyJob(client *cupsclient.Client, user string, jobID int, opts options) error {
 	hold := strings.ToLower(strings.TrimSpace(opts.hold))
-	hasChanges := opts.title != "" || opts.priority > 0 || len(opts.opts) > 0 || hold != ""
-
-	if hold != "" && !hasChanges {
+	hadRestart := false
+	if hold == "restart" {
+		if err := restartJob(client, user, jobID); err != nil {
+			return err
+		}
+		hadRestart = true
 		hold = ""
 	}
-
+	hasChanges := opts.title != "" || opts.priority > 0 || len(opts.opts) > 0 || hold != ""
+	if !hasChanges {
+		if hadRestart {
+			return nil
+		}
+		return nil
+	}
 	if hold != "" && !hasOtherChanges(opts) {
 		switch hold {
 		case "resume", "release", "no-hold":
@@ -407,6 +602,24 @@ func modifyJob(client *cupsclient.Client, user string, jobID int, opts options) 
 
 func hasOtherChanges(opts options) bool {
 	return opts.title != "" || opts.priority > 0 || len(opts.opts) > 0
+}
+
+func restartJob(client *cupsclient.Client, user string, jobID int) error {
+	req := goipp.NewRequest(goipp.DefaultVersion, goipp.OpRestartJob, uint32(time.Now().UnixNano()))
+	req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
+	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
+	req.Operation.Add(goipp.MakeAttribute("job-id", goipp.TagInteger, goipp.Integer(jobID)))
+	if user != "" {
+		req.Operation.Add(goipp.MakeAttribute("requesting-user-name", goipp.TagName, goipp.String(user)))
+	}
+	resp, err := client.Send(context.Background(), req, nil)
+	if err != nil {
+		return err
+	}
+	if goipp.Status(resp.Code) >= goipp.StatusRedirectionOtherSite {
+		return fmt.Errorf("%s", goipp.Status(resp.Code))
+	}
+	return nil
 }
 
 func holdJob(client *cupsclient.Client, user string, jobID int, holdValue string) error {
@@ -557,6 +770,8 @@ func addJobOption(req *goipp.Message, key, val string) {
 			vals = append(vals, goipp.String(p))
 		}
 		req.Job.Add(goipp.MakeAttr(key, goipp.TagName, vals[0], vals[1:]...))
+	case "notify-recipient-uri":
+		req.Job.Add(goipp.MakeAttribute(key, goipp.TagURI, goipp.String(val)))
 	default:
 		req.Job.Add(goipp.MakeAttribute(key, goipp.TagKeyword, goipp.String(val)))
 	}

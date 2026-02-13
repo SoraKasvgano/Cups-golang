@@ -2463,9 +2463,9 @@ func (s *Server) handleGetNotifications(ctx context.Context, r *http.Request, re
 	}
 
 	type subWithNotes struct {
-		sub   model.Subscription
-		notes []model.Notification
-		min   int64
+		sub        model.Subscription
+		notes      []model.Notification
+		printerURI string
 	}
 	collected := []subWithNotes{}
 	interval := 60
@@ -2493,7 +2493,7 @@ func (s *Server) handleGetNotifications(ctx context.Context, r *http.Request, re
 					filtered = append(filtered, n)
 				}
 			}
-			collected = append(collected, subWithNotes{sub: sub, notes: filtered, min: minSeq})
+			item := subWithNotes{sub: sub, notes: filtered}
 
 			if sub.JobID.Valid {
 				job, err := s.Store.GetJob(ctx, tx, sub.JobID.Int64)
@@ -2507,15 +2507,22 @@ func (s *Server) handleGetNotifications(ctx context.Context, r *http.Request, re
 						interval = 10
 					}
 				}
-			} else if sub.PrinterID.Valid {
+			}
+			if sub.PrinterID.Valid {
 				printer, err := s.Store.GetPrinterByID(ctx, tx, sub.PrinterID.Int64)
 				if err != nil && !errors.Is(err, sql.ErrNoRows) {
 					return err
 				}
-				if err == nil && printer.State == 4 && interval > 30 {
-					interval = 30
+				if err == nil {
+					if printer.State == 4 && interval > 30 {
+						interval = 30
+					}
+					if r != nil {
+						item.printerURI = printerURIFor(printer, r)
+					}
 				}
 			}
+			collected = append(collected, item)
 		}
 		return nil
 	})
@@ -2529,8 +2536,9 @@ func (s *Server) handleGetNotifications(ctx context.Context, r *http.Request, re
 		return nil, err
 	}
 
+	now := time.Now().Unix()
 	opAttrs := buildOperationDefaults()
-	opAttrs.Add(goipp.MakeAttribute("printer-up-time", goipp.TagInteger, goipp.Integer(time.Now().Unix())))
+	opAttrs.Add(goipp.MakeAttribute("printer-up-time", goipp.TagInteger, goipp.Integer(now)))
 	if interval > 0 {
 		opAttrs.Add(goipp.MakeAttribute("notify-get-interval", goipp.TagInteger, goipp.Integer(interval)))
 	}
@@ -2550,7 +2558,17 @@ func (s *Server) handleGetNotifications(ctx context.Context, r *http.Request, re
 			if sub.LeaseSecs > 0 {
 				attrs.Add(goipp.MakeAttribute("notify-lease-expiration-time", goipp.TagInteger, goipp.Integer(sub.CreatedAt.Add(time.Duration(sub.LeaseSecs)*time.Second).Unix())))
 			}
+			attrs.Add(goipp.MakeAttribute("notify-printer-up-time", goipp.TagInteger, goipp.Integer(now)))
 			attrs.Add(goipp.MakeAttribute("printer-state-change-time", goipp.TagInteger, goipp.Integer(n.CreatedAt.Unix())))
+			if sub.JobID.Valid {
+				attrs.Add(goipp.MakeAttribute("notify-job-id", goipp.TagInteger, goipp.Integer(sub.JobID.Int64)))
+			}
+			if item.printerURI != "" {
+				attrs.Add(goipp.MakeAttribute("notify-printer-uri", goipp.TagURI, goipp.String(item.printerURI)))
+			}
+			if uuid := subscriptionUUIDFor(sub, r); uuid != "" {
+				attrs.Add(goipp.MakeAttribute("notify-subscription-uuid", goipp.TagURI, goipp.String(uuid)))
+			}
 			user := strings.TrimSpace(sub.Owner)
 			if user == "" {
 				user = "anonymous"
@@ -2609,63 +2627,132 @@ func (s *Server) handleGetSubscriptionAttributes(ctx context.Context, r *http.Re
 	return resp, nil
 }
 
+type subscriptionScopeKind int
+
+const (
+	subscriptionScopeAll subscriptionScopeKind = iota
+	subscriptionScopePrinter
+	subscriptionScopeClass
+	subscriptionScopeJob
+)
+
+func parseSubscriptionScopeURI(raw string) (subscriptionScopeKind, string, int64, bool) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return subscriptionScopeAll, "", 0, false
+	}
+	resource := strings.TrimSpace(u.Path)
+	if resource == "" {
+		resource = "/"
+	}
+	resource = path.Clean(resource)
+	if resource == "." {
+		resource = "/"
+	}
+	if !strings.HasPrefix(resource, "/") {
+		resource = "/" + resource
+	}
+
+	switch resource {
+	case "/", "/jobs", "/printers", "/classes":
+		return subscriptionScopeAll, "", 0, true
+	}
+
+	if strings.HasPrefix(resource, "/jobs/") {
+		rest := strings.TrimPrefix(resource, "/jobs/")
+		if rest == "" || strings.Contains(rest, "/") {
+			return subscriptionScopeAll, "", 0, false
+		}
+		jobID, err := strconv.ParseInt(rest, 10, 64)
+		if err != nil || jobID <= 0 {
+			return subscriptionScopeAll, "", 0, false
+		}
+		return subscriptionScopeJob, "", jobID, true
+	}
+
+	if strings.HasPrefix(resource, "/printers/") {
+		name := strings.TrimSpace(strings.TrimPrefix(resource, "/printers/"))
+		if name == "" || strings.Contains(name, "/") {
+			return subscriptionScopeAll, "", 0, false
+		}
+		return subscriptionScopePrinter, name, 0, true
+	}
+
+	if strings.HasPrefix(resource, "/classes/") {
+		name := strings.TrimSpace(strings.TrimPrefix(resource, "/classes/"))
+		if name == "" || strings.Contains(name, "/") {
+			return subscriptionScopeAll, "", 0, false
+		}
+		return subscriptionScopeClass, name, 0, true
+	}
+
+	return subscriptionScopeAll, "", 0, false
+}
+
 func (s *Server) handleGetSubscriptions(ctx context.Context, r *http.Request, req *goipp.Message) (*goipp.Message, error) {
+	scopeURI := strings.TrimSpace(attrString(req.Operation, "printer-uri"))
+	if scopeURI == "" {
+		scopeURI = strings.TrimSpace(attrString(req.Operation, "job-uri"))
+	}
+	if scopeURI == "" {
+		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+	}
+
+	scopeKind, scopeName, scopeJobID, ok := parseSubscriptionScopeURI(scopeURI)
+	if !ok {
+		return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
+	}
+
 	var printerID *int64
 	var jobID *int64
-
-	if uri := attrString(req.Operation, "job-uri"); uri != "" {
-		if id := jobIDFromURI(uri); id != 0 {
+	classScoped := false
+	err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
+		switch scopeKind {
+		case subscriptionScopePrinter:
+			p, err := s.Store.GetPrinterByName(ctx, tx, scopeName)
+			if err != nil {
+				return err
+			}
+			id := p.ID
+			printerID = &id
+		case subscriptionScopeClass:
+			if _, err := s.Store.GetClassByName(ctx, tx, scopeName); err != nil {
+				return err
+			}
+			classScoped = true
+		case subscriptionScopeJob:
+			id := scopeJobID
 			jobID = &id
 		}
-	}
-	if jobID == nil {
-		if id := attrInt(req.Subscription, "notify-job-id"); id != 0 {
-			jobID = &id
-		} else if id := attrInt(req.Operation, "notify-job-id"); id != 0 {
-			jobID = &id
-		} else if id := attrInt(req.Operation, "job-id"); id != 0 {
-			jobID = &id
-		}
-	}
 
-	if jobID != nil {
-		err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
+		if scopeKind == subscriptionScopePrinter || scopeKind == subscriptionScopeClass {
+			if id := attrInt(req.Operation, "notify-job-id"); id != 0 {
+				v := id
+				jobID = &v
+			}
+		}
+		if jobID == nil {
+			if id := attrInt(req.Subscription, "notify-job-id"); id != 0 {
+				v := id
+				jobID = &v
+			} else if id := attrInt(req.Operation, "job-id"); id != 0 {
+				v := id
+				jobID = &v
+			}
+		}
+		if jobID != nil {
 			_, err := s.Store.GetJob(ctx, tx, *jobID)
-			return err
-		})
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
-			}
-			return nil, err
-		}
-	}
-
-	if printerID == nil && jobID == nil {
-		if uri := attrString(req.Operation, "printer-uri"); uri != "" {
-			if u, err := url.Parse(uri); err == nil {
-				if strings.HasPrefix(u.Path, "/printers/") {
-					name := strings.TrimPrefix(u.Path, "/printers/")
-					if name != "" {
-						err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
-							p, err := s.Store.GetPrinterByName(ctx, tx, name)
-							if err != nil {
-								return err
-							}
-							id := p.ID
-							printerID = &id
-							return nil
-						})
-						if err != nil {
-							if errors.Is(err, sql.ErrNoRows) {
-								return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
-							}
-							return nil, err
-						}
-					}
-				}
+			if err != nil {
+				return err
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
+		}
+		return nil, err
 	}
 
 	limit := clampLimit(attrInt(req.Operation, "limit"), 0, 0, 1000000)
@@ -2681,8 +2768,16 @@ func (s *Server) handleGetSubscriptions(ctx context.Context, r *http.Request, re
 		}
 	}
 
+	if classScoped {
+		// Class-target subscriptions are not persisted separately yet.
+		return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
+	}
+
 	var subs []model.Subscription
-	err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
+	err = s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
+		if err := s.Store.PruneExpiredSubscriptions(ctx, tx); err != nil {
+			return err
+		}
 		var err error
 		subs, err = s.Store.ListSubscriptions(ctx, tx, printerID, jobID, owner, limit)
 		return err
@@ -3416,43 +3511,66 @@ func (s *Server) handleGetDocuments(ctx context.Context, r *http.Request, req *g
 func (s *Server) handleGetDocumentAttributes(ctx context.Context, r *http.Request, req *goipp.Message) (*goipp.Message, error) {
 	jobID := int64(0)
 	docNum := 0
-	docURI := attrString(req.Operation, "document-uri")
+	docURI := strings.TrimSpace(attrString(req.Operation, "document-uri"))
+	docNumberAttr := attrByName(req.Operation, "document-number")
+
 	if docURI != "" {
-		jobID, docNum = parseDocumentURI(docURI)
-	}
-	if jobID == 0 {
-		if uri := attrString(req.Operation, "job-uri"); uri != "" {
+		var ok bool
+		if jobID, docNum, ok = parseDocumentURIStrict(docURI); !ok {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+		}
+		if docNumberAttr != nil {
+			if len(docNumberAttr.Values) != 1 {
+				return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+			}
+			n, ok := valueInt(docNumberAttr.Values[0].V)
+			if !ok || n <= 0 || n != docNum {
+				return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+			}
+		}
+		if id := attrInt(req.Operation, "job-id"); id != 0 && id != jobID {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+		}
+		if uri := strings.TrimSpace(attrString(req.Operation, "job-uri")); uri != "" {
+			if parsed := jobIDFromURI(uri); parsed == 0 || parsed != jobID {
+				return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+			}
+		}
+	} else {
+		if docNumberAttr == nil {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+		}
+		if len(docNumberAttr.Values) != 1 {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
+		}
+		n, ok := valueInt(docNumberAttr.Values[0].V)
+		if !ok {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+		}
+		docNum = n
+		if docNum <= 0 {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
+		}
+		if uri := strings.TrimSpace(attrString(req.Operation, "job-uri")); uri != "" {
 			jobID = jobIDFromURI(uri)
-		} else if uri := attrString(req.Operation, "printer-uri"); uri != "" {
+			if jobID == 0 {
+				return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+			}
+			if id := attrInt(req.Operation, "job-id"); id != 0 && id != jobID {
+				return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+			}
+		} else if strings.TrimSpace(attrString(req.Operation, "printer-uri")) != "" {
 			jobID = attrInt(req.Operation, "job-id")
 			if jobID == 0 {
 				return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
 			}
+		} else {
+			jobID = attrInt(req.Operation, "job-id")
 		}
 	}
-	if jobID == 0 {
-		jobID = attrInt(req.Operation, "job-id")
-	}
+
 	if jobID == 0 {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
-	}
-	if docURI == "" {
-		docAttr := attrByName(req.Operation, "document-number")
-		if docAttr == nil {
-			return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
-		}
-		if len(docAttr.Values) != 1 {
-			return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
-		}
-		if v, ok := docAttr.Values[0].V.(goipp.Integer); ok {
-			docNum = int(v)
-		} else {
-			if parsed, err := strconv.Atoi(docAttr.Values[0].V.String()); err == nil {
-				docNum = parsed
-			} else {
-				return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
-			}
-		}
 	}
 	if docNum <= 0 {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
@@ -4689,6 +4807,39 @@ func (s *Server) handleValidateJob(ctx context.Context, r *http.Request, req *go
 }
 
 func (s *Server) handleValidateDocument(ctx context.Context, r *http.Request, req *goipp.Message) (*goipp.Message, error) {
+	userName := attrString(req.Operation, "requesting-user-name")
+	if userName == "" {
+		userName = "anonymous"
+	}
+	dest, err := s.resolveDestination(ctx, r, req)
+	if err != nil {
+		return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
+	}
+	if dest.IsClass && !s.userAllowedForClass(ctx, dest.Class, userName) {
+		return goipp.NewResponse(req.Version, goipp.StatusErrorNotAuthorized, req.RequestID), nil
+	}
+	printer := dest.Printer
+	if dest.IsClass {
+		if !dest.Class.Accepting {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorNotAcceptingJobs, req.RequestID), nil
+		}
+		printer, err = s.selectClassMember(ctx, dest.Class.ID)
+		if err != nil {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorNotAcceptingJobs, req.RequestID), nil
+		}
+		printer = applyClassDefaultsToPrinter(printer, dest.Class)
+	}
+	if !printer.Accepting {
+		return goipp.NewResponse(req.Version, goipp.StatusErrorNotAcceptingJobs, req.RequestID), nil
+	}
+	if !s.userAllowedForPrinter(ctx, printer, userName) {
+		return goipp.NewResponse(req.Version, goipp.StatusErrorNotAuthorized, req.RequestID), nil
+	}
+	if err := s.enforceAuthInfo(r, req, goipp.OpValidateDocument); err != nil {
+		return nil, err
+	}
+	stripReadOnlyJobAttributes(req)
+
 	docFormat := attrString(req.Operation, "document-format")
 	if docFormat == "" {
 		docFormat = "application/octet-stream"
@@ -4706,8 +4857,34 @@ func (s *Server) handleValidateDocument(ctx context.Context, r *http.Request, re
 		resp.Unsupported.Add(goipp.MakeAttribute("document-format", goipp.TagMimeType, goipp.String(docFormat)))
 		return resp, nil
 	}
+
+	warn, err := validateRequestOptions(req, printer)
+	if err != nil {
+		if errors.Is(err, errBadRequest) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+		}
+		if errors.Is(err, errConflicting) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorConflicting, req.RequestID), nil
+		}
+		if errors.Is(err, errPPDConstraint) || errors.Is(err, errUnsupported) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorAttributesOrValues, req.RequestID), nil
+		}
+		return nil, err
+	}
+
+	if _, err := compressionFromRequest(req); err != nil {
+		if errors.Is(err, errBadRequest) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+		}
+		if errors.Is(err, errUnsupported) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorAttributesOrValues, req.RequestID), nil
+		}
+		return nil, err
+	}
+
 	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
 	addOperationDefaults(resp)
+	applyWarning(resp, warn)
 	return resp, nil
 }
 
@@ -14568,23 +14745,41 @@ func documentURIFor(jobID int64, docNum int64, r *http.Request) string {
 }
 
 func parseDocumentURI(uri string) (int64, int) {
-	if uri == "" {
+	jobID, docNum, ok := parseDocumentURIStrict(uri)
+	if !ok {
 		return 0, 0
+	}
+	return jobID, docNum
+}
+
+func parseDocumentURIStrict(uri string) (int64, int, bool) {
+	if strings.TrimSpace(uri) == "" {
+		return 0, 0, false
 	}
 	u, err := url.Parse(uri)
 	if err != nil {
-		return 0, 0
+		return 0, 0, false
 	}
-	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	if len(parts) < 4 {
-		return 0, 0
+	resource := path.Clean(strings.TrimSpace(u.Path))
+	if resource == "." {
+		resource = "/"
+	}
+	parts := strings.Split(strings.Trim(resource, "/"), "/")
+	if len(parts) != 4 {
+		return 0, 0, false
 	}
 	if parts[0] != "jobs" || parts[2] != "documents" {
-		return 0, 0
+		return 0, 0, false
 	}
-	jobID, _ := strconv.ParseInt(parts[1], 10, 64)
-	docNum, _ := strconv.Atoi(parts[3])
-	return jobID, docNum
+	jobID, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || jobID <= 0 {
+		return 0, 0, false
+	}
+	docNum, err := strconv.Atoi(parts[3])
+	if err != nil || docNum <= 0 {
+		return 0, 0, false
+	}
+	return jobID, docNum, true
 }
 
 func documentStateForJob(jobState int) int {
