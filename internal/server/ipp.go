@@ -362,10 +362,7 @@ func (s *Server) ippPolicyCheckContexts(ctx context.Context, r *http.Request, re
 	// CUPS-Move-Job is special: it checks the destination printer policy,
 	// but uses the job owner for the @OWNER check.
 	if op == goipp.OpCupsMoveJob {
-		destURI := attrString(req.Operation, "printer-uri")
-		if destURI == "" {
-			destURI = attrString(req.Operation, "printer-uri-destination")
-		}
+		destURI := strings.TrimSpace(attrString(req.Job, "job-printer-uri"))
 		if jobID == 0 || strings.TrimSpace(destURI) == "" {
 			return []ippPolicyCheckContext{ctxItem}, nil
 		}
@@ -834,67 +831,41 @@ func (s *Server) handleGetPrinterSupportedValues(ctx context.Context, r *http.Re
 		printer = applyClassDefaultsToPrinter(printer, dest.Class)
 	}
 	attrs := supportedValueAttributes(printer, isClass)
-	requested, all := requestedAttributes(req)
-	if all {
-		for _, attr := range attrs {
-			resp.Printer.Add(attr)
-		}
-		return resp, nil
-	}
 	for _, attr := range attrs {
-		if requested[attr.Name] {
-			resp.Printer.Add(attr)
-		}
+		resp.Printer.Add(attr)
 	}
 	return resp, nil
 }
 
 func (s *Server) handleSetPrinterAttributes(ctx context.Context, r *http.Request, req *goipp.Message) (*goipp.Message, error) {
-	printer, err := s.resolvePrinter(ctx, r, req)
+	dest, err := s.resolveDestination(ctx, r, req)
 	if err != nil {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
 	}
 
-	infoVal, infoOk := attrValue(req.Printer, "printer-info")
-	locVal, locOk := attrValue(req.Printer, "printer-location")
-	geoVal, geoOk := attrValue(req.Printer, "printer-geo-location")
-	orgVal, orgOk := attrValue(req.Printer, "printer-organization")
-	orgUnitVal, orgUnitOk := attrValue(req.Printer, "printer-organizational-unit")
-	defaultOpts, jobSheetsDefault, jobSheetsOk, sharedPtr := collectPrinterDefaultOptions(req.Printer)
-
-	// Match CUPS behavior: you cannot save (persistent) default values for a
-	// temporary queue.
-	if printer.IsTemporary && (sharedPtr != nil || jobSheetsOk || len(defaultOpts) > 0) {
-		attrName := "printer-defaults"
-		switch {
-		case sharedPtr != nil:
-			attrName = "printer-is-shared"
-		case jobSheetsOk:
-			attrName = "job-sheets-default"
-		case len(defaultOpts) > 0:
-			keys := make([]string, 0, len(defaultOpts))
-			for k := range defaultOpts {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			if len(keys) > 0 {
-				attrName = keys[0]
-			}
+	firstAttr := func(name string) (string, bool) {
+		if v, ok := attrValue(req.Printer, name); ok {
+			return strings.TrimSpace(v), true
 		}
-		resp := goipp.NewResponse(req.Version, goipp.StatusErrorNotPossible, req.RequestID)
-		addOperationDefaults(resp)
-		resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String(fmt.Sprintf("Unable to save value for \"%s\" with a temporary printer.", attrName))))
-		return resp, nil
+		if v, ok := attrValue(req.Operation, name); ok {
+			return strings.TrimSpace(v), true
+		}
+		return "", false
 	}
 
 	var infoPtr, locPtr, geoPtr, orgPtr, orgUnitPtr *string
+	infoVal, infoOk := firstAttr("printer-info")
+	locVal, locOk := firstAttr("printer-location")
+	geoVal, geoOk := firstAttr("printer-geo-location")
+	orgVal, orgOk := firstAttr("printer-organization")
+	orgUnitVal, orgUnitOk := firstAttr("printer-organizational-unit")
 	if infoOk {
 		infoPtr = &infoVal
 	}
 	if locOk {
 		locPtr = &locVal
 	}
-	if geoOk {
+	if geoOk && strings.HasPrefix(strings.ToLower(geoVal), "geo:") {
 		geoPtr = &geoVal
 	}
 	if orgOk {
@@ -905,32 +876,10 @@ func (s *Server) handleSetPrinterAttributes(ctx context.Context, r *http.Request
 	}
 
 	err = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
-		if err := s.Store.UpdatePrinterAttributes(ctx, tx, printer.ID, infoPtr, locPtr, geoPtr, orgPtr, orgUnitPtr); err != nil {
-			return err
+		if dest.IsClass {
+			return s.Store.UpdateClassAttributes(ctx, tx, dest.Class.ID, infoPtr, locPtr)
 		}
-		if sharedPtr != nil {
-			if err := s.Store.UpdatePrinterSharing(ctx, tx, printer.ID, *sharedPtr); err != nil {
-				return err
-			}
-		}
-		if jobSheetsOk {
-			if err := s.Store.UpdatePrinterJobSheetsDefault(ctx, tx, printer.ID, jobSheetsDefault); err != nil {
-				return err
-			}
-		}
-		if len(defaultOpts) > 0 {
-			if jobSheetsOk {
-				defaultOpts["job-sheets"] = jobSheetsDefault
-			}
-			merged := parseJobOptions(printer.DefaultOptions)
-			applyDefaultOptionUpdates(merged, defaultOpts)
-			if b, err := json.Marshal(merged); err == nil {
-				if err := s.Store.UpdatePrinterDefaultOptions(ctx, tx, printer.ID, string(b)); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
+		return s.Store.UpdatePrinterAttributes(ctx, tx, dest.Printer.ID, infoPtr, locPtr, geoPtr, orgPtr, orgUnitPtr)
 	})
 	if err != nil {
 		return nil, err
@@ -1825,20 +1774,18 @@ func (s *Server) handleCupsMoveJob(ctx context.Context, r *http.Request, req *go
 	if jobID == 0 {
 		jobID = jobIDFromURI(attrString(req.Operation, "job-uri"))
 	}
-	if jobID == 0 {
+
+	sourceURI := strings.TrimSpace(attrString(req.Operation, "printer-uri"))
+	destURI := strings.TrimSpace(attrString(req.Job, "job-printer-uri"))
+	if destURI == "" {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
 	}
-
-	destURI := attrString(req.Operation, "printer-uri")
-	if destURI == "" {
-		destURI = attrString(req.Operation, "printer-uri-destination")
-	}
-	if destURI == "" {
+	if jobID == 0 && sourceURI == "" {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
 	}
 
 	var target model.Printer
-	var job model.Job
+	authType := s.authTypeForRequest(r, goipp.Op(req.Code).String())
 	err := s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
 		var err error
 		target, err = s.printerFromURI(ctx, tx, destURI)
@@ -1848,10 +1795,48 @@ func (s *Server) handleCupsMoveJob(ctx context.Context, r *http.Request, req *go
 		if !target.Accepting {
 			return fmt.Errorf("not-accepting")
 		}
-		job, err = s.Store.MoveJob(ctx, tx, jobID, target.ID)
-		return err
+		if jobID != 0 {
+			job, err := s.Store.GetJob(ctx, tx, jobID)
+			if err != nil {
+				return err
+			}
+			if !s.canManageJob(ctx, r, req, authType, job, false) {
+				return errNotAuthorized
+			}
+			_, err = s.Store.MoveJob(ctx, tx, jobID, target.ID)
+			return err
+		}
+
+		sourcePrinterIDs, err := s.moveSourcePrinterIDs(ctx, tx, sourceURI)
+		if err != nil {
+			return err
+		}
+		for _, sourceID := range sourcePrinterIDs {
+			jobs, err := s.Store.ListJobsByPrinter(ctx, tx, sourceID, 1000000)
+			if err != nil {
+				return err
+			}
+			for _, job := range jobs {
+				if job.State > 6 {
+					continue
+				}
+				if !s.canManageJob(ctx, r, req, authType, job, false) {
+					continue
+				}
+				if _, err := s.Store.MoveJob(ctx, tx, job.ID, target.ID); err != nil {
+					if errors.Is(err, store.ErrJobCompleted) {
+						continue
+					}
+					return err
+				}
+			}
+		}
+		return nil
 	})
 	if err != nil {
+		if errors.Is(err, errNotAuthorized) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorNotAuthorized, req.RequestID), nil
+		}
 		if errors.Is(err, sql.ErrNoRows) {
 			return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
 		}
@@ -1866,7 +1851,6 @@ func (s *Server) handleCupsMoveJob(ctx context.Context, r *http.Request, req *go
 
 	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
 	addOperationDefaults(resp)
-	addJobAttributes(resp, job, target, r, model.Document{}, 0, req)
 	return resp, nil
 }
 
@@ -4590,10 +4574,16 @@ func (s *Server) handleSetJobAttributes(ctx context.Context, r *http.Request, re
 }
 
 func (s *Server) handleCancelJob(ctx context.Context, r *http.Request, req *goipp.Message) (*goipp.Message, error) {
-	jobID := attrInt(req.Operation, "job-id")
-	printerURI := attrString(req.Operation, "printer-uri")
+	jobID, jobIDPresent := attrIntPresent(req.Operation, "job-id")
+	printerURI := strings.TrimSpace(attrString(req.Operation, "printer-uri"))
 	if jobID == 0 {
 		jobID = jobIDFromURI(attrString(req.Operation, "job-uri"))
+	}
+	if printerURI != "" {
+		// CUPS cancel_job() requires job-id when printer-uri is supplied.
+		if !jobIDPresent {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+		}
 	}
 	if jobID == 0 && printerURI != "" {
 		var resolvedID int64
@@ -4616,16 +4606,16 @@ func (s *Server) handleCancelJob(ctx context.Context, r *http.Request, req *goip
 			return nil, err
 		}
 		jobID = resolvedID
+		if jobID == 0 {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorNotPossible, req.RequestID), nil
+		}
 	}
 	if jobID == 0 {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
 	}
 
 	authType := s.authTypeForRequest(r, goipp.Op(req.Code).String())
-	purgeJob, purgeJobPresent := attrBoolPresent(req.Operation, "purge-job")
-	if !purgeJobPresent {
-		purgeJob = attrBool(req.Operation, "purge-jobs")
-	}
+	purgeJob, _ := attrBoolPresent(req.Operation, "purge-job")
 	deleteFiles := purgeJob
 	paths := []string{}
 	err := s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
@@ -4645,6 +4635,9 @@ func (s *Server) handleCancelJob(ctx context.Context, r *http.Request, req *goip
 		if !s.canManageJob(ctx, r, req, authType, job, true) {
 			return errNotAuthorized
 		}
+		if !purgeJob && job.State >= 7 {
+			return store.ErrJobCompleted
+		}
 		if purgeJob {
 			return s.purgeSingleJobWithPaths(ctx, tx, jobID, deleteFiles, &paths)
 		}
@@ -4657,6 +4650,9 @@ func (s *Server) handleCancelJob(ctx context.Context, r *http.Request, req *goip
 		}
 		if errors.Is(err, sql.ErrNoRows) {
 			return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
+		}
+		if errors.Is(err, store.ErrJobCompleted) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorNotPossible, req.RequestID), nil
 		}
 		return nil, err
 	}
@@ -4673,23 +4669,30 @@ func (s *Server) handleCancelJob(ctx context.Context, r *http.Request, req *goip
 
 func (s *Server) handleCancelMyJobs(ctx context.Context, r *http.Request, req *goipp.Message) (*goipp.Message, error) {
 	authType := s.authTypeForRequest(r, goipp.Op(req.Code).String())
-	user := strings.TrimSpace(attrString(req.Operation, "requesting-user-name"))
-	if user == "" && r != nil {
-		if authUser, _, ok := r.BasicAuth(); ok {
-			user = authUser
+	scopeURI := strings.TrimSpace(attrString(req.Operation, "printer-uri"))
+	if scopeURI == "" {
+		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+	}
+
+	user := ""
+	if !strings.EqualFold(strings.TrimSpace(authType), "none") {
+		if authUser, ok := s.authenticateUser(ctx, r, authType); ok {
+			user = strings.TrimSpace(authUser.Username)
 		}
 	}
+	if user == "" || strings.EqualFold(user, "anonymous") {
+		user = strings.TrimSpace(attrString(req.Operation, "requesting-user-name"))
+	}
+
 	if user == "" {
-		user = "anonymous"
+		// CUPS requires requesting-user-name when there is no authenticated
+		// username available for Cancel-My-Jobs.
+		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
 	}
 	if !s.canActAsUser(ctx, r, req, authType, user) {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorNotAuthorized, req.RequestID), nil
 	}
 
-	which := strings.ToLower(strings.TrimSpace(attrString(req.Operation, "which-jobs")))
-	if which == "" {
-		which = "not-completed"
-	}
 	purge, purgePresent := attrBoolPresent(req.Operation, "purge-jobs")
 	if !purgePresent {
 		purge = attrBool(req.Operation, "purge-job")
@@ -4700,23 +4703,26 @@ func (s *Server) handleCancelMyJobs(ctx context.Context, r *http.Request, req *g
 	}
 
 	var printerID *int64
-	if uri := attrString(req.Operation, "printer-uri"); uri != "" {
-		var pid int64
-		err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
-			p, err := s.printerFromURI(ctx, tx, uri)
+	if !isAllPrintersScopeURI(scopeURI) {
+		uri := scopeURI
+		if uri != "" {
+			var pid int64
+			err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
+				p, err := s.printerFromURI(ctx, tx, uri)
+				if err != nil {
+					return err
+				}
+				pid = p.ID
+				return nil
+			})
 			if err != nil {
-				return err
+				if errors.Is(err, sql.ErrNoRows) {
+					return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
+				}
+				return nil, err
 			}
-			pid = p.ID
-			return nil
-		})
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
-			}
-			return nil, err
+			printerID = &pid
 		}
-		printerID = &pid
 	}
 
 	paths := []string{}
@@ -4726,10 +4732,7 @@ func (s *Server) handleCancelMyJobs(ctx context.Context, r *http.Request, req *g
 			return err
 		}
 		for _, job := range jobs {
-			if !matchWhichJobs(which, job.State) {
-				continue
-			}
-			if job.State >= 7 {
+			if !purge && job.State >= 7 {
 				continue
 			}
 			if purge {
@@ -5208,18 +5211,31 @@ func (s *Server) updateDestinationAccepting(ctx context.Context, r *http.Request
 }
 
 func (s *Server) handleCancelJobs(ctx context.Context, r *http.Request, req *goipp.Message) (*goipp.Message, error) {
+	if strings.TrimSpace(attrString(req.Operation, "printer-uri")) == "" {
+		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+	}
 	// If my-jobs is set this behaves like Cancel-My-Jobs for the target destination.
 	if attrBool(req.Operation, "my-jobs") {
 		return s.handleCancelMyJobs(ctx, r, req)
 	}
 	purge, purgePresent := attrBoolPresent(req.Operation, "purge-jobs")
 	if !purgePresent {
-		purge = true
+		purge = false
+	}
+	jobIDs := positiveUniqueInt64s(attrInts(req.Operation, "job-ids"))
+	if len(jobIDs) > 0 {
+		return s.cancelSelectedJobs(ctx, r, req, jobIDs, purge)
+	}
+	if isAllPrintersScopeURI(attrString(req.Operation, "printer-uri")) {
+		return s.cancelJobsForAllPrinters(ctx, r, req, "job-canceled-by-user", purge)
 	}
 	return s.cancelJobsForDestination(ctx, r, req, "job-canceled-by-user", purge)
 }
 
 func (s *Server) handlePurgeJobs(ctx context.Context, r *http.Request, req *goipp.Message) (*goipp.Message, error) {
+	if strings.TrimSpace(attrString(req.Operation, "printer-uri")) == "" {
+		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+	}
 	dest, err := s.resolveDestination(ctx, r, req)
 	if err != nil {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
@@ -5238,7 +5254,10 @@ func (s *Server) cancelJobsForDestination(ctx context.Context, r *http.Request, 
 	if err != nil {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
 	}
+	authType := s.authTypeForRequest(r, goipp.Op(req.Code).String())
 	paths := []string{}
+	scopeJobs := 0
+	acted := 0
 	err = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
 		if dest.IsClass {
 			members, err := s.Store.ListClassMembers(ctx, tx, dest.Class.ID)
@@ -5246,17 +5265,139 @@ func (s *Server) cancelJobsForDestination(ctx context.Context, r *http.Request, 
 				return err
 			}
 			for _, p := range members {
-				if err := s.cancelJobsForPrinter(ctx, tx, p.ID, reason, purge, &paths); err != nil {
+				scoped, changed, err := s.cancelJobsForPrinter(ctx, r, req, authType, tx, p.ID, reason, purge, &paths)
+				if err != nil {
 					return err
 				}
+				scopeJobs += scoped
+				acted += changed
 			}
 			return nil
 		}
-		return s.cancelJobsForPrinter(ctx, tx, dest.Printer.ID, reason, purge, &paths)
+		scoped, changed, err := s.cancelJobsForPrinter(ctx, r, req, authType, tx, dest.Printer.ID, reason, purge, &paths)
+		if err != nil {
+			return err
+		}
+		scopeJobs += scoped
+		acted += changed
+		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	if scopeJobs > 0 && acted == 0 {
+		return goipp.NewResponse(req.Version, goipp.StatusErrorNotAuthorized, req.RequestID), nil
+	}
+	if purge {
+		for _, p := range paths {
+			_ = os.Remove(p)
+		}
+	}
+	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
+	addOperationDefaults(resp)
+	return resp, nil
+}
+
+func (s *Server) cancelJobsForAllPrinters(ctx context.Context, r *http.Request, req *goipp.Message, reason string, purge bool) (*goipp.Message, error) {
+	authType := s.authTypeForRequest(r, goipp.Op(req.Code).String())
+	paths := []string{}
+	scopeJobs := 0
+	acted := 0
+	err := s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
+		printers, err := s.Store.ListPrinters(ctx, tx)
+		if err != nil {
+			return err
+		}
+		for _, p := range printers {
+			scoped, changed, err := s.cancelJobsForPrinter(ctx, r, req, authType, tx, p.ID, reason, purge, &paths)
+			if err != nil {
+				return err
+			}
+			scopeJobs += scoped
+			acted += changed
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if scopeJobs > 0 && acted == 0 {
+		return goipp.NewResponse(req.Version, goipp.StatusErrorNotAuthorized, req.RequestID), nil
+	}
+	if purge {
+		for _, p := range paths {
+			_ = os.Remove(p)
+		}
+	}
+	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
+	addOperationDefaults(resp)
+	return resp, nil
+}
+
+func (s *Server) cancelSelectedJobs(ctx context.Context, r *http.Request, req *goipp.Message, jobIDs []int64, purge bool) (*goipp.Message, error) {
+	if len(jobIDs) == 0 {
+		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+	}
+
+	authType := s.authTypeForRequest(r, goipp.Op(req.Code).String())
+	scopePrinterIDs := map[int64]bool{}
+	hasScope := false
+	if uri := strings.TrimSpace(attrString(req.Operation, "printer-uri")); uri != "" && !isAllPrintersScopeURI(uri) {
+		err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
+			ids, err := s.moveSourcePrinterIDs(ctx, tx, uri)
+			if err != nil {
+				return err
+			}
+			for _, id := range ids {
+				scopePrinterIDs[id] = true
+			}
+			return nil
+		})
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
+			}
+			return nil, err
+		}
+		hasScope = len(scopePrinterIDs) > 0
+	}
+
+	paths := []string{}
+	err := s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
+		for _, jobID := range jobIDs {
+			job, err := s.Store.GetJob(ctx, tx, jobID)
+			if err != nil {
+				return err
+			}
+			if hasScope && !scopePrinterIDs[job.PrinterID] {
+				return sql.ErrNoRows
+			}
+			if !s.canManageJob(ctx, r, req, authType, job, true) {
+				return errNotAuthorized
+			}
+			if purge {
+				if err := s.purgeSingleJobWithPaths(ctx, tx, job.ID, true, &paths); err != nil {
+					return err
+				}
+				continue
+			}
+			completed := time.Now().UTC()
+			if err := s.Store.UpdateJobState(ctx, tx, job.ID, 7, "job-canceled-by-user", &completed); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, errNotAuthorized) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorNotAuthorized, req.RequestID), nil
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
+		}
+		return nil, err
+	}
+
 	if purge {
 		for _, p := range paths {
 			_ = os.Remove(p)
@@ -5329,20 +5470,37 @@ func (s *Server) purgeSingleJobWithPaths(ctx context.Context, tx *sql.Tx, jobID 
 	return s.Store.DeleteJob(ctx, tx, jobID)
 }
 
-func (s *Server) cancelJobsForPrinter(ctx context.Context, tx *sql.Tx, printerID int64, reason string, purge bool, paths *[]string) error {
-	if !purge {
-		return s.Store.CancelJobsByPrinter(ctx, tx, printerID, reason)
-	}
+func (s *Server) cancelJobsForPrinter(ctx context.Context, r *http.Request, req *goipp.Message, authType string, tx *sql.Tx, printerID int64, reason string, purge bool, paths *[]string) (scopeJobs int, acted int, err error) {
 	jobIDs, err := s.Store.ListJobIDsByPrinter(ctx, tx, printerID)
 	if err != nil {
-		return err
+		return 0, 0, err
 	}
 	for _, jobID := range jobIDs {
-		if err := s.purgeSingleJobWithPaths(ctx, tx, jobID, true, paths); err != nil {
-			return err
+		job, err := s.Store.GetJob(ctx, tx, jobID)
+		if err != nil {
+			return scopeJobs, acted, err
 		}
+		if !purge && job.State >= 7 {
+			continue
+		}
+		scopeJobs++
+		if !s.canManageJob(ctx, r, req, authType, job, true) {
+			continue
+		}
+		if !purge {
+			completed := time.Now().UTC()
+			if err := s.Store.UpdateJobState(ctx, tx, job.ID, 7, reason, &completed); err != nil {
+				return scopeJobs, acted, err
+			}
+			acted++
+			continue
+		}
+		if err := s.purgeSingleJobWithPaths(ctx, tx, jobID, true, paths); err != nil {
+			return scopeJobs, acted, err
+		}
+		acted++
 	}
-	return nil
+	return scopeJobs, acted, nil
 }
 
 func (s *Server) findCurrentJobIDForPrinter(ctx context.Context, tx *sql.Tx, printerID int64) (int64, error) {
@@ -13108,11 +13266,16 @@ func printerSettableAttributesForDestination(isClass bool) []string {
 }
 
 func supportedValueAttributes(printer model.Printer, isClass bool) goipp.Attributes {
-	_ = printer
+	_, _ = printer, isClass
 	attrs := goipp.Attributes{}
-	// CUPS returns admin-defined integer values (0) to indicate settable
-	// attributes for Set-Printer-Attributes.
-	for _, key := range printerSettableAttributesForDestination(isClass) {
+	// CUPS 2.4.16 only reports the basic Set-Printer-Attributes keys here.
+	for _, key := range []string{
+		"printer-geo-location",
+		"printer-info",
+		"printer-location",
+		"printer-organization",
+		"printer-organizational-unit",
+	} {
 		attrs.Add(goipp.MakeAttribute(key, goipp.TagAdminDefine, goipp.Integer(0)))
 	}
 	return attrs
@@ -15297,6 +15460,113 @@ func printerNameFromURI(uri string) string {
 		return ""
 	}
 	return path.Base(u.Path)
+}
+
+func isAllPrintersScopeURI(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	scope := path.Clean(strings.TrimSpace(u.Path))
+	if scope == "." {
+		scope = "/"
+	}
+	switch scope {
+	case "/", "/printers", "/classes":
+		return true
+	default:
+		return false
+	}
+}
+
+func positiveUniqueInt64s(values []int64) []int64 {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := map[int64]bool{}
+	out := make([]int64, 0, len(values))
+	for _, v := range values {
+		if v <= 0 || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}
+
+func parseMoveSourceURI(raw string) (isClass bool, name string, ok bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false, "", false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false, "", false
+	}
+	resource := path.Clean(strings.TrimSpace(u.Path))
+	if resource == "." {
+		resource = "/"
+	}
+	switch {
+	case strings.HasPrefix(resource, "/printers/"):
+		name = strings.TrimSpace(strings.TrimPrefix(resource, "/printers/"))
+		if name == "" || strings.Contains(name, "/") {
+			return false, "", false
+		}
+		return false, name, true
+	case strings.HasPrefix(resource, "/classes/"):
+		name = strings.TrimSpace(strings.TrimPrefix(resource, "/classes/"))
+		if name == "" || strings.Contains(name, "/") {
+			return false, "", false
+		}
+		return true, name, true
+	default:
+		return false, "", false
+	}
+}
+
+func (s *Server) moveSourcePrinterIDs(ctx context.Context, tx *sql.Tx, sourceURI string) ([]int64, error) {
+	isClass, name, ok := parseMoveSourceURI(sourceURI)
+	if !ok {
+		return nil, sql.ErrNoRows
+	}
+	if !isClass {
+		p, err := s.Store.GetPrinterByName(ctx, tx, name)
+		if err != nil {
+			return nil, err
+		}
+		return []int64{p.ID}, nil
+	}
+
+	class, err := s.Store.GetClassByName(ctx, tx, name)
+	if err != nil {
+		return nil, err
+	}
+	members, err := s.Store.ListClassMembers(ctx, tx, class.ID)
+	if err != nil {
+		return nil, err
+	}
+	if len(members) == 0 {
+		return nil, sql.ErrNoRows
+	}
+	ids := make([]int64, 0, len(members))
+	seen := map[int64]bool{}
+	for _, member := range members {
+		if member.ID == 0 || seen[member.ID] {
+			continue
+		}
+		seen[member.ID] = true
+		ids = append(ids, member.ID)
+	}
+	if len(ids) == 0 {
+		return nil, sql.ErrNoRows
+	}
+	return ids, nil
 }
 
 func (s *Server) printerFromURI(ctx context.Context, tx *sql.Tx, uri string) (model.Printer, error) {

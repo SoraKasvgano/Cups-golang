@@ -29,18 +29,25 @@ func TestPrinterSettableAttributesIncludePolicyDefaults(t *testing.T) {
 	}
 }
 
-func TestSupportedValueAttributesClassFiltersPrinterIsShared(t *testing.T) {
+func TestSupportedValueAttributesMatchesCUPSSetPrinterAttrs(t *testing.T) {
 	printerAttrs := supportedValueAttributes(model.Printer{}, false)
 	classAttrs := supportedValueAttributes(model.Printer{}, true)
 
-	if !hasSupportedValueAttr(printerAttrs, "printer-is-shared") {
-		t.Fatalf("expected printer-is-shared for printer destination")
-	}
-	if hasSupportedValueAttr(classAttrs, "printer-is-shared") {
-		t.Fatalf("did not expect printer-is-shared for class destination")
+	expected := []string{
+		"printer-geo-location",
+		"printer-info",
+		"printer-location",
+		"printer-organization",
+		"printer-organizational-unit",
 	}
 
-	for _, want := range []string{"printer-error-policy", "printer-op-policy", "port-monitor"} {
+	if len(printerAttrs) != len(expected) {
+		t.Fatalf("unexpected printer attr count: got %d want %d", len(printerAttrs), len(expected))
+	}
+	if len(classAttrs) != len(expected) {
+		t.Fatalf("unexpected class attr count: got %d want %d", len(classAttrs), len(expected))
+	}
+	for _, want := range expected {
 		if !hasSupportedValueAttr(printerAttrs, want) {
 			t.Fatalf("expected %s for printer destination", want)
 		}

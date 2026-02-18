@@ -71,3 +71,39 @@ func TestDestinationTypeResolution(t *testing.T) {
 		t.Fatalf("expected network, got %q", got)
 	}
 }
+
+func TestNormalizeOptionsSummaryMatchesCUPS(t *testing.T) {
+	opts := options{showSummary: true}
+	normalizeOptions(&opts, "alice")
+
+	if !opts.showDefault || !opts.showClasses || !opts.showDevices {
+		t.Fatalf("expected -s to enable default/classes/devices, got %+v", opts)
+	}
+	if opts.showStatus || opts.showPrinters {
+		t.Fatalf("did not expect -s to force status/printers, got %+v", opts)
+	}
+}
+
+func TestNormalizeOptionsAllMatchesCUPS(t *testing.T) {
+	opts := options{showAll: true}
+	normalizeOptions(&opts, "alice")
+
+	if !opts.showStatus || !opts.showDefault || !opts.showClasses || !opts.showDevices || !opts.showAccepting || !opts.showPrinters || !opts.showJobs {
+		t.Fatalf("expected -t expanded view, got %+v", opts)
+	}
+}
+
+func TestNormalizeOptionsDefaultJobsUsesCaller(t *testing.T) {
+	opts := options{}
+	normalizeOptions(&opts, "alice")
+
+	if !opts.showJobs {
+		t.Fatalf("expected default mode to show jobs")
+	}
+	if len(opts.userFilter) != 1 || opts.userFilter[0] != "alice" {
+		t.Fatalf("expected default user filter alice, got %+v", opts.userFilter)
+	}
+	if opts.whichJobs != "not-completed" {
+		t.Fatalf("expected default which-jobs, got %q", opts.whichJobs)
+	}
+}

@@ -47,27 +47,7 @@ func main() {
 		cupsclient.WithTLS(opts.encrypt),
 		cupsclient.WithUser(opts.user),
 	)
-
-	if opts.showAll {
-		opts.showSummary = true
-		opts.showJobs = true
-		opts.showDevices = true
-		opts.showAccepting = true
-	}
-	if opts.showSummary {
-		opts.showDefault = true
-		opts.showStatus = true
-		opts.showPrinters = true
-	}
-	if !opts.showDefault && !opts.showStatus && !opts.showPrinters && !opts.showAccepting && !opts.showJobs && !opts.showDevices && !opts.showForms && !opts.showClasses && !opts.showAllDests {
-		opts.showJobs = true
-		if len(opts.userFilter) == 0 {
-			opts.userFilter = []string{client.User}
-		}
-	}
-	if opts.whichJobs == "" {
-		opts.whichJobs = "not-completed"
-	}
+	normalizeOptions(&opts, client.User)
 
 	if opts.showHost {
 		printServerHost(client)
@@ -117,6 +97,40 @@ func main() {
 		if err := printJobs(client, opts.printerFilter, opts.userFilter, opts.whichJobs, opts.showRanking, opts.longStatus); err != nil {
 			fail(err)
 		}
+	}
+}
+
+func normalizeOptions(opts *options, defaultUser string) {
+	if opts == nil {
+		return
+	}
+
+	if opts.showAll {
+		// CUPS -t: scheduler + default + classes + devices + accepting + printers + jobs.
+		opts.showStatus = true
+		opts.showSummary = true
+		opts.showAccepting = true
+		opts.showPrinters = true
+		opts.showJobs = true
+	}
+
+	if opts.showSummary {
+		// CUPS -s: default destination + classes + devices.
+		opts.showDefault = true
+		opts.showClasses = true
+		opts.showDevices = true
+	}
+
+	if !opts.showDefault && !opts.showStatus && !opts.showPrinters && !opts.showAccepting && !opts.showJobs && !opts.showDevices && !opts.showForms && !opts.showClasses && !opts.showAllDests {
+		opts.showJobs = true
+		if len(opts.userFilter) == 0 {
+			if u := strings.TrimSpace(defaultUser); u != "" {
+				opts.userFilter = []string{u}
+			}
+		}
+	}
+	if opts.whichJobs == "" {
+		opts.whichJobs = "not-completed"
 	}
 }
 

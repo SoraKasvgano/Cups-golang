@@ -1024,6 +1024,27 @@ func (s *Store) UpdatePrinterAttributes(ctx context.Context, tx *sql.Tx, id int6
 	return err
 }
 
+func (s *Store) UpdateClassAttributes(ctx context.Context, tx *sql.Tx, id int64, info, location *string) error {
+	parts := []string{}
+	args := []any{}
+	if info != nil {
+		parts = append(parts, "info = ?")
+		args = append(args, *info)
+	}
+	if location != nil {
+		parts = append(parts, "location = ?")
+		args = append(args, *location)
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	parts = append(parts, "updated_at = ?")
+	args = append(args, time.Now().UTC(), id)
+	query := "UPDATE classes SET " + strings.Join(parts, ", ") + " WHERE id = ?"
+	_, err := tx.ExecContext(ctx, query, args...)
+	return err
+}
+
 func (s *Store) UpdatePrinterSharing(ctx context.Context, tx *sql.Tx, id int64, shared bool) error {
 	val := 0
 	if shared {
