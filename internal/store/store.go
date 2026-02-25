@@ -1303,7 +1303,9 @@ func (s *Store) CreateSubscription(ctx context.Context, tx *sql.Tx, printerID *i
 	if owner == "" {
 		owner = "anonymous"
 	}
-	if strings.TrimSpace(pullMethod) == "" {
+	recipientURI = strings.TrimSpace(recipientURI)
+	pullMethod = strings.TrimSpace(pullMethod)
+	if pullMethod == "" && recipientURI == "" {
 		pullMethod = "ippget"
 	}
 	var pid sql.NullInt64

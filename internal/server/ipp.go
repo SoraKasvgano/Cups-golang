@@ -4483,7 +4483,7 @@ func ensureSubscriptionTemplateDefaults(attrs *goipp.Attributes, sub model.Subsc
 		case "notify-pull-method-supported":
 			attrs.Add(makeKeywordsAttr(name, []string{"ippget"}))
 		case "notify-schemes-supported":
-			attrs.Add(makeKeywordsAttr(name, []string{"ippget"}))
+			attrs.Add(makeKeywordsAttr(name, notifySchemesForSubscriptions(appConfig())))
 		case "notify-time-interval":
 			if sub.TimeInterval > 0 {
 				attrs.Add(goipp.MakeAttribute(name, goipp.TagInteger, goipp.Integer(sub.TimeInterval)))
@@ -5908,9 +5908,7 @@ func buildPrinterAttributes(ctx context.Context, printer model.Printer, r *http.
 	}
 	attrs.Add(goipp.MakeAttribute("notify-events-default", goipp.TagKeyword, goipp.String(notifyEventsDefault)))
 	attrs.Add(goipp.MakeAttribute("notify-pull-method-supported", goipp.TagKeyword, goipp.String("ippget")))
-	if schemes := notifySchemesSupported(cfg); len(schemes) > 0 {
-		attrs.Add(makeKeywordsAttr("notify-schemes-supported", schemes))
-	}
+	attrs.Add(makeKeywordsAttr("notify-schemes-supported", notifySchemesForSubscriptions(cfg)))
 	maxEvents := cfg.MaxEvents
 	if maxEvents < 0 {
 		maxEvents = 0
@@ -6340,9 +6338,7 @@ func buildClassAttributes(ctx context.Context, class model.Class, r *http.Reques
 	}
 	attrs.Add(goipp.MakeAttribute("notify-events-default", goipp.TagKeyword, goipp.String(notifyEventsDefault)))
 	attrs.Add(goipp.MakeAttribute("notify-pull-method-supported", goipp.TagKeyword, goipp.String("ippget")))
-	if schemes := notifySchemesSupported(cfg); len(schemes) > 0 {
-		attrs.Add(makeKeywordsAttr("notify-schemes-supported", schemes))
-	}
+	attrs.Add(makeKeywordsAttr("notify-schemes-supported", notifySchemesForSubscriptions(cfg)))
 	maxEvents := cfg.MaxEvents
 	if maxEvents < 0 {
 		maxEvents = 0
@@ -7161,11 +7157,9 @@ func joinInts(values []int) string {
 }
 
 func requestingUserName(req *goipp.Message, r *http.Request) string {
-	name := strings.TrimSpace(attrString(req.Operation, "requesting-user-name"))
-	if name == "" && r != nil {
-		if user, _, ok := r.BasicAuth(); ok {
-			name = user
-		}
+	name := strings.TrimSpace(authUserFromRequest(r))
+	if name == "" {
+		name = strings.TrimSpace(attrString(req.Operation, "requesting-user-name"))
 	}
 	if name == "" {
 		name = "anonymous"
@@ -7174,10 +7168,8 @@ func requestingUserName(req *goipp.Message, r *http.Request) string {
 }
 
 func requestUserForFilter(r *http.Request, req *goipp.Message) string {
-	if r != nil {
-		if user, _, ok := r.BasicAuth(); ok && strings.TrimSpace(user) != "" {
-			return strings.TrimSpace(user)
-		}
+	if user := strings.TrimSpace(authUserFromRequest(r)); user != "" {
+		return user
 	}
 	if req != nil {
 		if val, ok := attrValue(req.Operation, "requested-user-name"); ok {
@@ -13310,6 +13302,7 @@ func notifySchemesSupported(cfg config.Config) []string {
 		return nil
 	}
 	out := []string{}
+	seen := map[string]bool{}
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -13325,12 +13318,39 @@ func notifySchemesSupported(cfg config.Config) []string {
 		if !isNotifierExecutable(info, name) {
 			continue
 		}
-		out = append(out, name)
+		scheme := notifierSchemeName(name)
+		if scheme == "" || seen[scheme] {
+			continue
+		}
+		seen[scheme] = true
+		out = append(out, scheme)
 	}
 	if len(out) == 0 {
 		return nil
 	}
 	sort.Strings(out)
+	return out
+}
+
+func notifierSchemeName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if runtime.GOOS == "windows" {
+		name = strings.TrimSuffix(name, filepath.Ext(name))
+	}
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+func notifySchemesForSubscriptions(cfg config.Config) []string {
+	extra := notifySchemesSupported(cfg)
+	out := []string{"ippget"}
+	for _, scheme := range extra {
+		if !stringInList(scheme, out) {
+			out = append(out, scheme)
+		}
+	}
 	return out
 }
 
