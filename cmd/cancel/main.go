@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -24,7 +25,16 @@ type options struct {
 	encrypt   bool
 	authUser  string
 	purge     bool
+	destKinds map[string]destinationKind
 }
+
+type destinationKind int
+
+const (
+	destinationUnknown destinationKind = iota
+	destinationPrinter
+	destinationClass
+)
 
 func main() {
 	opts, err := parseArgs(os.Args[1:])
@@ -43,6 +53,7 @@ func main() {
 	)
 
 	known, _ := listDestinations(client)
+	opts.destKinds = known
 
 	if len(opts.jobs) == 0 {
 		if err := cancelWithoutExplicitTargets(client, opts); err != nil {
@@ -193,13 +204,13 @@ func cancelWithoutExplicitTargets(client *cupsclient.Client, opts options) error
 func cancelDestinationTarget(client *cupsclient.Client, opts options, destination string) error {
 	switch {
 	case opts.cancelAll && opts.user != "":
-		return cancelUserJobs(client, opts.user, opts.purge, destination)
+		return cancelUserJobs(client, opts.user, opts.purge, destination, opts.destKinds)
 	case opts.cancelAll:
-		return cancelAllJobs(client, destination, opts.purge, opts.user)
+		return cancelAllJobs(client, destination, opts.purge, opts.user, opts.destKinds)
 	case opts.user != "":
-		return cancelUserJobs(client, opts.user, opts.purge, destination)
+		return cancelUserJobs(client, opts.user, opts.purge, destination, opts.destKinds)
 	default:
-		return cancelCurrentJob(client, destination, opts.purge, "")
+		return cancelCurrentJob(client, destination, opts.purge, "", opts.destKinds)
 	}
 }
 
@@ -207,7 +218,7 @@ func cancelJobTarget(client *cupsclient.Client, opts options, destination string
 	user := opts.user
 	switch {
 	case destination != "":
-		return cancelJobOnPrinter(client, destination, jobID, opts.purge, user)
+		return cancelJobOnPrinter(client, destination, jobID, opts.purge, user, opts.destKinds)
 	default:
 		return cancelJob(client, jobID, opts.purge, user)
 	}
@@ -217,7 +228,7 @@ func cancelJob(client *cupsclient.Client, jobID int, purge bool, user string) er
 	req := goipp.NewRequest(goipp.DefaultVersion, goipp.OpCancelJob, uint32(time.Now().UnixNano()))
 	req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
 	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
-	req.Operation.Add(goipp.MakeAttribute("job-id", goipp.TagInteger, goipp.Integer(jobID)))
+	req.Operation.Add(goipp.MakeAttribute("job-uri", goipp.TagURI, goipp.String(jobURI(jobID))))
 	req.Operation.Add(goipp.MakeAttribute("requesting-user-name", goipp.TagName, goipp.String(effectiveRequestingUser(client, user))))
 	if purge {
 		req.Operation.Add(goipp.MakeAttribute("purge-job", goipp.TagBoolean, goipp.Boolean(true)))
@@ -232,11 +243,11 @@ func cancelJob(client *cupsclient.Client, jobID int, purge bool, user string) er
 	return nil
 }
 
-func cancelJobOnPrinter(client *cupsclient.Client, printer string, jobID int, purge bool, user string) error {
+func cancelJobOnPrinter(client *cupsclient.Client, printer string, jobID int, purge bool, user string, known ...map[string]destinationKind) error {
 	req := goipp.NewRequest(goipp.DefaultVersion, goipp.OpCancelJob, uint32(time.Now().UnixNano()))
 	req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
 	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
-	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(destinationURI(client, printer))))
+	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(destinationURI(client, printer, known...))))
 	req.Operation.Add(goipp.MakeAttribute("job-id", goipp.TagInteger, goipp.Integer(jobID)))
 	req.Operation.Add(goipp.MakeAttribute("requesting-user-name", goipp.TagName, goipp.String(effectiveRequestingUser(client, user))))
 	if purge {
@@ -252,11 +263,11 @@ func cancelJobOnPrinter(client *cupsclient.Client, printer string, jobID int, pu
 	return nil
 }
 
-func cancelAllJobs(client *cupsclient.Client, printer string, purge bool, user string) error {
+func cancelAllJobs(client *cupsclient.Client, printer string, purge bool, user string, known ...map[string]destinationKind) error {
 	req := goipp.NewRequest(goipp.DefaultVersion, goipp.OpCancelJobs, uint32(time.Now().UnixNano()))
 	req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
 	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
-	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(destinationURI(client, printer))))
+	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(destinationURI(client, printer, known...))))
 	req.Operation.Add(goipp.MakeAttribute("requesting-user-name", goipp.TagName, goipp.String(effectiveRequestingUser(client, user))))
 	if purge {
 		req.Operation.Add(goipp.MakeAttribute("purge-jobs", goipp.TagBoolean, goipp.Boolean(true)))
@@ -271,12 +282,12 @@ func cancelAllJobs(client *cupsclient.Client, printer string, purge bool, user s
 	return nil
 }
 
-func cancelUserJobs(client *cupsclient.Client, user string, purge bool, printer string) error {
+func cancelUserJobs(client *cupsclient.Client, user string, purge bool, printer string, known ...map[string]destinationKind) error {
 	req := goipp.NewRequest(goipp.DefaultVersion, goipp.OpCancelMyJobs, uint32(time.Now().UnixNano()))
 	req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
 	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
 	req.Operation.Add(goipp.MakeAttribute("requesting-user-name", goipp.TagName, goipp.String(effectiveRequestingUser(client, user))))
-	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(destinationURI(client, printer))))
+	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(destinationURI(client, printer, known...))))
 	if purge {
 		req.Operation.Add(goipp.MakeAttribute("purge-jobs", goipp.TagBoolean, goipp.Boolean(true)))
 	}
@@ -290,11 +301,11 @@ func cancelUserJobs(client *cupsclient.Client, user string, purge bool, printer 
 	return nil
 }
 
-func cancelCurrentJob(client *cupsclient.Client, printer string, purge bool, user string) error {
+func cancelCurrentJob(client *cupsclient.Client, printer string, purge bool, user string, known ...map[string]destinationKind) error {
 	req := goipp.NewRequest(goipp.DefaultVersion, goipp.OpCancelJob, uint32(time.Now().UnixNano()))
 	req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
 	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
-	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(destinationURI(client, printer))))
+	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(destinationURI(client, printer, known...))))
 	req.Operation.Add(goipp.MakeAttribute("job-id", goipp.TagInteger, goipp.Integer(0)))
 	req.Operation.Add(goipp.MakeAttribute("requesting-user-name", goipp.TagName, goipp.String(effectiveRequestingUser(client, user))))
 	if purge {
@@ -329,10 +340,16 @@ func cancelAllJobsEverywhere(client *cupsclient.Client, purge bool, user string)
 	return nil
 }
 
-func listDestinations(client *cupsclient.Client) (map[string]bool, error) {
-	out := map[string]bool{}
-	for _, op := range []goipp.Op{goipp.OpCupsGetPrinters, goipp.OpCupsGetClasses} {
-		req := goipp.NewRequest(goipp.DefaultVersion, op, uint32(time.Now().UnixNano()))
+func listDestinations(client *cupsclient.Client) (map[string]destinationKind, error) {
+	out := map[string]destinationKind{}
+	for _, item := range []struct {
+		op   goipp.Op
+		kind destinationKind
+	}{
+		{op: goipp.OpCupsGetPrinters, kind: destinationPrinter},
+		{op: goipp.OpCupsGetClasses, kind: destinationClass},
+	} {
+		req := goipp.NewRequest(goipp.DefaultVersion, item.op, uint32(time.Now().UnixNano()))
 		req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
 		req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
 		req.Operation.Add(goipp.MakeAttr("requested-attributes", goipp.TagKeyword, goipp.String("printer-name")))
@@ -348,14 +365,17 @@ func listDestinations(client *cupsclient.Client) (map[string]bool, error) {
 				continue
 			}
 			if name := strings.TrimSpace(findAttr(g.Attrs, "printer-name")); name != "" {
-				out[strings.ToLower(name)] = true
+				key := strings.ToLower(name)
+				if existing, exists := out[key]; !exists || item.kind == destinationClass || existing == destinationUnknown {
+					out[key] = item.kind
+				}
 			}
 		}
 	}
 	return out, nil
 }
 
-func isKnownDestination(value string, known map[string]bool) bool {
+func isKnownDestination(value string, known map[string]destinationKind) bool {
 	v := strings.TrimSpace(value)
 	if v == "" || v == "-" {
 		return true
@@ -364,7 +384,8 @@ func isKnownDestination(value string, known map[string]bool) bool {
 		_, id := splitJobSpec(v)
 		return id == 0
 	}
-	return known[strings.ToLower(v)]
+	kind, ok := known[strings.ToLower(v)]
+	return ok && kind != destinationUnknown
 }
 
 func findAttr(attrs goipp.Attributes, name string) string {
@@ -376,15 +397,17 @@ func findAttr(attrs goipp.Attributes, name string) string {
 	return ""
 }
 
-func destinationURI(client *cupsclient.Client, destination string) string {
+func destinationURI(client *cupsclient.Client, destination string, known ...map[string]destinationKind) string {
+	_ = client
+	_ = known
 	destination = strings.TrimSpace(destination)
 	if destination == "" {
-		return client.PrinterURI("")
+		return "ipp://localhost/printers/"
 	}
 	if strings.Contains(destination, "://") {
 		return destination
 	}
-	return client.PrinterURI(destination)
+	return fmt.Sprintf("ipp://localhost/printers/%s", url.PathEscape(destination))
 }
 
 func effectiveRequestingUser(client *cupsclient.Client, override string) string {
@@ -414,8 +437,13 @@ func splitJobSpec(value string) (string, int) {
 	}
 	if idx := strings.LastIndex(value, "-"); idx != -1 && idx < len(value)-1 {
 		if n, err := strconv.Atoi(value[idx+1:]); err == nil && n > 0 {
-			return strings.TrimSpace(value[:idx]), n
+			// CUPS treats destination-id operands as job IDs.
+			return "", n
 		}
 	}
 	return "", 0
+}
+
+func jobURI(jobID int) string {
+	return fmt.Sprintf("ipp://localhost/jobs/%d", jobID)
 }

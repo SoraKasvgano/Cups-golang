@@ -243,10 +243,18 @@ func (s *Server) resolveClassOrPrinterPolicy(ctx context.Context, tx *sql.Tx, pr
 			return s.defaultPolicyName(), sql.ErrNoRows
 		}
 		printer, err := s.Store.GetPrinterByName(ctx, tx, name)
-		if err != nil {
+		if err == nil {
+			return s.policyNameForDefaultOptions(printer.DefaultOptions), nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
 			return s.defaultPolicyName(), err
 		}
-		return s.policyNameForDefaultOptions(printer.DefaultOptions), nil
+		// CUPS systemv tools address both printers and classes via /printers/<name>.
+		class, classErr := s.Store.GetClassByName(ctx, tx, name)
+		if classErr != nil {
+			return s.defaultPolicyName(), classErr
+		}
+		return s.policyNameForDefaultOptions(class.DefaultOptions), nil
 	default:
 		// Unknown printer URI path - treat as default policy.
 		return s.defaultPolicyName(), nil
@@ -349,9 +357,10 @@ func (s *Server) ippPolicyCheckContexts(ctx context.Context, r *http.Request, re
 	}
 
 	// Job-based operations.
-	jobID := attrInt(req.Operation, "job-id")
-	if jobID == 0 {
-		jobID = jobIDFromURI(attrString(req.Operation, "job-uri"))
+	jobID, jobIDPresent := attrIntPresent(req.Operation, "job-id")
+	jobURI, jobURIPresent := attrValue(req.Operation, "job-uri")
+	if !jobIDPresent && jobURIPresent {
+		jobID = jobIDFromURI(jobURI)
 	}
 	if jobID == 0 && r != nil && strings.HasPrefix(r.URL.Path, "/jobs/") {
 		if n, err := strconv.ParseInt(strings.TrimPrefix(r.URL.Path, "/jobs/"), 10, 64); err == nil {
@@ -363,18 +372,28 @@ func (s *Server) ippPolicyCheckContexts(ctx context.Context, r *http.Request, re
 	// but uses the job owner for the @OWNER check.
 	if op == goipp.OpCupsMoveJob {
 		destURI := strings.TrimSpace(attrString(req.Job, "job-printer-uri"))
-		if jobID == 0 || strings.TrimSpace(destURI) == "" {
+		if strings.TrimSpace(destURI) == "" {
 			return []ippPolicyCheckContext{ctxItem}, nil
 		}
+		if _, _, ok := parseQueueURI(destURI); !ok {
+			return nil, nil
+		}
+		if (jobIDPresent || jobURIPresent) && jobID <= 0 {
+			// Let handler return bad-request/not-found for invalid explicit job refs.
+			return nil, nil
+		}
 		err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
-			job, err := s.Store.GetJob(ctx, tx, jobID)
+			pol, err := s.resolveClassOrPrinterPolicy(ctx, tx, destURI)
 			if err != nil {
 				return err
 			}
-			ctxItem.owner = job.UserName
-			pol, err := s.resolveClassOrPrinterPolicy(ctx, tx, destURI)
-			if err == nil {
-				ctxItem.policyName = pol
+			ctxItem.policyName = pol
+			if jobID > 0 {
+				job, err := s.Store.GetJob(ctx, tx, jobID)
+				if err != nil {
+					return err
+				}
+				ctxItem.owner = job.UserName
 			}
 			return nil
 		})
@@ -1770,17 +1789,29 @@ func localizeDeviceURIForLocalQueue(deviceURI string, cfg config.Config) string 
 }
 
 func (s *Server) handleCupsMoveJob(ctx context.Context, r *http.Request, req *goipp.Message) (*goipp.Message, error) {
-	jobID := attrInt(req.Operation, "job-id")
-	if jobID == 0 {
-		jobID = jobIDFromURI(attrString(req.Operation, "job-uri"))
+	jobID, jobIDPresent := attrIntPresent(req.Operation, "job-id")
+	jobURI, jobURIPresent := attrValue(req.Operation, "job-uri")
+	jobURIValid := false
+	if !jobIDPresent && jobURIPresent {
+		if parsedJobID, ok := parseMoveJobURI(jobURI); ok {
+			jobID = parsedJobID
+			jobURIValid = true
+		}
 	}
+	singleMove := jobIDPresent || jobURIPresent
 
 	sourceURI := strings.TrimSpace(attrString(req.Operation, "printer-uri"))
 	destURI := strings.TrimSpace(attrString(req.Job, "job-printer-uri"))
 	if destURI == "" {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
 	}
-	if jobID == 0 && sourceURI == "" {
+	if singleMove && jobID <= 0 {
+		if jobURIPresent && !jobURIValid {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+		}
+		return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
+	}
+	if !singleMove && sourceURI == "" {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
 	}
 
@@ -1795,7 +1826,7 @@ func (s *Server) handleCupsMoveJob(ctx context.Context, r *http.Request, req *go
 		if !target.Accepting {
 			return fmt.Errorf("not-accepting")
 		}
-		if jobID != 0 {
+		if singleMove {
 			job, err := s.Store.GetJob(ctx, tx, jobID)
 			if err != nil {
 				return err
@@ -1985,6 +2016,9 @@ func (s *Server) handleCupsAddModifyPrinter(ctx context.Context, r *http.Request
 				printer.DefaultOptions = string(b)
 			}
 		}
+		if err := applyDestinationUserAccessAttrs(ctx, tx, s.Store, "printer."+strconv.FormatInt(printer.ID, 10), req.Printer); err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {
@@ -2161,6 +2195,9 @@ func (s *Server) handleCupsAddModifyClass(ctx context.Context, r *http.Request, 
 				}
 				class.DefaultOptions = string(b)
 			}
+		}
+		if err := applyDestinationUserAccessAttrs(ctx, tx, s.Store, "class."+strconv.FormatInt(class.ID, 10), req.Printer); err != nil {
+			return err
 		}
 		return nil
 	})
@@ -2629,12 +2666,14 @@ func parseSubscriptionScopeURI(raw string) (subscriptionScopeKind, string, int64
 	if resource == "" {
 		resource = "/"
 	}
-	resource = path.Clean(resource)
-	if resource == "." {
-		resource = "/"
-	}
 	if !strings.HasPrefix(resource, "/") {
 		resource = "/" + resource
+	}
+	if resource != "/" {
+		resource = strings.TrimSuffix(resource, "/")
+		if resource == "" {
+			resource = "/"
+		}
 	}
 
 	switch resource {
@@ -4673,6 +4712,13 @@ func (s *Server) handleCancelMyJobs(ctx context.Context, r *http.Request, req *g
 	if scopeURI == "" {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
 	}
+	scope, err := s.resolveCancelScope(ctx, scopeURI)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
+		}
+		return nil, err
+	}
 
 	user := ""
 	if !strings.EqualFold(strings.TrimSpace(authType), "none") {
@@ -4693,45 +4739,71 @@ func (s *Server) handleCancelMyJobs(ctx context.Context, r *http.Request, req *g
 		return goipp.NewResponse(req.Version, goipp.StatusErrorNotAuthorized, req.RequestID), nil
 	}
 
-	purge, purgePresent := attrBoolPresent(req.Operation, "purge-jobs")
-	if !purgePresent {
-		purge = attrBool(req.Operation, "purge-job")
+	// CUPS Cancel-My-Jobs always cancels jobs; purge control is handled by
+	// Purge-Jobs.
+	return s.cancelMyJobsForUser(ctx, r, req, user, false, scope)
+}
+
+func (s *Server) cancelMyJobsForUser(ctx context.Context, r *http.Request, req *goipp.Message, user string, purge bool, scope cancelScope) (*goipp.Message, error) {
+	var printerID *int64
+	scopePrinterIDs, hasScope, err := s.cancelScopePrinterIDs(ctx, scope)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
+		}
+		return nil, err
 	}
+	if hasScope && !scope.dest.IsClass {
+		for id := range scopePrinterIDs {
+			pid := id
+			printerID = &pid
+			break
+		}
+	}
+	jobIDs := positiveUniqueInt64s(attrInts(req.Operation, "job-ids"))
 	reason := "job-canceled-by-user"
 	if purge {
 		reason = "job-purged"
 	}
-
-	var printerID *int64
-	if !isAllPrintersScopeURI(scopeURI) {
-		uri := scopeURI
-		if uri != "" {
-			var pid int64
-			err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
-				p, err := s.printerFromURI(ctx, tx, uri)
+	paths := []string{}
+	err = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
+		if len(jobIDs) > 0 {
+			for _, jobID := range jobIDs {
+				job, err := s.Store.GetJob(ctx, tx, jobID)
 				if err != nil {
 					return err
 				}
-				pid = p.ID
-				return nil
-			})
-			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
+				if hasScope && !scopePrinterIDs[job.PrinterID] {
+					return sql.ErrNoRows
 				}
-				return nil, err
+				if !strings.EqualFold(strings.TrimSpace(job.UserName), strings.TrimSpace(user)) {
+					return sql.ErrNoRows
+				}
+				if !purge && job.State >= 7 {
+					continue
+				}
+				if purge {
+					if err := s.purgeSingleJobWithPaths(ctx, tx, job.ID, true, &paths); err != nil {
+						return err
+					}
+				} else {
+					completed := time.Now().UTC()
+					if err := s.Store.UpdateJobState(ctx, tx, job.ID, 7, reason, &completed); err != nil {
+						return err
+					}
+				}
 			}
-			printerID = &pid
+			return nil
 		}
-	}
 
-	paths := []string{}
-	err := s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
 		jobs, err := s.Store.ListJobsByUser(ctx, tx, user, printerID, 1000)
 		if err != nil {
 			return err
 		}
 		for _, job := range jobs {
+			if hasScope && !scopePrinterIDs[job.PrinterID] {
+				continue
+			}
 			if !purge && job.State >= 7 {
 				continue
 			}
@@ -4749,6 +4821,9 @@ func (s *Server) handleCancelMyJobs(ctx context.Context, r *http.Request, req *g
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
+		}
 		return nil, err
 	}
 	if purge {
@@ -5211,12 +5286,16 @@ func (s *Server) updateDestinationAccepting(ctx context.Context, r *http.Request
 }
 
 func (s *Server) handleCancelJobs(ctx context.Context, r *http.Request, req *goipp.Message) (*goipp.Message, error) {
-	if strings.TrimSpace(attrString(req.Operation, "printer-uri")) == "" {
+	printerURI := strings.TrimSpace(attrString(req.Operation, "printer-uri"))
+	if printerURI == "" {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
 	}
-	// If my-jobs is set this behaves like Cancel-My-Jobs for the target destination.
-	if attrBool(req.Operation, "my-jobs") {
-		return s.handleCancelMyJobs(ctx, r, req)
+	scope, err := s.resolveCancelScope(ctx, printerURI)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
+		}
+		return nil, err
 	}
 	purge, purgePresent := attrBoolPresent(req.Operation, "purge-jobs")
 	if !purgePresent {
@@ -5224,41 +5303,73 @@ func (s *Server) handleCancelJobs(ctx context.Context, r *http.Request, req *goi
 	}
 	jobIDs := positiveUniqueInt64s(attrInts(req.Operation, "job-ids"))
 	if len(jobIDs) > 0 {
-		return s.cancelSelectedJobs(ctx, r, req, jobIDs, purge)
+		scopePrinterIDs, hasScope, err := s.cancelScopePrinterIDs(ctx, scope)
+		if err != nil {
+			return nil, err
+		}
+		return s.cancelSelectedJobs(ctx, r, req, jobIDs, purge, scopePrinterIDs, hasScope)
 	}
-	if isAllPrintersScopeURI(attrString(req.Operation, "printer-uri")) {
+	if scope.all {
 		return s.cancelJobsForAllPrinters(ctx, r, req, "job-canceled-by-user", purge)
 	}
-	return s.cancelJobsForDestination(ctx, r, req, "job-canceled-by-user", purge)
+	return s.cancelJobsForResolvedDestination(ctx, r, req, scope.dest, "job-canceled-by-user", purge)
 }
 
 func (s *Server) handlePurgeJobs(ctx context.Context, r *http.Request, req *goipp.Message) (*goipp.Message, error) {
-	if strings.TrimSpace(attrString(req.Operation, "printer-uri")) == "" {
+	printerURI := strings.TrimSpace(attrString(req.Operation, "printer-uri"))
+	if printerURI == "" {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
 	}
-	dest, err := s.resolveDestination(ctx, r, req)
+	scope, err := s.resolveCancelScope(ctx, printerURI)
 	if err != nil {
-		return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
-	}
-	deleteFiles := !s.preserveJobFiles(ctx)
-	if err := s.purgeDestinationJobs(ctx, dest, deleteFiles); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
+		}
 		return nil, err
 	}
-	resp := goipp.NewResponse(req.Version, goipp.StatusOk, req.RequestID)
-	addOperationDefaults(resp)
-	return resp, nil
+
+	purge := true
+	if v, present := attrBoolPresent(req.Operation, "purge-jobs"); present {
+		purge = v
+	}
+
+	if attrBool(req.Operation, "my-jobs") {
+		// CUPS requires requesting-user-name for Purge-Jobs with my-jobs.
+		user := strings.TrimSpace(attrString(req.Operation, "requesting-user-name"))
+		if user == "" {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
+		}
+		authType := s.authTypeForRequest(r, goipp.Op(req.Code).String())
+		if !s.canActAsUser(ctx, r, req, authType, user) {
+			return goipp.NewResponse(req.Version, goipp.StatusErrorNotAuthorized, req.RequestID), nil
+		}
+		return s.cancelMyJobsForUser(ctx, r, req, user, purge, scope)
+	}
+
+	jobIDs := positiveUniqueInt64s(attrInts(req.Operation, "job-ids"))
+	if len(jobIDs) > 0 {
+		scopePrinterIDs, hasScope, err := s.cancelScopePrinterIDs(ctx, scope)
+		if err != nil {
+			return nil, err
+		}
+		return s.cancelSelectedJobs(ctx, r, req, jobIDs, purge, scopePrinterIDs, hasScope)
+	}
+	reason := "job-canceled-by-user"
+	if purge {
+		reason = "job-purged"
+	}
+	if scope.all {
+		return s.cancelJobsForAllPrinters(ctx, r, req, reason, purge)
+	}
+	return s.cancelJobsForResolvedDestination(ctx, r, req, scope.dest, reason, purge)
 }
 
-func (s *Server) cancelJobsForDestination(ctx context.Context, r *http.Request, req *goipp.Message, reason string, purge bool) (*goipp.Message, error) {
-	dest, err := s.resolveDestination(ctx, r, req)
-	if err != nil {
-		return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
-	}
+func (s *Server) cancelJobsForResolvedDestination(ctx context.Context, r *http.Request, req *goipp.Message, dest destination, reason string, purge bool) (*goipp.Message, error) {
 	authType := s.authTypeForRequest(r, goipp.Op(req.Code).String())
 	paths := []string{}
 	scopeJobs := 0
 	acted := 0
-	err = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
+	err := s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
 		if dest.IsClass {
 			members, err := s.Store.ListClassMembers(ctx, tx, dest.Class.ID)
 			if err != nil {
@@ -5334,33 +5445,12 @@ func (s *Server) cancelJobsForAllPrinters(ctx context.Context, r *http.Request, 
 	return resp, nil
 }
 
-func (s *Server) cancelSelectedJobs(ctx context.Context, r *http.Request, req *goipp.Message, jobIDs []int64, purge bool) (*goipp.Message, error) {
+func (s *Server) cancelSelectedJobs(ctx context.Context, r *http.Request, req *goipp.Message, jobIDs []int64, purge bool, scopePrinterIDs map[int64]bool, hasScope bool) (*goipp.Message, error) {
 	if len(jobIDs) == 0 {
 		return goipp.NewResponse(req.Version, goipp.StatusErrorBadRequest, req.RequestID), nil
 	}
 
 	authType := s.authTypeForRequest(r, goipp.Op(req.Code).String())
-	scopePrinterIDs := map[int64]bool{}
-	hasScope := false
-	if uri := strings.TrimSpace(attrString(req.Operation, "printer-uri")); uri != "" && !isAllPrintersScopeURI(uri) {
-		err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
-			ids, err := s.moveSourcePrinterIDs(ctx, tx, uri)
-			if err != nil {
-				return err
-			}
-			for _, id := range ids {
-				scopePrinterIDs[id] = true
-			}
-			return nil
-		})
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return goipp.NewResponse(req.Version, goipp.StatusErrorNotFound, req.RequestID), nil
-			}
-			return nil, err
-		}
-		hasScope = len(scopePrinterIDs) > 0
-	}
 
 	paths := []string{}
 	err := s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
@@ -10326,6 +10416,65 @@ func splitUserList(list string) []string {
 	return out
 }
 
+func applyDestinationUserAccessAttrs(ctx context.Context, tx *sql.Tx, st *store.Store, keyPrefix string, attrs goipp.Attributes) error {
+	if st == nil || tx == nil || strings.TrimSpace(keyPrefix) == "" || len(attrs) == 0 {
+		return nil
+	}
+	allowedKey := keyPrefix + ".allowed_users"
+	deniedKey := keyPrefix + ".denied_users"
+	for _, attr := range attrs {
+		switch strings.ToLower(strings.TrimSpace(attr.Name)) {
+		case "requesting-user-name-allowed":
+			users := strings.Join(userAccessListFromAttr(attr, true), ",")
+			if err := st.SetSetting(ctx, tx, allowedKey, users); err != nil {
+				return err
+			}
+			if err := st.SetSetting(ctx, tx, deniedKey, ""); err != nil {
+				return err
+			}
+		case "requesting-user-name-denied":
+			users := strings.Join(userAccessListFromAttr(attr, false), ",")
+			if err := st.SetSetting(ctx, tx, deniedKey, users); err != nil {
+				return err
+			}
+			if err := st.SetSetting(ctx, tx, allowedKey, ""); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func userAccessListFromAttr(attr goipp.Attribute, allowMode bool) []string {
+	if len(attr.Values) == 0 {
+		return nil
+	}
+	raw := make([]string, 0, len(attr.Values))
+	for _, value := range attr.Values {
+		switch value.T {
+		case goipp.TagName, goipp.TagKeyword, goipp.TagText:
+		default:
+			continue
+		}
+		s := strings.TrimSpace(value.V.String())
+		if s == "" {
+			continue
+		}
+		raw = append(raw, s)
+	}
+	list := splitUserList(strings.Join(raw, ","))
+	if len(list) == 1 {
+		token := strings.ToLower(strings.TrimSpace(list[0]))
+		if allowMode && token == "all" {
+			return nil
+		}
+		if !allowMode && token == "none" {
+			return nil
+		}
+	}
+	return list
+}
+
 func userInList(user string, list []string) bool {
 	for _, v := range list {
 		if strings.EqualFold(strings.TrimSpace(v), user) {
@@ -14714,19 +14863,7 @@ func parsePageRanges(value string) (goipp.Range, bool) {
 }
 
 func jobIDFromURI(uri string) int64 {
-	if uri == "" {
-		return 0
-	}
-	u, err := url.Parse(uri)
-	if err != nil {
-		return 0
-	}
-	base := path.Base(u.Path)
-	if base == "" {
-		return 0
-	}
-	n, _ := strconv.ParseInt(base, 10, 64)
-	return n
+	return parseJobURICompat(uri)
 }
 
 func (s *Server) resolvePrinter(ctx context.Context, r *http.Request, req *goipp.Message) (model.Printer, error) {
@@ -14772,6 +14909,11 @@ type destination struct {
 	Class   model.Class
 }
 
+type cancelScope struct {
+	all  bool
+	dest destination
+}
+
 func (s *Server) resolveDestination(ctx context.Context, r *http.Request, req *goipp.Message) (destination, error) {
 	printerName := ""
 	className := ""
@@ -14797,7 +14939,19 @@ func (s *Server) resolveDestination(ctx context.Context, r *http.Request, req *g
 		var err error
 		if printerName != "" {
 			dest.Printer, err = s.Store.GetPrinterByName(ctx, tx, printerName)
-			return err
+			if err == nil {
+				return nil
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			// CUPS accepts class names addressed via /printers/<name>.
+			dest.Class, err = s.Store.GetClassByName(ctx, tx, printerName)
+			if err != nil {
+				return err
+			}
+			dest.IsClass = true
+			return nil
 		}
 		if className != "" {
 			dest.Class, err = s.Store.GetClassByName(ctx, tx, className)
@@ -14808,6 +14962,101 @@ func (s *Server) resolveDestination(ctx context.Context, r *http.Request, req *g
 		return err
 	})
 	return dest, err
+}
+
+func (s *Server) resolveCancelScope(ctx context.Context, printerURI string) (cancelScope, error) {
+	scope := cancelScope{all: true}
+	printerURI = strings.TrimSpace(printerURI)
+	if printerURI == "" {
+		return scope, sql.ErrNoRows
+	}
+
+	resource := "/"
+	if parsed, ok := uriResourcePath(printerURI); ok {
+		resource = parsed
+	}
+
+	// CUPS falls back to all-printers scope when printer-uri is syntactically
+	// present but does not reference /printers/* or /classes/*.
+	if !(strings.HasPrefix(resource, "/printers/") || strings.HasPrefix(resource, "/classes/")) {
+		return scope, nil
+	}
+
+	scope.all = false
+	err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
+		switch {
+		case strings.HasPrefix(resource, "/printers/"):
+			name := strings.TrimSpace(strings.TrimPrefix(resource, "/printers/"))
+			if name == "" {
+				scope.all = true
+				return nil
+			}
+			if strings.Contains(name, "/") {
+				return sql.ErrNoRows
+			}
+			printer, err := s.Store.GetPrinterByName(ctx, tx, name)
+			if err == nil {
+				scope.dest = destination{IsClass: false, Printer: printer}
+				return nil
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			class, classErr := s.Store.GetClassByName(ctx, tx, name)
+			if classErr != nil {
+				return classErr
+			}
+			scope.dest = destination{IsClass: true, Class: class}
+			return nil
+
+		case strings.HasPrefix(resource, "/classes/"):
+			name := strings.TrimSpace(strings.TrimPrefix(resource, "/classes/"))
+			if name == "" {
+				scope.all = true
+				return nil
+			}
+			if strings.Contains(name, "/") {
+				return sql.ErrNoRows
+			}
+			class, err := s.Store.GetClassByName(ctx, tx, name)
+			if err != nil {
+				return err
+			}
+			scope.dest = destination{IsClass: true, Class: class}
+			return nil
+
+		default:
+			return nil
+		}
+	})
+	return scope, err
+}
+
+func (s *Server) cancelScopePrinterIDs(ctx context.Context, scope cancelScope) (map[int64]bool, bool, error) {
+	if scope.all {
+		return nil, false, nil
+	}
+	if !scope.dest.IsClass {
+		return map[int64]bool{scope.dest.Printer.ID: true}, true, nil
+	}
+
+	ids := map[int64]bool{}
+	err := s.Store.WithTx(ctx, true, func(tx *sql.Tx) error {
+		members, err := s.Store.ListClassMembers(ctx, tx, scope.dest.Class.ID)
+		if err != nil {
+			return err
+		}
+		for _, member := range members {
+			if member.ID > 0 {
+				ids[member.ID] = true
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return ids, true, nil
 }
 
 func (s *Server) defaultDestination(ctx context.Context, tx *sql.Tx) (destination, error) {
@@ -14916,29 +15165,28 @@ func parseDocumentURI(uri string) (int64, int) {
 }
 
 func parseDocumentURIStrict(uri string) (int64, int, bool) {
-	if strings.TrimSpace(uri) == "" {
+	resource, ok := uriResourcePath(uri)
+	if !ok {
 		return 0, 0, false
 	}
-	u, err := url.Parse(uri)
-	if err != nil {
+	if resource != "/" {
+		resource = strings.TrimSuffix(resource, "/")
+		if resource == "" {
+			resource = "/"
+		}
+	}
+	parts := strings.Split(resource, "/")
+	if len(parts) != 5 {
 		return 0, 0, false
 	}
-	resource := path.Clean(strings.TrimSpace(u.Path))
-	if resource == "." {
-		resource = "/"
-	}
-	parts := strings.Split(strings.Trim(resource, "/"), "/")
-	if len(parts) != 4 {
+	if parts[0] != "" || parts[1] != "jobs" || parts[2] == "" || parts[3] != "documents" || parts[4] == "" {
 		return 0, 0, false
 	}
-	if parts[0] != "jobs" || parts[2] != "documents" {
-		return 0, 0, false
-	}
-	jobID, err := strconv.ParseInt(parts[1], 10, 64)
+	jobID, err := strconv.ParseInt(parts[2], 10, 64)
 	if err != nil || jobID <= 0 {
 		return 0, 0, false
 	}
-	docNum, err := strconv.Atoi(parts[3])
+	docNum, err := strconv.Atoi(parts[4])
 	if err != nil || docNum <= 0 {
 		return 0, 0, false
 	}
@@ -15462,21 +15710,118 @@ func printerNameFromURI(uri string) string {
 	return path.Base(u.Path)
 }
 
-func isAllPrintersScopeURI(raw string) bool {
+func uriResourcePath(raw string) (string, bool) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return false
+		return "", false
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
+		return "", false
+	}
+	resource := strings.TrimSpace(u.Path)
+	if resource == "" {
+		resource = "/"
+	}
+	if !strings.HasPrefix(resource, "/") {
+		resource = "/" + resource
+	}
+	return resource, true
+}
+
+func parseQueueURI(raw string) (isClass bool, name string, ok bool) {
+	resource, ok := uriResourcePath(raw)
+	if !ok {
+		return false, "", false
+	}
+	switch {
+	case strings.HasPrefix(resource, "/printers/"):
+		name = strings.TrimSpace(strings.TrimPrefix(resource, "/printers/"))
+		if name == "" || strings.Contains(name, "/") {
+			return false, "", false
+		}
+		return false, name, true
+	case strings.HasPrefix(resource, "/classes/"):
+		name = strings.TrimSpace(strings.TrimPrefix(resource, "/classes/"))
+		if name == "" || strings.Contains(name, "/") {
+			return false, "", false
+		}
+		return true, name, true
+	default:
+		return false, "", false
+	}
+}
+
+func parseMoveJobURI(raw string) (int64, bool) {
+	resource, ok := uriResourcePath(raw)
+	if !ok || !strings.HasPrefix(resource, "/jobs/") {
+		return 0, false
+	}
+	tail := strings.TrimPrefix(resource, "/jobs/")
+	if tail == "" {
+		return 0, true
+	}
+
+	// CUPS uses atoi(resource + 6), so only the initial digit run is consumed.
+	sign := int64(1)
+	if tail[0] == '-' {
+		sign = -1
+		tail = tail[1:]
+	}
+	i := 0
+	for i < len(tail) && tail[i] >= '0' && tail[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		return 0, true
+	}
+	v, err := strconv.ParseInt(tail[:i], 10, 64)
+	if err != nil {
+		return 0, true
+	}
+	return sign * v, true
+}
+
+func parseJobURICompat(raw string) int64 {
+	resource, ok := uriResourcePath(raw)
+	if !ok {
+		return 0
+	}
+	if !strings.HasPrefix(resource, "/jobs/") {
+		return 0
+	}
+	tail := strings.TrimPrefix(resource, "/jobs/")
+	if tail == "" {
+		return 0
+	}
+
+	// CUPS uses atoi(resource + 6) for job-uri parsing in many operations.
+	sign := int64(1)
+	if tail[0] == '-' {
+		sign = -1
+		tail = tail[1:]
+	}
+	i := 0
+	for i < len(tail) && tail[i] >= '0' && tail[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		return 0
+	}
+	v, err := strconv.ParseInt(tail[:i], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return sign * v
+}
+
+func isAllPrintersScopeURI(raw string) bool {
+	scope, ok := uriResourcePath(raw)
+	if !ok {
 		return false
 	}
-	scope := path.Clean(strings.TrimSpace(u.Path))
-	if scope == "." {
-		scope = "/"
-	}
 	switch scope {
-	case "/", "/printers", "/classes":
+	case "/", "/printers", "/printers/", "/classes", "/classes/":
 		return true
 	default:
 		return false
@@ -15500,34 +15845,7 @@ func positiveUniqueInt64s(values []int64) []int64 {
 }
 
 func parseMoveSourceURI(raw string) (isClass bool, name string, ok bool) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return false, "", false
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return false, "", false
-	}
-	resource := path.Clean(strings.TrimSpace(u.Path))
-	if resource == "." {
-		resource = "/"
-	}
-	switch {
-	case strings.HasPrefix(resource, "/printers/"):
-		name = strings.TrimSpace(strings.TrimPrefix(resource, "/printers/"))
-		if name == "" || strings.Contains(name, "/") {
-			return false, "", false
-		}
-		return false, name, true
-	case strings.HasPrefix(resource, "/classes/"):
-		name = strings.TrimSpace(strings.TrimPrefix(resource, "/classes/"))
-		if name == "" || strings.Contains(name, "/") {
-			return false, "", false
-		}
-		return true, name, true
-	default:
-		return false, "", false
-	}
+	return parseQueueURI(raw)
 }
 
 func (s *Server) moveSourcePrinterIDs(ctx context.Context, tx *sql.Tx, sourceURI string) ([]int64, error) {
@@ -15537,10 +15855,37 @@ func (s *Server) moveSourcePrinterIDs(ctx context.Context, tx *sql.Tx, sourceURI
 	}
 	if !isClass {
 		p, err := s.Store.GetPrinterByName(ctx, tx, name)
-		if err != nil {
+		if err == nil {
+			return []int64{p.ID}, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
 		}
-		return []int64{p.ID}, nil
+		// CUPS commands can pass class names via /printers/<name>.
+		class, classErr := s.Store.GetClassByName(ctx, tx, name)
+		if classErr != nil {
+			return nil, classErr
+		}
+		members, membersErr := s.Store.ListClassMembers(ctx, tx, class.ID)
+		if membersErr != nil {
+			return nil, membersErr
+		}
+		if len(members) == 0 {
+			return nil, sql.ErrNoRows
+		}
+		ids := make([]int64, 0, len(members))
+		seen := map[int64]bool{}
+		for _, member := range members {
+			if member.ID == 0 || seen[member.ID] {
+				continue
+			}
+			seen[member.ID] = true
+			ids = append(ids, member.ID)
+		}
+		if len(ids) == 0 {
+			return nil, sql.ErrNoRows
+		}
+		return ids, nil
 	}
 
 	class, err := s.Store.GetClassByName(ctx, tx, name)
@@ -15580,7 +15925,26 @@ func (s *Server) printerFromURI(ctx context.Context, tx *sql.Tx, uri string) (mo
 		if name == "" {
 			return model.Printer{}, sql.ErrNoRows
 		}
-		return s.Store.GetPrinterByName(ctx, tx, name)
+		printer, err := s.Store.GetPrinterByName(ctx, tx, name)
+		if err == nil {
+			return printer, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return model.Printer{}, err
+		}
+		// CUPS destination names for classes can appear under /printers/<name>.
+		class, classErr := s.Store.GetClassByName(ctx, tx, name)
+		if classErr != nil {
+			return model.Printer{}, classErr
+		}
+		members, membersErr := s.Store.ListClassMembers(ctx, tx, class.ID)
+		if membersErr != nil {
+			return model.Printer{}, membersErr
+		}
+		if len(members) == 0 {
+			return model.Printer{}, sql.ErrNoRows
+		}
+		return members[0], nil
 	case strings.HasPrefix(u.Path, "/classes/"):
 		name := strings.TrimPrefix(u.Path, "/classes/")
 		if name == "" {
@@ -15599,10 +15963,6 @@ func (s *Server) printerFromURI(ctx context.Context, tx *sql.Tx, uri string) (mo
 		}
 		return members[0], nil
 	default:
-		name := path.Base(u.Path)
-		if name == "" {
-			return model.Printer{}, sql.ErrNoRows
-		}
-		return s.Store.GetPrinterByName(ctx, tx, name)
+		return model.Printer{}, sql.ErrNoRows
 	}
 }

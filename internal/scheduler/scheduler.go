@@ -34,6 +34,8 @@ type Scheduler struct {
 	lastTempCleanup time.Time
 }
 
+var errFilterPipeline = errors.New("filter-pipeline-failed")
+
 func (s *Scheduler) Start(ctx context.Context) {
 	if s.Interval <= 0 {
 		s.Interval = 2 * time.Second
@@ -187,7 +189,21 @@ func (s *Scheduler) processOnce(ctx context.Context) {
 		})
 		if err == nil && finalState != 0 {
 			copies := optionInt(opts, "copies")
-			logging.Page(logging.PageLogLine(job.ID, job.UserName, printer.Name, job.Name, copies, pageResult))
+			logging.Page(logging.PageLogLine(logging.PageLogEntry{
+				JobID:      job.ID,
+				User:       job.UserName,
+				Printer:    printer.Name,
+				Title:      job.Name,
+				Copies:     copies,
+				OriginHost: job.OriginHost,
+				Media:      optionString(opts, "media"),
+				Sides:      optionString(opts, "sides"),
+				Billing:    optionString(opts, "job-billing"),
+				AccountID:  optionString(opts, "job-account-id"),
+				Extra: map[string]string{
+					"result": pageResult,
+				},
+			}))
 		}
 		_ = s.Store.WithTx(ctx, false, func(tx *sql.Tx) error {
 			details := map[string]string{
@@ -314,7 +330,7 @@ func (s *Scheduler) applyErrorPolicy(ctx context.Context, tx *sql.Tx, job model.
 	if reason != "job-stopped" {
 		return false, nil
 	}
-	policy := strings.ToLower(strings.TrimSpace(errorPolicyForJob(printer, opts)))
+	policy := s.errorPolicyForJob(printer, opts)
 	switch policy {
 	case "retry-current-job":
 		return true, s.Store.UpdateJobState(ctx, tx, job.ID, 3, "job-retry", nil)
@@ -327,19 +343,34 @@ func (s *Scheduler) applyErrorPolicy(ctx context.Context, tx *sql.Tx, job model.
 		_ = s.Store.UpdatePrinterState(ctx, tx, printer.ID, 5)
 		return true, s.Store.UpdateJobState(ctx, tx, job.ID, 3, "printer-stopped", nil)
 	default:
-		return false, nil
+		_ = s.Store.UpdatePrinterState(ctx, tx, printer.ID, 5)
+		return true, s.Store.UpdateJobState(ctx, tx, job.ID, 3, "printer-stopped", nil)
 	}
 }
 
-func errorPolicyForJob(printer model.Printer, opts map[string]string) string {
+func normalizeErrorPolicy(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "retry-current-job", "retry-job", "abort-job", "stop-printer":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return ""
+	}
+}
+
+func (s *Scheduler) errorPolicyForJob(printer model.Printer, opts map[string]string) string {
 	if opts != nil {
-		if v := strings.TrimSpace(opts["cups-error-policy"]); v != "" {
+		if v := normalizeErrorPolicy(opts["cups-error-policy"]); v != "" {
 			return v
 		}
 	}
 	defaults := parseOptionsJSON(printer.DefaultOptions)
-	if v := strings.TrimSpace(defaults["printer-error-policy"]); v != "" {
+	if v := normalizeErrorPolicy(defaults["printer-error-policy"]); v != "" {
 		return v
+	}
+	if s != nil {
+		if v := normalizeErrorPolicy(s.Config.ErrorPolicy); v != "" {
+			return v
+		}
 	}
 	return "stop-printer"
 }
@@ -711,7 +742,7 @@ func (s *Scheduler) runFilterPipeline(job model.Job, printer model.Printer, doc 
 		}
 		cmd.Stderr = os.Stderr
 		if err := cmd.Start(); err != nil {
-			return docMime, copyFile(doc.Path, outPath)
+			return docMime, fmt.Errorf("%w: %v", errFilterPipeline, err)
 		}
 		cmdsRun = append(cmdsRun, cmd)
 		if i < len(pipeClosers) {
@@ -720,15 +751,15 @@ func (s *Scheduler) runFilterPipeline(job model.Job, printer model.Printer, doc 
 	}
 	for _, cmd := range cmdsRun {
 		if err := cmd.Wait(); err != nil {
-			return docMime, copyFile(doc.Path, outPath)
+			return docMime, fmt.Errorf("%w: %v", errFilterPipeline, err)
 		}
 	}
 	return finalType, out.Sync()
 }
 
 func (s *Scheduler) submitToBackend(ctx context.Context, printer model.Printer, job model.Job, doc model.Document, outPath string) error {
-	if printer.URI == "" {
-		return nil
+	if strings.TrimSpace(printer.URI) == "" {
+		return backend.WrapUnsupported("backend-uri", printer.URI, errors.New("missing printer URI"))
 	}
 	b := backend.ForURI(printer.URI)
 	if b == nil {
@@ -744,8 +775,14 @@ func failureReasonForError(err error) string {
 	if backend.IsUnsupported(err) || errors.Is(err, backend.ErrUnsupported) {
 		return "document-unprintable-error"
 	}
+	if backend.IsPermanent(err) {
+		return "document-unprintable-error"
+	}
 	if backend.IsTemporary(err) {
 		return "job-stopped"
+	}
+	if errors.Is(err, errFilterPipeline) {
+		return "document-unprintable-error"
 	}
 	msg := strings.ToLower(strings.TrimSpace(err.Error()))
 	if strings.Contains(msg, "unsupported") || strings.Contains(msg, "unprintable") || strings.Contains(msg, "format") {
@@ -903,6 +940,13 @@ func optionInt(opts map[string]string, key string) int {
 		return 0
 	}
 	return n
+}
+
+func optionString(opts map[string]string, key string) string {
+	if opts == nil {
+		return ""
+	}
+	return strings.TrimSpace(opts[key])
 }
 
 func optionInt64(opts map[string]string, key string) int64 {

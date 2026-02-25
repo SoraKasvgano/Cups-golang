@@ -25,7 +25,14 @@ import (
 func main() {
 	cfg := config.Load()
 	server.SetAppConfig(cfg)
-	logging.Configure(cfg.ErrorLogPath, cfg.AccessLogPath, cfg.PageLogPath, cfg.MaxLogSize)
+	logging.Configure(
+		cfg.ErrorLogPath,
+		cfg.AccessLogPath,
+		cfg.PageLogPath,
+		cfg.MaxLogSize,
+		cfg.AccessLogLevel,
+		cfg.PageLogFormat,
+	)
 
 	log.SetOutput(logging.ErrorWriter())
 

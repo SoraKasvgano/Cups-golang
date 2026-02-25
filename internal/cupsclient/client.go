@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -96,19 +97,80 @@ func NewFromEnv() *Client {
 }
 
 func (c *Client) PrinterURI(name string) string {
-	scheme := "ipp"
-	if c.UseTLS {
-		scheme = "ipps"
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "ipp://localhost/printers/"
 	}
-	return scheme + "://" + c.Host + ":" + strconv.Itoa(c.Port) + "/printers/" + name
+	return "ipp://localhost/printers/" + url.PathEscape(name)
 }
 
 func (c *Client) IppURL() string {
+	return c.ippURLForPath("/ipp/print")
+}
+
+func (c *Client) ippURLForPath(path string) string {
 	scheme := "http"
 	if c.UseTLS {
 		scheme = "https"
 	}
-	return scheme + "://" + c.Host + ":" + strconv.Itoa(c.Port) + "/ipp/print"
+	if path == "" {
+		path = "/ipp/print"
+	}
+	return scheme + "://" + c.Host + ":" + strconv.Itoa(c.Port) + path
+}
+
+func ippPathForOp(op goipp.Op) string {
+	switch op {
+	case goipp.OpCancelJobs,
+		goipp.OpPurgeJobs,
+		goipp.OpCupsAddModifyPrinter,
+		goipp.OpCupsDeletePrinter,
+		goipp.OpCupsAddModifyClass,
+		goipp.OpCupsDeleteClass,
+		goipp.OpCupsSetDefault,
+		goipp.OpCupsAcceptJobs,
+		goipp.OpCupsRejectJobs,
+		goipp.OpPausePrinter,
+		goipp.OpPausePrinterAfterCurrentJob,
+		goipp.OpResumePrinter,
+		goipp.OpEnablePrinter,
+		goipp.OpDisablePrinter,
+		goipp.OpHoldNewJobs,
+		goipp.OpReleaseHeldNewJobs,
+		goipp.OpRestartPrinter,
+		goipp.OpPauseAllPrinters,
+		goipp.OpPauseAllPrintersAfterCurrentJob,
+		goipp.OpResumeAllPrinters,
+		goipp.OpRestartSystem:
+		return "/admin/"
+
+	case goipp.OpCancelJob,
+		goipp.OpCancelMyJobs,
+		goipp.OpGetJobs,
+		goipp.OpGetJobAttributes,
+		goipp.OpSetJobAttributes,
+		goipp.OpHoldJob,
+		goipp.OpReleaseJob,
+		goipp.OpRestartJob,
+		goipp.OpResumeJob,
+		goipp.OpCloseJob,
+		goipp.OpCreateJobSubscriptions,
+		goipp.OpGetNotifications,
+		goipp.OpGetDocuments,
+		goipp.OpGetDocumentAttributes,
+		goipp.OpCupsAuthenticateJob,
+		goipp.OpCupsMoveJob,
+		goipp.OpCupsGetDocument:
+		return "/jobs/"
+	case goipp.OpPrintJob,
+		goipp.OpCreateJob,
+		goipp.OpSendDocument,
+		goipp.OpValidateJob,
+		goipp.OpValidateDocument:
+		return "/ipp/print"
+	default:
+		return "/"
+	}
 }
 
 func (c *Client) Send(ctx context.Context, msg *goipp.Message, data io.Reader) (*goipp.Message, error) {
@@ -124,7 +186,7 @@ func (c *Client) Send(ctx context.Context, msg *goipp.Message, data io.Reader) (
 		body = io.MultiReader(bytes.NewBuffer(payload), data)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.IppURL(), body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ippURLForPath(ippPathForMessage(msg)), body)
 	if err != nil {
 		return nil, err
 	}
@@ -170,7 +232,7 @@ func (c *Client) SendWithPayload(ctx context.Context, msg *goipp.Message, data i
 		body = io.MultiReader(bytes.NewBuffer(payload), data)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.IppURL(), body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ippURLForPath(ippPathForMessage(msg)), body)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -213,4 +275,71 @@ func tlsConfig(c *Client) *tls.Config {
 		skipVerify = insecure
 	}
 	return &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: skipVerify}
+}
+
+func ippPathForMessage(msg *goipp.Message) string {
+	if msg == nil {
+		return "/"
+	}
+	op := goipp.Op(msg.Code)
+	defaultPath := ippPathForOp(op)
+	if defaultPath == "/admin/" || defaultPath == "/jobs/" {
+		return defaultPath
+	}
+	if ippPathPinnedToRoot(op) {
+		return "/"
+	}
+	if p, ok := ippResourcePathFromURI(attrString(msg.Operation, "printer-uri")); ok {
+		return p
+	}
+	if p, ok := ippResourcePathFromURI(attrString(msg.Operation, "job-uri")); ok {
+		return p
+	}
+	return defaultPath
+}
+
+func ippPathPinnedToRoot(op goipp.Op) bool {
+	switch op {
+	case goipp.OpCupsGetDevices,
+		goipp.OpCupsGetPpd,
+		goipp.OpCupsGetPpds,
+		goipp.OpCupsGetPrinters,
+		goipp.OpCupsGetClasses,
+		goipp.OpCupsGetDefault:
+		return true
+	default:
+		return false
+	}
+}
+
+func ippResourcePathFromURI(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", false
+	}
+	path := strings.TrimSpace(u.Path)
+	if path == "" {
+		return "", false
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return path, true
+}
+
+func attrString(attrs goipp.Attributes, name string) string {
+	for _, attr := range attrs {
+		if !strings.EqualFold(strings.TrimSpace(attr.Name), strings.TrimSpace(name)) {
+			continue
+		}
+		if len(attr.Values) == 0 {
+			return ""
+		}
+		return strings.TrimSpace(attr.Values[0].V.String())
+	}
+	return ""
 }

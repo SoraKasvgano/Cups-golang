@@ -97,6 +97,9 @@ func (dnssdBackend) ListDevices(ctx context.Context) ([]Device, error) {
 func (dnssdBackend) SubmitJob(ctx context.Context, printer model.Printer, job model.Job, doc model.Document, filePath string) error {
 	target, err := resolveDNSSDTarget(ctx, printer.URI)
 	if err != nil {
+		if classifyDNSSDResolveError(err) == ErrorUnsupported {
+			return WrapUnsupported("dnssd-resolve", printer.URI, err)
+		}
 		return WrapTemporary("dnssd-resolve", printer.URI, err)
 	}
 	if target == "" {
@@ -133,11 +136,34 @@ func (dnssdBackend) QuerySupplies(ctx context.Context, printer model.Printer) (S
 				lastErr = qerr
 			}
 		}
+	} else if err != nil {
+		if classifyDNSSDResolveError(err) == ErrorUnsupported {
+			return SupplyStatus{State: "unknown"}, WrapUnsupported("dnssd-resolve", printer.URI, err)
+		}
+		lastErr = WrapTemporary("dnssd-resolve", printer.URI, err)
 	}
 	if status, err, ok := querySuppliesViaSNMP(ctx, printer); ok {
 		return status, err
 	}
 	return SupplyStatus{State: "unknown"}, lastErr
+}
+
+func classifyDNSSDResolveError(err error) ErrorKind {
+	if err == nil {
+		return ErrorTemporary
+	}
+	if errors.Is(err, ErrUnsupported) {
+		return ErrorUnsupported
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return ErrorUnsupported
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	if strings.Contains(msg, "invalid dnssd uri") || strings.Contains(msg, "empty dnssd uri") || strings.Contains(msg, "unsupported") {
+		return ErrorUnsupported
+	}
+	return ErrorTemporary
 }
 
 func parseTxtRecords(records []string) map[string]string {
@@ -258,23 +284,36 @@ func parseDNSSDURI(uri string) (string, string, string, error) {
 	if uri == "" {
 		return "", "", "", errors.New("empty dnssd uri")
 	}
-	u, err := url.Parse(uri)
-	if err != nil {
-		return "", "", "", err
-	}
-	host := strings.TrimSpace(u.Host)
-	if host == "" {
-		host = strings.TrimSpace(u.Opaque)
+	host := ""
+	if u, err := url.Parse(uri); err == nil {
+		host = strings.TrimSpace(u.Host)
+		if host == "" {
+			host = strings.TrimSpace(u.Opaque)
+		}
+	} else {
+		// Go's URL parser rejects escaped host labels (for example "%20"),
+		// but CUPS-style dnssd:// instance names commonly rely on that form.
+		raw := strings.TrimSpace(uri)
+		if strings.HasPrefix(strings.ToLower(raw), "dnssd://") {
+			raw = raw[len("dnssd://"):]
+		}
+		if idx := strings.IndexAny(raw, "/?#"); idx >= 0 {
+			raw = raw[:idx]
+		}
+		host = strings.TrimSpace(raw)
 	}
 	host = strings.TrimPrefix(host, "//")
 	if host == "" {
 		return "", "", "", errors.New("invalid dnssd uri")
 	}
+	if at := strings.LastIndex(host, "@"); at >= 0 && at < len(host)-1 {
+		host = host[at+1:]
+	}
 	if strings.Contains(host, ":") {
 		if h, _, err := net.SplitHostPort(host); err == nil {
 			host = h
-		} else {
-			host = strings.Split(host, ":")[0]
+		} else if idx := strings.LastIndex(host, ":"); idx > 0 && idx < len(host)-1 && isAllDigits(host[idx+1:]) {
+			host = host[:idx]
 		}
 	}
 	host, _ = url.PathUnescape(host)
@@ -295,6 +334,18 @@ func parseDNSSDURI(uri string) (string, string, string, error) {
 		}
 	}
 	return host, "", "", nil
+}
+
+func isAllDigits(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func dnssdEntryURI(service string, entry *mdns.ServiceEntry) string {

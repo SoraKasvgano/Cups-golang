@@ -11,55 +11,57 @@ import (
 )
 
 type Config struct {
-	ListenAddr           string
-	ListenHTTP           []string
-	ListenHTTPS          []string
-	TLSEnabled           bool
-	TLSOnly              bool
-	TLSCertPath          string
-	TLSKeyPath           string
-	TLSAutoGenerate      bool
-	DataDir              string
-	DBPath               string
-	SpoolDir             string
-	OutputDir            string
-	ConfDir              string
-	PPDDir               string
-	ServerName           string
-	ServerAlias          []string
-	DefaultPolicy        string
-	WebInterface         bool
-	MaxRequestSize       int64
-	MaxLogSize           int64
-	LogLevel             string
-	ErrorLogPath         string
-	AccessLogPath        string
-	PageLogPath          string
-	ErrorPolicy          string
-	DefaultAuthType      string
-	MaxJobTime           int
-	MaxEvents            int
-	MaxLeaseDuration     int
-	DefaultLeaseDuration int
+	ListenAddr                 string
+	ListenHTTP                 []string
+	ListenHTTPS                []string
+	TLSEnabled                 bool
+	TLSOnly                    bool
+	TLSCertPath                string
+	TLSKeyPath                 string
+	TLSAutoGenerate            bool
+	DataDir                    string
+	DBPath                     string
+	SpoolDir                   string
+	OutputDir                  string
+	ConfDir                    string
+	PPDDir                     string
+	ServerName                 string
+	ServerAlias                []string
+	DefaultPolicy              string
+	WebInterface               bool
+	MaxRequestSize             int64
+	MaxLogSize                 int64
+	LogLevel                   string
+	AccessLogLevel             string
+	PageLogFormat              string
+	ErrorLogPath               string
+	AccessLogPath              string
+	PageLogPath                string
+	ErrorPolicy                string
+	DefaultAuthType            string
+	MaxJobTime                 int
+	MaxEvents                  int
+	MaxLeaseDuration           int
+	DefaultLeaseDuration       int
 	MaxSubscriptions           int
 	MaxSubscriptionsPerJob     int
 	MaxSubscriptionsPerPrinter int
 	MaxSubscriptionsPerUser    int
-	BrowseLocal          bool
-	BrowseLocalProtocols []string
-	DNSSDHostName        string
-	DNSSDComputerName    string
-	DeviceBackendsDir    string
-	FilterDir            string
-	ClientConfDir        string
-	JobRetryLimit        int
-	JobRetryInterval     int
-	MultipleOperationTimeout int
-	ServerBin            string
-	RequestRoot          string
-	StateDir             string
-	CacheDir             string
-	DocumentRoot         string
+	BrowseLocal                bool
+	BrowseLocalProtocols       []string
+	DNSSDHostName              string
+	DNSSDComputerName          string
+	DeviceBackendsDir          string
+	FilterDir                  string
+	ClientConfDir              string
+	JobRetryLimit              int
+	JobRetryInterval           int
+	MultipleOperationTimeout   int
+	ServerBin                  string
+	RequestRoot                string
+	StateDir                   string
+	CacheDir                   string
+	DocumentRoot               string
 }
 
 type configOverrides struct {
@@ -84,28 +86,30 @@ func Load() Config {
 	confDir := getenv("CUPS_CONF_DIR", filepath.Join(dataDir, "conf"))
 
 	cfg := Config{
-		ListenAddr:      getenv("CUPS_LISTEN_ADDR", ":631"),
-		TLSEnabled:      getenvBool("CUPS_TLS_ENABLED", true),
-		TLSOnly:         getenvBool("CUPS_TLS_ONLY", false),
-		TLSCertPath:     getenv("CUPS_TLS_CERT", filepath.Join(confDir, "cupsd.crt")),
-		TLSKeyPath:      getenv("CUPS_TLS_KEY", filepath.Join(confDir, "cupsd.key")),
-		TLSAutoGenerate: getenvBool("CUPS_TLS_AUTOGEN", true),
-		DataDir:         dataDir,
-		DBPath:          getenv("CUPS_DB_PATH", filepath.Join(dataDir, "cupsgolang.db")),
-		SpoolDir:        getenv("CUPS_SPOOL_DIR", filepath.Join(dataDir, "spool")),
-		OutputDir:       getenv("CUPS_OUTPUT_DIR", filepath.Join(dataDir, "printed")),
-		ConfDir:         confDir,
-		PPDDir:          getenv("CUPS_PPD_DIR", filepath.Join(dataDir, "ppd")),
-		ServerName:      getenv("CUPS_SERVER_NAME", "CUPS-Golang"),
-		WebInterface:    true,
-		LogLevel:        "info",
-		BrowseLocal:     true,
-		BrowseLocalProtocols: []string{"dnssd"},
-		MultipleOperationTimeout: 900,
-		MaxJobTime:               3 * 60 * 60,
-		MaxEvents:               100,
-		MaxLeaseDuration:        0,
-		DefaultLeaseDuration:    24 * 60 * 60,
+		ListenAddr:                 getenv("CUPS_LISTEN_ADDR", ":631"),
+		TLSEnabled:                 getenvBool("CUPS_TLS_ENABLED", true),
+		TLSOnly:                    getenvBool("CUPS_TLS_ONLY", false),
+		TLSCertPath:                getenv("CUPS_TLS_CERT", filepath.Join(confDir, "cupsd.crt")),
+		TLSKeyPath:                 getenv("CUPS_TLS_KEY", filepath.Join(confDir, "cupsd.key")),
+		TLSAutoGenerate:            getenvBool("CUPS_TLS_AUTOGEN", true),
+		DataDir:                    dataDir,
+		DBPath:                     getenv("CUPS_DB_PATH", filepath.Join(dataDir, "cupsgolang.db")),
+		SpoolDir:                   getenv("CUPS_SPOOL_DIR", filepath.Join(dataDir, "spool")),
+		OutputDir:                  getenv("CUPS_OUTPUT_DIR", filepath.Join(dataDir, "printed")),
+		ConfDir:                    confDir,
+		PPDDir:                     getenv("CUPS_PPD_DIR", filepath.Join(dataDir, "ppd")),
+		ServerName:                 getenv("CUPS_SERVER_NAME", "CUPS-Golang"),
+		WebInterface:               true,
+		LogLevel:                   "info",
+		AccessLogLevel:             "actions",
+		PageLogFormat:              "%p %u %j %T %P %C %{job-billing} %{job-originating-host-name} %{job-name} %{media} %{sides}",
+		BrowseLocal:                true,
+		BrowseLocalProtocols:       []string{"dnssd"},
+		MultipleOperationTimeout:   900,
+		MaxJobTime:                 3 * 60 * 60,
+		MaxEvents:                  100,
+		MaxLeaseDuration:           0,
+		DefaultLeaseDuration:       24 * 60 * 60,
 		MaxSubscriptions:           100,
 		MaxSubscriptionsPerJob:     0,
 		MaxSubscriptionsPerPrinter: 0,
@@ -252,6 +256,12 @@ func applyEnvOverrides(cfg *Config, overrides *configOverrides) {
 			overrides.tlsKeyLocked = true
 		}
 	}
+	if v, ok := os.LookupEnv("CUPS_ACCESS_LOG_LEVEL"); ok {
+		cfg.AccessLogLevel = strings.TrimSpace(v)
+	}
+	if v, ok := os.LookupEnv("CUPS_PAGE_LOG_FORMAT"); ok {
+		cfg.PageLogFormat = strings.TrimSpace(v)
+	}
 	if v, ok := os.LookupEnv("CUPS_MULTIPLE_OPERATION_TIMEOUT"); ok {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
 			cfg.MultipleOperationTimeout = n
@@ -364,31 +374,32 @@ func parseCupsFilesConf(path string, cfg *Config, overrides *configOverrides) {
 			continue
 		}
 		parts := strings.Fields(line)
-		if len(parts) < 2 {
+		if len(parts) < 1 {
 			continue
 		}
-		key := parts[0]
-		raw := strings.TrimSpace(line[len(key):])
-		value := strings.TrimSpace(raw)
+		keyToken := parts[0]
+		key := strings.ToLower(keyToken)
+		raw := strings.TrimSpace(line[len(keyToken):])
+		value := unquoteValue(strings.TrimSpace(raw))
 		if strings.Contains(value, "@") {
 			continue
 		}
 		switch key {
-		case "ServerRoot":
+		case "serverroot":
 			if overrides != nil && overrides.confDirLocked {
 				continue
 			}
 			if value != "" {
 				cfg.ConfDir = resolvePath(cfg.ConfDir, value)
 			}
-		case "DataDir":
+		case "datadir":
 			if overrides != nil && overrides.dataDirLocked {
 				continue
 			}
 			if value != "" {
 				cfg.DataDir = resolvePath(cfg.ConfDir, value)
 			}
-		case "RequestRoot":
+		case "requestroot":
 			if overrides != nil && overrides.spoolDir {
 				continue
 			}
@@ -399,19 +410,19 @@ func parseCupsFilesConf(path string, cfg *Config, overrides *configOverrides) {
 					overrides.spoolDir = true
 				}
 			}
-		case "StateDir":
+		case "statedir":
 			if value != "" {
 				cfg.StateDir = resolvePath(cfg.ConfDir, value)
 			}
-		case "CacheDir":
+		case "cachedir":
 			if value != "" {
 				cfg.CacheDir = resolvePath(cfg.ConfDir, value)
 			}
-		case "DocumentRoot":
+		case "documentroot":
 			if value != "" {
 				cfg.DocumentRoot = resolvePath(cfg.ConfDir, value)
 			}
-		case "ServerBin":
+		case "serverbin":
 			if value != "" {
 				cfg.ServerBin = resolvePath(cfg.ConfDir, value)
 				if cfg.DeviceBackendsDir == "" {
@@ -421,18 +432,24 @@ func parseCupsFilesConf(path string, cfg *Config, overrides *configOverrides) {
 					cfg.FilterDir = filepath.Join(cfg.ServerBin, "filter")
 				}
 			}
-		case "AccessLog":
-			if value != "" {
-				cfg.AccessLogPath = resolvePath(cfg.ConfDir, value)
+		case "accesslog":
+			if value == "" {
+				cfg.AccessLogPath = ""
+				continue
 			}
-		case "ErrorLog":
-			if value != "" {
-				cfg.ErrorLogPath = resolvePath(cfg.ConfDir, value)
+			cfg.AccessLogPath = resolvePath(cfg.ConfDir, value)
+		case "errorlog":
+			if value == "" {
+				cfg.ErrorLogPath = ""
+				continue
 			}
-		case "PageLog":
-			if value != "" {
-				cfg.PageLogPath = resolvePath(cfg.ConfDir, value)
+			cfg.ErrorLogPath = resolvePath(cfg.ConfDir, value)
+		case "pagelog":
+			if value == "" {
+				cfg.PageLogPath = ""
+				continue
 			}
+			cfg.PageLogPath = resolvePath(cfg.ConfDir, value)
 		}
 	}
 }
@@ -475,14 +492,14 @@ func parseCupsdConf(path string, cfg *Config, overrides *configOverrides) {
 		if len(parts) < 2 {
 			continue
 		}
-		key := parts[0]
+		key := strings.ToLower(parts[0])
 		raw := strings.TrimSpace(line[len(key):])
-		value := strings.TrimSpace(raw)
+		value := unquoteValue(strings.TrimSpace(raw))
 		if strings.Contains(value, "@") {
 			continue
 		}
 		switch key {
-		case "Listen":
+		case "listen":
 			if overrides != nil && overrides.listenHTTPLocked {
 				continue
 			}
@@ -494,7 +511,7 @@ func parseCupsdConf(path string, cfg *Config, overrides *configOverrides) {
 			} else {
 				addListen(cfg, value, false)
 			}
-		case "Port":
+		case "port":
 			if overrides != nil && overrides.listenHTTPLocked {
 				continue
 			}
@@ -504,90 +521,94 @@ func parseCupsdConf(path string, cfg *Config, overrides *configOverrides) {
 				}
 				addListen(cfg, ":"+p, false)
 			}
-		case "ServerName":
+		case "servername":
 			if overrides != nil && overrides.serverNameLocked {
 				continue
 			}
 			cfg.ServerName = value
-		case "ServerAlias":
+		case "serveralias":
 			cfg.ServerAlias = appendUniqueList(cfg.ServerAlias, parts[1:]...)
-		case "DefaultPolicy":
+		case "defaultpolicy":
 			cfg.DefaultPolicy = value
-		case "WebInterface":
+		case "webinterface":
 			if v, ok := parseBool(value); ok {
 				cfg.WebInterface = v
 			}
-		case "MaxRequestSize":
+		case "maxrequestsize":
 			if v, ok := parseSize(value); ok {
 				cfg.MaxRequestSize = v
 			}
-		case "LimitRequestBody":
+		case "limitrequestbody":
 			if v, ok := parseSize(value); ok {
 				cfg.MaxRequestSize = v
 			}
-		case "MaxLogSize":
+		case "maxlogsize":
 			if v, ok := parseSize(value); ok {
 				cfg.MaxLogSize = v
 			}
-		case "LogLevel":
+		case "loglevel":
 			cfg.LogLevel = value
-		case "ErrorPolicy":
+		case "accessloglevel":
+			cfg.AccessLogLevel = strings.TrimSpace(value)
+		case "pagelogformat":
+			cfg.PageLogFormat = value
+		case "errorpolicy":
 			cfg.ErrorPolicy = value
-		case "DefaultAuthType":
+		case "defaultauthtype":
 			cfg.DefaultAuthType = value
-		case "Browsing":
+		case "browsing":
 			if v, ok := parseBool(value); ok {
 				cfg.BrowseLocal = v
 			}
-		case "BrowseLocalProtocols":
+		case "browselocalprotocols":
 			cfg.BrowseLocalProtocols = parseBrowseLocalProtocols(parts[1:])
-		case "DNSSDHostName":
+		case "dnssdhostname":
 			cfg.DNSSDHostName = value
-		case "DNSSDComputerName":
+		case "dnssdcomputername":
 			cfg.DNSSDComputerName = value
-		case "DefaultEncryption":
+		case "defaultencryption":
 			applyDefaultEncryption(cfg, value)
-		case "JobRetryLimit":
+		case "jobretrylimit":
 			if n, ok := parseInt(value); ok {
 				cfg.JobRetryLimit = n
 			}
-		case "JobRetryInterval":
+		case "jobretryinterval":
 			if n, ok := parseInt(value); ok {
 				cfg.JobRetryInterval = n
 			}
-		case "MultipleOperationTimeout":
+		case "multipleoperationtimeout":
 			if n, ok := parseInt(value); ok {
 				cfg.MultipleOperationTimeout = n
 			}
-		case "MaxJobTime":
+		case "maxjobtime":
 			if n, ok := parseTimeSeconds(value); ok {
 				cfg.MaxJobTime = n
 			}
-		case "MaxEvents":
+		case "maxevents":
 			if n, ok := parseInt(value); ok {
 				cfg.MaxEvents = n
 			}
-		case "MaxLeaseDuration":
+		case "maxleaseduration":
 			if n, ok := parseTimeSeconds(value); ok {
 				cfg.MaxLeaseDuration = n
 			}
-		case "DefaultLeaseDuration":
+		case "defaultleaseduration":
 			if n, ok := parseTimeSeconds(value); ok {
 				cfg.DefaultLeaseDuration = n
 			}
-		case "MaxSubscriptions":
+		case "maxsubscriptions":
 			if n, ok := parseInt(value); ok {
 				cfg.MaxSubscriptions = n
 			}
-		case "MaxSubscriptionsPerJob":
+		case "maxsubscriptionsperjob":
 			if n, ok := parseInt(value); ok {
 				cfg.MaxSubscriptionsPerJob = n
 			}
-		case "MaxSubscriptionsPerPrinter":
+		case "maxsubscriptionsperprinter":
 			if n, ok := parseInt(value); ok {
 				cfg.MaxSubscriptionsPerPrinter = n
 			}
-		case "MaxSubscriptionsPerUser":
+		case "maxsubscriptionsperuser":
 			if n, ok := parseInt(value); ok {
 				cfg.MaxSubscriptionsPerUser = n
 			}
@@ -834,6 +855,17 @@ func parseTimeSeconds(value string) (int, bool) {
 		return 0, false
 	}
 	return n * mult, true
+}
+
+func unquoteValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 {
+		if (strings.HasPrefix(value, "\"") && strings.HasSuffix(value, "\"")) ||
+			(strings.HasPrefix(value, "'") && strings.HasSuffix(value, "'")) {
+			value = value[1 : len(value)-1]
+		}
+	}
+	return strings.TrimSpace(value)
 }
 
 func getenv(key, fallback string) string {

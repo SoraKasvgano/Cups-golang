@@ -2,6 +2,8 @@ package backend
 
 import (
 	"encoding/json"
+	"errors"
+	"net/http"
 	"testing"
 
 	goipp "github.com/OpenPrinting/goipp"
@@ -71,6 +73,76 @@ func TestBuildJobAttributesFromOptions_FiltersInternalKeys(t *testing.T) {
 		t.Fatalf("expected print-color-mode attribute from output-mode mapping")
 	} else if len(a.Values) != 1 || a.Values[0].T != goipp.TagKeyword || a.Values[0].V.String() != "color" {
 		t.Fatalf("expected print-color-mode=color keyword, got %+v", a)
+	}
+}
+
+func TestClassifyIPPStatus(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    goipp.Status
+		wantKind  ErrorKind
+		expectNil bool
+	}{
+		{name: "ok", status: goipp.StatusOk, expectNil: true},
+		{name: "unsupported format", status: goipp.StatusErrorDocumentFormatNotSupported, wantKind: ErrorUnsupported},
+		{name: "unsupported attrs", status: goipp.StatusErrorAttributesOrValues, wantKind: ErrorUnsupported},
+		{name: "temporary busy", status: goipp.StatusErrorBusy, wantKind: ErrorTemporary},
+		{name: "temporary not accepting", status: goipp.StatusErrorNotAcceptingJobs, wantKind: ErrorTemporary},
+		{name: "permanent bad request", status: goipp.StatusErrorBadRequest, wantKind: ErrorPermanent},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := classifyIPPStatus("ipp-submit", "ipp://localhost/printers/Office", tc.status)
+			if tc.expectNil {
+				if err != nil {
+					t.Fatalf("expected nil error, got %v", err)
+				}
+				return
+			}
+			var be *Error
+			if err == nil || !errors.As(err, &be) {
+				t.Fatalf("expected backend error, got %v", err)
+			}
+			if be.Kind != tc.wantKind {
+				t.Fatalf("error kind = %q, want %q", be.Kind, tc.wantKind)
+			}
+		})
+	}
+}
+
+func TestClassifyIPPHTTPStatus(t *testing.T) {
+	tests := []struct {
+		name      string
+		code      int
+		wantKind  ErrorKind
+		expectNil bool
+	}{
+		{name: "ok", code: http.StatusOK, expectNil: true},
+		{name: "not found", code: http.StatusNotFound, wantKind: ErrorUnsupported},
+		{name: "gone", code: http.StatusGone, wantKind: ErrorUnsupported},
+		{name: "server error", code: http.StatusBadGateway, wantKind: ErrorTemporary},
+		{name: "timeout", code: http.StatusRequestTimeout, wantKind: ErrorTemporary},
+		{name: "bad request", code: http.StatusBadRequest, wantKind: ErrorPermanent},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := classifyIPPHTTPStatus("ipp-submit", "ipp://localhost/printers/Office", tc.code, http.StatusText(tc.code))
+			if tc.expectNil {
+				if err != nil {
+					t.Fatalf("expected nil error, got %v", err)
+				}
+				return
+			}
+			var be *Error
+			if err == nil || !errors.As(err, &be) {
+				t.Fatalf("expected backend error, got %v", err)
+			}
+			if be.Kind != tc.wantKind {
+				t.Fatalf("error kind = %q, want %q", be.Kind, tc.wantKind)
+			}
+		})
 	}
 }
 

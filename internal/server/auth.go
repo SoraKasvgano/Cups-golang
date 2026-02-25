@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -100,22 +101,38 @@ func (s *Server) authenticate(r *http.Request, authType string) (model.User, boo
 	if r == nil {
 		return model.User{}, false
 	}
-	authType = strings.TrimSpace(authType)
-	if strings.EqualFold(authType, "none") {
+	authType = strings.ToLower(strings.TrimSpace(authType))
+	if authType == "none" {
 		return model.User{}, true
 	}
-	if authType == "" || strings.EqualFold(authType, "basic") {
+	if authType == "basic" {
 		if u, ok := s.authenticateBasic(r); ok {
 			return u, true
 		}
-		if authType != "" {
-			return model.User{}, false
-		}
+		return model.User{}, false
 	}
-	if authType == "" || strings.EqualFold(authType, "digest") {
+	if authType == "digest" {
 		if u, ok := s.authenticateDigest(r); ok {
 			return u, true
 		}
+		return model.User{}, false
+	}
+	if authType == "negotiate" || authType == "kerberos" {
+		if u, ok := s.authenticateNegotiate(r); ok {
+			return u, true
+		}
+		return model.User{}, false
+	}
+
+	// Default/unknown auth type: follow CUPS behavior and try common methods.
+	if u, ok := s.authenticateBasic(r); ok {
+		return u, true
+	}
+	if u, ok := s.authenticateDigest(r); ok {
+		return u, true
+	}
+	if u, ok := s.authenticateNegotiate(r); ok {
+		return u, true
 	}
 	return model.User{}, false
 }
@@ -198,7 +215,46 @@ func (s *Server) authenticateDigest(r *http.Request) (model.User, bool) {
 	return model.User{}, false
 }
 
+func (s *Server) authenticateNegotiate(r *http.Request) (model.User, bool) {
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if auth == "" || !strings.HasPrefix(strings.ToLower(auth), "negotiate ") {
+		return model.User{}, false
+	}
+	token := strings.TrimSpace(auth[len("Negotiate "):])
+	if token == "" {
+		return model.User{}, false
+	}
+	username := negotiateUserName(r)
+	if username == "" {
+		return model.User{}, false
+	}
+
+	// If user exists in local store, return full record (including admin flag).
+	if s != nil && s.Store != nil {
+		var user model.User
+		err := s.Store.WithTx(r.Context(), true, func(tx *sql.Tx) error {
+			u, err := s.Store.GetUserByUsername(r.Context(), tx, username)
+			if err != nil {
+				return err
+			}
+			user = u
+			return nil
+		})
+		if err == nil {
+			return user, true
+		}
+	}
+
+	// Reverse-proxy / external auth integration fallback.
+	return model.User{Username: username}, true
+}
+
 func setAuthChallenge(w http.ResponseWriter, authType string) {
+	authType = strings.ToLower(strings.TrimSpace(authType))
+	if authType == "negotiate" || authType == "kerberos" {
+		w.Header().Set("WWW-Authenticate", "Negotiate")
+		return
+	}
 	if strings.EqualFold(authType, "basic") {
 		w.Header().Set("WWW-Authenticate", `Basic realm="`+authRealm+`"`)
 		return
@@ -211,6 +267,7 @@ func setAuthChallenge(w http.ResponseWriter, authType string) {
 	nonce := generateNonce()
 	w.Header().Add("WWW-Authenticate", `Basic realm="`+authRealm+`"`)
 	w.Header().Add("WWW-Authenticate", fmt.Sprintf(`Digest realm="%s", qop="auth", nonce="%s", algorithm=MD5`, authRealm, nonce))
+	w.Header().Add("WWW-Authenticate", "Negotiate")
 }
 
 func parseDigestAuth(value string) map[string]string {
@@ -290,6 +347,76 @@ func md5Hex(value string) string {
 
 func computeDigestHA1(username, password string) string {
 	return md5Hex(username + ":" + authRealm + ":" + password)
+}
+
+func authUserFromRequest(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	if user, _, ok := r.BasicAuth(); ok {
+		user = strings.TrimSpace(user)
+		if user != "" {
+			return user
+		}
+	}
+
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(auth), "digest ") {
+		fields := parseDigestAuth(auth[len("Digest "):])
+		if user := strings.TrimSpace(fields["username"]); user != "" {
+			return user
+		}
+	}
+	if strings.HasPrefix(strings.ToLower(auth), "negotiate ") {
+		if user := strings.TrimSpace(negotiateUserName(r)); user != "" {
+			return user
+		}
+	}
+	return ""
+}
+
+func negotiateUserName(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	headerCandidates := []string{
+		"X-Remote-User",
+		"Remote-User",
+		"X-Auth-Request-User",
+		"X-Forwarded-User",
+		"REMOTE_USER",
+	}
+
+	// Only trust proxy-forwarded user headers on loopback requests.
+	if isLoopbackRemoteAddr(r.RemoteAddr) {
+		for _, header := range headerCandidates {
+			if user := strings.TrimSpace(r.Header.Get(header)); user != "" {
+				return user
+			}
+		}
+	}
+
+	// TLS client certificate identity fallback.
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		if cn := strings.TrimSpace(r.TLS.PeerCertificates[0].Subject.CommonName); cn != "" {
+			return cn
+		}
+	}
+
+	return ""
+}
+
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	host := strings.TrimSpace(remoteAddr)
+	if host == "" {
+		return false
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = strings.TrimSpace(h)
+	}
+	host = strings.Trim(host, "[]")
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func isMutatingIPP(op int) bool {

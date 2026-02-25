@@ -124,9 +124,49 @@ func acceptJobs(client *cupsclient.Client, name, reason string) error {
 	req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
 	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
 	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(client.PrinterURI(name))))
+	addRequestingUserName(&req.Operation, client)
 	if strings.TrimSpace(reason) != "" {
 		req.Operation.Add(goipp.MakeAttribute("printer-state-message", goipp.TagText, goipp.String(strings.TrimSpace(reason))))
 	}
-	_, err := client.Send(context.Background(), req, nil)
-	return err
+	resp, err := client.Send(context.Background(), req, nil)
+	if err != nil {
+		return err
+	}
+	return checkIPPStatus(resp)
+}
+
+func checkIPPStatus(resp *goipp.Message) error {
+	if resp == nil {
+		return errors.New("empty ipp response")
+	}
+	status := goipp.Status(resp.Code)
+	if status > goipp.StatusOkConflicting {
+		return fmt.Errorf("%s", status)
+	}
+	return nil
+}
+
+func addRequestingUserName(attrs *goipp.Attributes, client *cupsclient.Client) {
+	if attrs == nil {
+		return
+	}
+	user := requestingUserName(client)
+	if user == "" {
+		return
+	}
+	attrs.Add(goipp.MakeAttribute("requesting-user-name", goipp.TagName, goipp.String(user)))
+}
+
+func requestingUserName(client *cupsclient.Client) string {
+	if client != nil {
+		if user := strings.TrimSpace(client.User); user != "" {
+			return user
+		}
+	}
+	for _, key := range []string{"CUPS_USER", "USER", "USERNAME"} {
+		if user := strings.TrimSpace(os.Getenv(key)); user != "" {
+			return user
+		}
+	}
+	return "anonymous"
 }

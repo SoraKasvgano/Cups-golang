@@ -34,7 +34,16 @@ type options struct {
 	classRemove string
 	extraOpts   map[string]string
 	removeOpts  []string
+	warnings    []string
 }
+
+type classMemberAction string
+
+const (
+	classMemberNoop   classMemberAction = "noop"
+	classMemberSet    classMemberAction = "set"
+	classMemberDelete classMemberAction = "delete"
+)
 
 func main() {
 	opts, err := parseArgs(os.Args[1:])
@@ -44,6 +53,11 @@ func main() {
 	}
 	if err != nil {
 		fail(err)
+	}
+	for _, warning := range opts.warnings {
+		if strings.TrimSpace(warning) != "" {
+			fmt.Fprintln(os.Stderr, "lpadmin:", warning)
+		}
 	}
 	client := cupsclient.NewFromConfig(
 		cupsclient.WithServer(opts.server),
@@ -98,6 +112,9 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  -E                      Encrypt connection or enable queue when used after -p")
 	fmt.Fprintln(os.Stderr, "  -h server[:port]        Connect to server")
 	fmt.Fprintln(os.Stderr, "  -U username             Authenticate as user")
+	fmt.Fprintln(os.Stderr, "  -u allow:userlist|deny:userlist")
+	fmt.Fprintln(os.Stderr, "  -A file                 Not supported (System V interfaces are removed)")
+	fmt.Fprintln(os.Stderr, "  -I type-list            Accepted for compatibility; ignored")
 	fmt.Fprintln(os.Stderr, "  -p printer              Add/modify printer")
 	fmt.Fprintln(os.Stderr, "  -v device-uri           Set device URI")
 	fmt.Fprintln(os.Stderr, "  -m model                Set ppd-name")
@@ -164,6 +181,18 @@ func parseArgs(args []string) (options, error) {
 					return opts, err
 				}
 				opts.user = strings.TrimSpace(v)
+			case 'A':
+				_, err := consume(ch)
+				if err != nil {
+					return opts, err
+				}
+				return opts, fmt.Errorf("System V interface scripts are no longer supported for security reasons")
+			case 'I':
+				_, err := consume(ch)
+				if err != nil {
+					return opts, err
+				}
+				opts.warnings = append(opts.warnings, "Warning - content type list ignored.")
 			case 'p':
 				v, err := consume(ch)
 				if err != nil {
@@ -242,6 +271,24 @@ func parseArgs(args []string) (options, error) {
 						opts.removeOpts = append(opts.removeOpts, name)
 					}
 				}
+			case 'u':
+				v, err := consume(ch)
+				if err != nil {
+					return opts, err
+				}
+				attrName, users, ok := parseAccessUsersOption(v)
+				if !ok {
+					return opts, fmt.Errorf("unknown allow/deny option %q", strings.TrimSpace(v))
+				}
+				if opts.extraOpts == nil {
+					opts.extraOpts = map[string]string{}
+				}
+				opts.extraOpts[attrName] = users
+				if attrName == "requesting-user-name-allowed" {
+					delete(opts.extraOpts, "requesting-user-name-denied")
+				} else {
+					delete(opts.extraOpts, "requesting-user-name-allowed")
+				}
 			case 'c':
 				v, err := consume(ch)
 				if err != nil {
@@ -259,7 +306,40 @@ func parseArgs(args []string) (options, error) {
 			}
 		}
 	}
+	if opts.printer != "" && !validateName(opts.printer) {
+		return opts, fmt.Errorf("printer name can only contain printable characters")
+	}
+	if opts.classAdd != "" && !validateName(opts.classAdd) {
+		return opts, fmt.Errorf("class name can only contain printable characters")
+	}
+	if opts.classRemove != "" && !validateName(opts.classRemove) {
+		return opts, fmt.Errorf("class name can only contain printable characters")
+	}
+	if opts.defaultName != "" && !validateName(opts.defaultName) {
+		return opts, fmt.Errorf("printer name can only contain printable characters")
+	}
+	if opts.deleteName != "" && !validateName(opts.deleteName) {
+		return opts, fmt.Errorf("printer name can only contain printable characters")
+	}
 	return opts, nil
+}
+
+func validateName(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	n := 0
+	for _, r := range name {
+		if r == '@' {
+			break
+		}
+		n++
+		if (r >= 0 && r <= ' ') || r == 127 || r == '/' || r == '\\' || r == '?' || r == '\'' || r == '"' || r == '#' {
+			return false
+		}
+	}
+	return n < 128
 }
 
 func addModifyPrinter(client *cupsclient.Client, opts options) error {
@@ -268,6 +348,7 @@ func addModifyPrinter(client *cupsclient.Client, opts options) error {
 	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
 	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(client.PrinterURI(opts.printer))))
 	req.Operation.Add(goipp.MakeAttribute("printer-name", goipp.TagName, goipp.String(opts.printer)))
+	addRequestingUserName(&req.Operation, client)
 
 	if opts.deviceURI != "" {
 		req.Printer.Add(goipp.MakeAttribute("device-uri", goipp.TagURI, goipp.String(opts.deviceURI)))
@@ -368,6 +449,26 @@ func normalizeLpadminOption(name, value string) (string, goipp.Tag, []goipp.Valu
 		return lower, goipp.TagName, []goipp.Value{goipp.String(value)}
 	case "printer-is-shared":
 		return "printer-is-shared", goipp.TagBoolean, []goipp.Value{goipp.Boolean(isTruthy(value))}
+	case "requesting-user-name-allowed":
+		vals := splitList(value, 0)
+		if len(vals) == 0 {
+			vals = []string{"all"}
+		}
+		out := make([]goipp.Value, 0, len(vals))
+		for _, v := range vals {
+			out = append(out, goipp.String(v))
+		}
+		return lower, goipp.TagName, out
+	case "requesting-user-name-denied":
+		vals := splitList(value, 0)
+		if len(vals) == 0 {
+			vals = []string{"none"}
+		}
+		out := make([]goipp.Value, 0, len(vals))
+		for _, v := range vals {
+			out = append(out, goipp.String(v))
+		}
+		return lower, goipp.TagName, out
 	case "job-sheets", "job-sheets-default":
 		vals := splitList(value, 2)
 		if len(vals) == 0 {
@@ -424,6 +525,21 @@ func parseOption(raw string) (string, string) {
 	return raw, "true"
 }
 
+func parseAccessUsersOption(raw string) (string, string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", false
+	}
+	lower := strings.ToLower(raw)
+	if strings.HasPrefix(lower, "allow:") {
+		return "requesting-user-name-allowed", strings.TrimSpace(raw[len("allow:"):]), true
+	}
+	if strings.HasPrefix(lower, "deny:") {
+		return "requesting-user-name-denied", strings.TrimSpace(raw[len("deny:"):]), true
+	}
+	return "", "", false
+}
+
 func splitList(value string, max int) []string {
 	if strings.TrimSpace(value) == "" {
 		return nil
@@ -463,16 +579,26 @@ func deleteDestination(client *cupsclient.Client, name string) error {
 	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
 	req.Operation.Add(goipp.MakeAttribute("printer-name", goipp.TagName, goipp.String(name)))
 	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(client.PrinterURI(name))))
+	addRequestingUserName(&req.Operation, client)
 	resp, err := client.Send(context.Background(), req, nil)
 	if err == nil && goipp.Status(resp.Code) < goipp.StatusRedirectionOtherSite {
 		return nil
 	}
+	if err != nil {
+		return err
+	}
+	if goipp.Status(resp.Code) != goipp.StatusErrorNotFound {
+		return fmt.Errorf("%s", goipp.Status(resp.Code))
+	}
 
-	// Try delete class if printer delete failed.
+	// Match CUPS behavior: only attempt class deletion when printer delete
+	// reports a missing destination.
 	req = goipp.NewRequest(goipp.DefaultVersion, goipp.OpCupsDeleteClass, uint32(time.Now().UnixNano()))
 	req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
 	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
 	req.Operation.Add(goipp.MakeAttribute("printer-name", goipp.TagName, goipp.String(name)))
+	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(classURI(client, name))))
+	addRequestingUserName(&req.Operation, client)
 	resp, err = client.Send(context.Background(), req, nil)
 	if err != nil {
 		return err
@@ -489,6 +615,7 @@ func setDefault(client *cupsclient.Client, name string) error {
 	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
 	req.Operation.Add(goipp.MakeAttribute("printer-name", goipp.TagName, goipp.String(name)))
 	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(client.PrinterURI(name))))
+	addRequestingUserName(&req.Operation, client)
 	resp, err := client.Send(context.Background(), req, nil)
 	if err != nil {
 		return err
@@ -504,6 +631,7 @@ func resumePrinter(client *cupsclient.Client, name string) error {
 	req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
 	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
 	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(client.PrinterURI(name))))
+	addRequestingUserName(&req.Operation, client)
 	resp, err := client.Send(context.Background(), req, nil)
 	if err != nil {
 		return err
@@ -519,6 +647,7 @@ func acceptPrinter(client *cupsclient.Client, name string) error {
 	req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
 	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
 	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(client.PrinterURI(name))))
+	addRequestingUserName(&req.Operation, client)
 	resp, err := client.Send(context.Background(), req, nil)
 	if err != nil {
 		return err
@@ -530,82 +659,91 @@ func acceptPrinter(client *cupsclient.Client, name string) error {
 }
 
 func updateClassMembers(client *cupsclient.Client, printerName, classAdd, classRemove string) error {
-	className := classAdd
+	if strings.TrimSpace(printerName) == "" {
+		return fmt.Errorf("missing printer name")
+	}
+	addClass := strings.TrimSpace(classAdd)
+	removeClass := strings.TrimSpace(classRemove)
+	if addClass != "" && removeClass != "" && !strings.EqualFold(addClass, removeClass) {
+		return fmt.Errorf("cannot combine -c %s with -r %s", addClass, removeClass)
+	}
+	className := addClass
 	if className == "" {
-		className = classRemove
+		className = removeClass
 	}
 	if className == "" {
 		return nil
 	}
 
-	members, err := fetchClassMembers(client, className)
+	members, memberURIs, found, err := fetchClassMembers(client, className)
 	if err != nil {
 		return err
 	}
-
-	memberSet := map[string]bool{}
-	for _, m := range members {
-		m = strings.TrimSpace(m)
-		if m == "" {
-			continue
-		}
-		memberSet[m] = true
-	}
-	if classAdd != "" {
-		memberSet[printerName] = true
-	}
-	if classRemove != "" {
-		delete(memberSet, printerName)
-	}
-
-	memberList := make([]goipp.Value, 0, len(memberSet))
-	for name := range memberSet {
-		memberList = append(memberList, goipp.String(client.PrinterURI(name)))
-	}
-
-	req := goipp.NewRequest(goipp.DefaultVersion, goipp.OpCupsAddModifyClass, uint32(time.Now().UnixNano()))
-	req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
-	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
-	req.Operation.Add(goipp.MakeAttribute("printer-name", goipp.TagName, goipp.String(className)))
-	if len(memberList) > 0 {
-		req.Printer.Add(goipp.MakeAttr("member-uris", goipp.TagURI, memberList[0], memberList[1:]...))
-	}
-	resp, err := client.Send(context.Background(), req, nil)
+	action, updatedMembers, err := computeClassMembersUpdate(found, members, printerName, addClass != "", removeClass != "", className)
 	if err != nil {
 		return err
 	}
-	if goipp.Status(resp.Code) >= goipp.StatusRedirectionOtherSite {
-		return fmt.Errorf("%s", goipp.Status(resp.Code))
+	switch action {
+	case classMemberNoop:
+		return nil
+	case classMemberDelete:
+		return deleteClass(client, className)
+	case classMemberSet:
+		updatedURIs := classMemberURIsForNames(updatedMembers, members, memberURIs, client)
+		return setClassMemberURIs(client, className, updatedURIs)
+	default:
+		return fmt.Errorf("unsupported class update action %q", action)
 	}
-	return nil
 }
 
-func fetchClassMembers(client *cupsclient.Client, className string) ([]string, error) {
-	req := goipp.NewRequest(goipp.DefaultVersion, goipp.OpCupsGetClasses, uint32(time.Now().UnixNano()))
+func fetchClassMembers(client *cupsclient.Client, className string) ([]string, []string, bool, error) {
+	req := goipp.NewRequest(goipp.DefaultVersion, goipp.OpGetPrinterAttributes, uint32(time.Now().UnixNano()))
 	req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
 	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
+	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(classURI(client, className))))
+	req.Operation.Add(goipp.MakeAttr("requested-attributes", goipp.TagKeyword, goipp.String("member-names"), goipp.String("member-uris")))
+	addRequestingUserName(&req.Operation, client)
 	resp, err := client.Send(context.Background(), req, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, false, err
+	}
+	status := goipp.Status(resp.Code)
+	if status == goipp.StatusErrorNotFound {
+		return nil, nil, false, nil
+	}
+	if status >= goipp.StatusRedirectionOtherSite {
+		return nil, nil, false, fmt.Errorf("%s", status)
 	}
 	for _, g := range resp.Groups {
 		if g.Tag != goipp.TagPrinterGroup {
 			continue
 		}
-		name := findAttr(g.Attrs, "printer-name")
-		if !strings.EqualFold(name, className) {
-			continue
-		}
-		uris := attrValues(g.Attrs, "member-uris")
-		members := make([]string, 0, len(uris))
-		for _, uri := range uris {
-			if n := destinationNameFromURI(uri); n != "" {
-				members = append(members, n)
+		memberNames := attrValues(g.Attrs, "member-names")
+		memberURIs := attrValues(g.Attrs, "member-uris")
+		if len(memberNames) == 0 && len(memberURIs) > 0 {
+			for _, memberURI := range memberURIs {
+				memberNames = append(memberNames, destinationNameFromURI(memberURI))
 			}
 		}
-		return members, nil
+		if len(memberURIs) < len(memberNames) {
+			for i := len(memberURIs); i < len(memberNames); i++ {
+				name := strings.TrimSpace(memberNames[i])
+				if name == "" {
+					memberURIs = append(memberURIs, "")
+					continue
+				}
+				memberURIs = append(memberURIs, client.PrinterURI(name))
+			}
+		}
+		if len(memberNames) < len(memberURIs) {
+			for i := len(memberNames); i < len(memberURIs); i++ {
+				memberNames = append(memberNames, destinationNameFromURI(memberURIs[i]))
+			}
+		}
+		names, uris := normalizeClassMembers(memberNames, memberURIs)
+		return names, uris, true, nil
 	}
-	return nil, nil
+	return nil, nil, true, nil
 }
 
 func findAttr(attrs goipp.Attributes, name string) string {
@@ -641,10 +779,281 @@ func destinationNameFromURI(uri string) string {
 			return ""
 		}
 		parts := strings.Split(path, "/")
-		return strings.TrimSpace(parts[len(parts)-1])
+		name := strings.TrimSpace(parts[len(parts)-1])
+		if decoded, err := url.PathUnescape(name); err == nil {
+			name = decoded
+		}
+		return name
 	}
 	if idx := strings.LastIndex(uri, "/"); idx >= 0 && idx+1 < len(uri) {
-		return strings.TrimSpace(uri[idx+1:])
+		name := strings.TrimSpace(uri[idx+1:])
+		if decoded, err := url.PathUnescape(name); err == nil {
+			name = decoded
+		}
+		return name
 	}
 	return strings.TrimSpace(uri)
+}
+
+func computeClassMembersUpdate(found bool, existing []string, printerName string, wantAdd, wantRemove bool, className string) (classMemberAction, []string, error) {
+	members := normalizeDestinationList(existing)
+	printerName = strings.TrimSpace(printerName)
+	if printerName == "" {
+		return classMemberNoop, nil, fmt.Errorf("missing printer name")
+	}
+	if !found {
+		if wantRemove && !wantAdd {
+			return classMemberNoop, nil, fmt.Errorf("class %s does not exist", className)
+		}
+		members = nil
+	}
+
+	changed := false
+	if wantRemove {
+		var removed bool
+		members, removed = removeDestinationName(members, printerName)
+		if !removed && !wantAdd {
+			return classMemberNoop, nil, fmt.Errorf("printer %s is not a member of class %s", printerName, className)
+		}
+		changed = changed || removed
+	}
+	if wantAdd && !containsDestinationName(members, printerName) {
+		members = append(members, printerName)
+		changed = true
+	}
+	if !changed {
+		return classMemberNoop, normalizeDestinationList(members), nil
+	}
+	if len(members) == 0 {
+		return classMemberDelete, nil, nil
+	}
+	return classMemberSet, normalizeDestinationList(members), nil
+}
+
+func containsDestinationName(names []string, target string) bool {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return false
+	}
+	for _, name := range names {
+		if strings.EqualFold(strings.TrimSpace(name), target) {
+			return true
+		}
+	}
+	return false
+}
+
+func removeDestinationName(names []string, target string) ([]string, bool) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return normalizeDestinationList(names), false
+	}
+	out := make([]string, 0, len(names))
+	removed := false
+	for _, name := range names {
+		if strings.EqualFold(strings.TrimSpace(name), target) {
+			removed = true
+			continue
+		}
+		out = append(out, name)
+	}
+	return normalizeDestinationList(out), removed
+}
+
+func normalizeDestinationList(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		name := strings.TrimSpace(value)
+		if name == "" {
+			continue
+		}
+		key := strings.ToLower(name)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, name)
+	}
+	return out
+}
+
+func setClassMembers(client *cupsclient.Client, className string, members []string) error {
+	return setClassMemberURIs(client, className, classMemberURIsForNames(members, nil, nil, client))
+}
+
+func setClassMemberURIs(client *cupsclient.Client, className string, memberURIs []string) error {
+	memberURIs = normalizeMemberURIs(memberURIs)
+	if len(memberURIs) == 0 {
+		return deleteClass(client, className)
+	}
+	req := goipp.NewRequest(goipp.DefaultVersion, goipp.OpCupsAddModifyClass, uint32(time.Now().UnixNano()))
+	req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
+	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
+	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(classURI(client, className))))
+	req.Operation.Add(goipp.MakeAttribute("printer-name", goipp.TagName, goipp.String(className)))
+	addRequestingUserName(&req.Operation, client)
+
+	values := make([]goipp.Value, 0, len(memberURIs))
+	for _, memberURI := range memberURIs {
+		values = append(values, goipp.String(memberURI))
+	}
+	req.Printer.Add(goipp.MakeAttr("member-uris", goipp.TagURI, values[0], values[1:]...))
+	resp, err := client.Send(context.Background(), req, nil)
+	if err != nil {
+		return err
+	}
+	if goipp.Status(resp.Code) >= goipp.StatusRedirectionOtherSite {
+		return fmt.Errorf("%s", goipp.Status(resp.Code))
+	}
+	return nil
+}
+
+func deleteClass(client *cupsclient.Client, className string) error {
+	req := goipp.NewRequest(goipp.DefaultVersion, goipp.OpCupsDeleteClass, uint32(time.Now().UnixNano()))
+	req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
+	req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
+	req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(classURI(client, className))))
+	req.Operation.Add(goipp.MakeAttribute("printer-name", goipp.TagName, goipp.String(className)))
+	addRequestingUserName(&req.Operation, client)
+	resp, err := client.Send(context.Background(), req, nil)
+	if err != nil {
+		return err
+	}
+	if goipp.Status(resp.Code) >= goipp.StatusRedirectionOtherSite {
+		return fmt.Errorf("%s", goipp.Status(resp.Code))
+	}
+	return nil
+}
+
+func classURI(client *cupsclient.Client, className string) string {
+	_ = client
+	return fmt.Sprintf("ipp://localhost/classes/%s", url.PathEscape(strings.TrimSpace(className)))
+}
+
+func classMemberURIsForNames(updatedNames, existingNames, existingURIs []string, client *cupsclient.Client) []string {
+	updatedNames = normalizeDestinationList(updatedNames)
+	if len(updatedNames) == 0 {
+		return nil
+	}
+	memberURIs := make([]string, 0, len(updatedNames))
+	for _, name := range updatedNames {
+		idx := indexDestinationName(existingNames, name)
+		if idx >= 0 && idx < len(existingURIs) {
+			if uri := strings.TrimSpace(existingURIs[idx]); uri != "" {
+				memberURIs = append(memberURIs, uri)
+				continue
+			}
+		}
+		memberURIs = append(memberURIs, client.PrinterURI(name))
+	}
+	return normalizeMemberURIs(memberURIs)
+}
+
+func indexDestinationName(names []string, target string) int {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return -1
+	}
+	for idx, name := range names {
+		if strings.EqualFold(strings.TrimSpace(name), target) {
+			return idx
+		}
+	}
+	return -1
+}
+
+func normalizeMemberURIs(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		uri := strings.TrimSpace(value)
+		if uri == "" {
+			continue
+		}
+		key := strings.ToLower(uri)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, uri)
+	}
+	return out
+}
+
+func normalizeClassMembers(names, uris []string) ([]string, []string) {
+	if len(names) == 0 && len(uris) == 0 {
+		return nil, nil
+	}
+	if len(names) < len(uris) {
+		for i := len(names); i < len(uris); i++ {
+			names = append(names, destinationNameFromURI(uris[i]))
+		}
+	}
+	if len(uris) < len(names) {
+		for i := len(uris); i < len(names); i++ {
+			name := strings.TrimSpace(names[i])
+			if name == "" {
+				uris = append(uris, "")
+				continue
+			}
+			uris = append(uris, fmt.Sprintf("ipp://localhost/printers/%s", url.PathEscape(name)))
+		}
+	}
+
+	seen := map[string]bool{}
+	outNames := make([]string, 0, len(names))
+	outURIs := make([]string, 0, len(names))
+	for i := 0; i < len(names) && i < len(uris); i++ {
+		name := strings.TrimSpace(names[i])
+		uri := strings.TrimSpace(uris[i])
+		if name == "" && uri != "" {
+			name = destinationNameFromURI(uri)
+		}
+		if name == "" {
+			continue
+		}
+		key := strings.ToLower(name)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if uri == "" {
+			uri = fmt.Sprintf("ipp://localhost/printers/%s", url.PathEscape(name))
+		}
+		outNames = append(outNames, name)
+		outURIs = append(outURIs, uri)
+	}
+	return outNames, outURIs
+}
+
+func addRequestingUserName(attrs *goipp.Attributes, client *cupsclient.Client) {
+	if attrs == nil {
+		return
+	}
+	user := strings.TrimSpace(requestingUserName(client))
+	if user == "" {
+		return
+	}
+	attrs.Add(goipp.MakeAttribute("requesting-user-name", goipp.TagName, goipp.String(user)))
+}
+
+func requestingUserName(client *cupsclient.Client) string {
+	if client != nil {
+		if user := strings.TrimSpace(client.User); user != "" {
+			return user
+		}
+	}
+	for _, key := range []string{"CUPS_USER", "USER", "USERNAME"} {
+		if user := strings.TrimSpace(os.Getenv(key)); user != "" {
+			return user
+		}
+	}
+	return "anonymous"
 }

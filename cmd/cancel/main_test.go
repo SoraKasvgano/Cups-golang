@@ -44,7 +44,7 @@ func TestParseArgsHelpSentinel(t *testing.T) {
 
 func TestSplitJobSpec(t *testing.T) {
 	dest, id := splitJobSpec("Office-321")
-	if dest != "Office" || id != 321 {
+	if dest != "" || id != 321 {
 		t.Fatalf("unexpected split: %q/%d", dest, id)
 	}
 	dest, id = splitJobSpec("44")
@@ -70,15 +70,26 @@ func TestDestinationURIEmptyUsesAllPrintersScope(t *testing.T) {
 	if !strings.Contains(uri, "/printers/") {
 		t.Fatalf("expected all-printers URI, got %q", uri)
 	}
+	if !strings.Contains(uri, "ipp://localhost/") {
+		t.Fatalf("expected localhost printer URI, got %q", uri)
+	}
 }
 
 func TestIsKnownDestination(t *testing.T) {
-	known := map[string]bool{"office": true}
+	known := map[string]destinationKind{"office": destinationPrinter}
 	if !isKnownDestination("Office", known) {
 		t.Fatalf("expected Office to be known")
 	}
 	if isKnownDestination("Unknown", known) {
 		t.Fatalf("did not expect Unknown to be known")
+	}
+}
+
+func TestDestinationURIUsesPrinterPathForKnownClass(t *testing.T) {
+	client := cupsclient.NewFromConfig(cupsclient.WithServer("localhost:8631"))
+	uri := destinationURI(client, "Team", map[string]destinationKind{"team": destinationClass})
+	if got, want := uri, "ipp://localhost/printers/Team"; got != want {
+		t.Fatalf("destinationURI class = %q, want %q", got, want)
 	}
 }
 
@@ -121,6 +132,89 @@ func TestCancelUserJobsAlwaysSendsPrinterURI(t *testing.T) {
 		}
 		if got := findAttrValue(req.Operation, "requesting-user-name"); got != "alice" {
 			t.Fatalf("expected requesting-user-name alice, got %q", got)
+		}
+	}
+}
+
+func TestCancelUserJobsClassDestinationUsesPrinterURI(t *testing.T) {
+	reqCh := make(chan goipp.Message, 1)
+	errCh := make(chan error, 1)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var req goipp.Message
+		if err := req.Decode(r.Body); err != nil {
+			errCh <- err
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		reqCh <- req
+
+		w.Header().Set("Content-Type", goipp.ContentType)
+		resp := goipp.NewResponse(goipp.DefaultVersion, goipp.StatusOk, req.RequestID)
+		_ = resp.Encode(w)
+	}))
+	defer srv.Close()
+
+	parsed, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse server url: %v", err)
+	}
+	client := cupsclient.NewFromConfig(cupsclient.WithServer(parsed.Host))
+
+	if err := cancelUserJobs(client, "alice", false, "Team", map[string]destinationKind{"team": destinationClass}); err != nil {
+		t.Fatalf("cancelUserJobs error: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("decode request: %v", err)
+	case req := <-reqCh:
+		if got := findAttrValue(req.Operation, "printer-uri"); got != "ipp://localhost/printers/Team" {
+			t.Fatalf("expected printer-uri /printers/Team, got %q", got)
+		}
+	}
+}
+
+func TestCancelJobUsesJobURIInsteadOfJobID(t *testing.T) {
+	reqCh := make(chan goipp.Message, 1)
+	errCh := make(chan error, 1)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var req goipp.Message
+		if err := req.Decode(r.Body); err != nil {
+			errCh <- err
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		reqCh <- req
+
+		w.Header().Set("Content-Type", goipp.ContentType)
+		resp := goipp.NewResponse(goipp.DefaultVersion, goipp.StatusOk, req.RequestID)
+		_ = resp.Encode(w)
+	}))
+	defer srv.Close()
+
+	parsed, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse server url: %v", err)
+	}
+	client := cupsclient.NewFromConfig(cupsclient.WithServer(parsed.Host))
+
+	if err := cancelJob(client, 42, false, "alice"); err != nil {
+		t.Fatalf("cancelJob error: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("decode request: %v", err)
+	case req := <-reqCh:
+		if got := findAttrValue(req.Operation, "job-uri"); got != "ipp://localhost/jobs/42" {
+			t.Fatalf("expected job-uri ipp://localhost/jobs/42, got %q", got)
+		}
+		if got := findAttrValue(req.Operation, "job-id"); got != "" {
+			t.Fatalf("did not expect job-id attribute, got %q", got)
 		}
 	}
 }

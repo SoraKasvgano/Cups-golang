@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -20,10 +21,20 @@ type options struct {
 	server      string
 	encrypt     bool
 	user        string
+	sourceToken string
 	jobID       int
 	source      string
 	destination string
+	destKinds   map[string]destinationKind
 }
+
+type destinationKind int
+
+const (
+	destinationUnknown destinationKind = iota
+	destinationPrinter
+	destinationClass
+)
 
 func main() {
 	opts, err := parseArgs(os.Args[1:])
@@ -41,6 +52,10 @@ func main() {
 		cupsclient.WithTLS(opts.encrypt),
 		cupsclient.WithUser(opts.user),
 	)
+	if known, err := listDestinations(client); err == nil {
+		opts.destKinds = known
+		opts = normalizeMoveSource(opts, known)
+	}
 
 	req := buildMoveRequest(client, opts)
 	resp, err := client.Send(context.Background(), req, nil)
@@ -127,6 +142,7 @@ func parseArgs(args []string) (options, error) {
 	if jobID == 0 && source == "" {
 		return opts, fmt.Errorf("invalid job id")
 	}
+	opts.sourceToken = positional[0]
 	opts.jobID = jobID
 	opts.source = source
 	opts.destination = strings.TrimSpace(positional[1])
@@ -160,7 +176,7 @@ func buildMoveRequest(client *cupsclient.Client, opts options) *goipp.Message {
 	if opts.jobID > 0 {
 		req.Operation.Add(goipp.MakeAttribute("job-uri", goipp.TagURI, goipp.String(jobURI(client, opts.jobID))))
 	} else {
-		req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(destinationURI(client, opts.source))))
+		req.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String(destinationURI(client, opts.source, opts.destKinds))))
 	}
 
 	requestingUser := strings.TrimSpace(opts.user)
@@ -171,13 +187,14 @@ func buildMoveRequest(client *cupsclient.Client, opts options) *goipp.Message {
 		req.Operation.Add(goipp.MakeAttribute("requesting-user-name", goipp.TagName, goipp.String(requestingUser)))
 	}
 
-	destURI := destinationURI(client, opts.destination)
+	destURI := destinationURI(client, opts.destination, opts.destKinds)
 	// CUPS sends destination URI in the job attribute group.
 	req.Job.Add(goipp.MakeAttribute("job-printer-uri", goipp.TagURI, goipp.String(destURI)))
 	return req
 }
 
-func destinationURI(client *cupsclient.Client, destination string) string {
+func destinationURI(client *cupsclient.Client, destination string, known map[string]destinationKind) string {
+	_ = client
 	destination = strings.TrimSpace(destination)
 	if destination == "" {
 		return ""
@@ -185,15 +202,62 @@ func destinationURI(client *cupsclient.Client, destination string) string {
 	if strings.Contains(destination, "://") {
 		return destination
 	}
-	if client == nil {
-		return destination
-	}
-	return client.PrinterURI(destination)
+	_ = known
+	return fmt.Sprintf("ipp://localhost/printers/%s", url.PathEscape(destination))
 }
 
 func jobURI(client *cupsclient.Client, jobID int) string {
-	if client == nil {
-		return fmt.Sprintf("ipp://localhost/jobs/%d", jobID)
+	_ = client
+	return fmt.Sprintf("ipp://localhost/jobs/%d", jobID)
+}
+
+func listDestinations(client *cupsclient.Client) (map[string]destinationKind, error) {
+	out := map[string]destinationKind{}
+	for _, item := range []struct {
+		op   goipp.Op
+		kind destinationKind
+	}{
+		{op: goipp.OpCupsGetPrinters, kind: destinationPrinter},
+		{op: goipp.OpCupsGetClasses, kind: destinationClass},
+	} {
+		req := goipp.NewRequest(goipp.DefaultVersion, item.op, uint32(time.Now().UnixNano()))
+		req.Operation.Add(goipp.MakeAttribute("attributes-charset", goipp.TagCharset, goipp.String("utf-8")))
+		req.Operation.Add(goipp.MakeAttribute("attributes-natural-language", goipp.TagLanguage, goipp.String("en-US")))
+		req.Operation.Add(goipp.MakeAttr("requested-attributes", goipp.TagKeyword, goipp.String("printer-name")))
+		resp, err := client.Send(context.Background(), req, nil)
+		if err != nil {
+			if len(out) > 0 {
+				continue
+			}
+			return nil, err
+		}
+		for _, g := range resp.Groups {
+			if g.Tag != goipp.TagPrinterGroup {
+				continue
+			}
+			if name := strings.TrimSpace(findAttr(g.Attrs, "printer-name")); name != "" {
+				key := strings.ToLower(name)
+				// Keep explicit class classification when present.
+				if existing, exists := out[key]; !exists || item.kind == destinationClass || existing == destinationUnknown {
+					out[key] = item.kind
+				}
+			}
+		}
 	}
-	return fmt.Sprintf("ipp://%s:%d/jobs/%d", client.Host, client.Port, jobID)
+	return out, nil
+}
+
+func normalizeMoveSource(opts options, known map[string]destinationKind) options {
+	if len(known) == 0 {
+		return opts
+	}
+	sourceToken := strings.TrimSpace(opts.sourceToken)
+	if sourceToken == "" {
+		return opts
+	}
+	if kind, ok := known[strings.ToLower(sourceToken)]; ok && kind != destinationUnknown {
+		opts.jobID = 0
+		opts.source = sourceToken
+	}
+	return opts
 }

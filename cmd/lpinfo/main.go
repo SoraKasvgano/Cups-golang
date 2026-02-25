@@ -20,7 +20,6 @@ var errShowHelp = errors.New("show-help")
 type options struct {
 	server         string
 	encrypt        bool
-	user           string
 	showDevices    bool
 	showModels     bool
 	longListing    bool
@@ -42,13 +41,13 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
+	// Match CUPS: lpinfo without -m/-v performs no listing and exits success.
 	if !opts.showDevices && !opts.showModels {
-		opts.showDevices = true
+		return
 	}
 	client := cupsclient.NewFromConfig(
 		cupsclient.WithServer(opts.server),
 		cupsclient.WithTLS(opts.encrypt),
-		cupsclient.WithUser(opts.user),
 	)
 
 	if opts.showDevices {
@@ -64,12 +63,11 @@ func main() {
 }
 
 func usage() {
-	fmt.Println("Usage: lpinfo [options] -v | -m")
-	fmt.Println("       lpinfo [options]")
+	fmt.Println("Usage: lpinfo [options] -m")
+	fmt.Println("       lpinfo [options] -v")
 	fmt.Println("Options:")
 	fmt.Println("  -E                      Encrypt connection")
 	fmt.Println("  -h server[:port]        Connect to server")
-	fmt.Println("  -U username             Authenticate as user")
 	fmt.Println("  -v                      Show devices")
 	fmt.Println("  -m                      Show models (PPDs)")
 	fmt.Println("  -l                      Long listing")
@@ -84,7 +82,6 @@ func usage() {
 
 func parseArgs(args []string) (options, error) {
 	opts := options{}
-	seenOther := false
 	for i := 0; i < len(args); i++ {
 		arg := strings.TrimSpace(args[i])
 		if arg == "" {
@@ -155,7 +152,6 @@ func parseArgs(args []string) (options, error) {
 			default:
 				return opts, fmt.Errorf("unknown option %q", arg)
 			}
-			seenOther = true
 			continue
 		}
 		if !strings.HasPrefix(arg, "-") || arg == "-" {
@@ -178,9 +174,6 @@ func parseArgs(args []string) (options, error) {
 			}
 			switch ch {
 			case 'h':
-				if seenOther {
-					return opts, fmt.Errorf("-h must appear before all other options")
-				}
 				v, err := consume(ch)
 				if err != nil {
 					return opts, err
@@ -188,12 +181,6 @@ func parseArgs(args []string) (options, error) {
 				opts.server = strings.TrimSpace(v)
 			case 'E':
 				opts.encrypt = true
-			case 'U':
-				v, err := consume(ch)
-				if err != nil {
-					return opts, err
-				}
-				opts.user = strings.TrimSpace(v)
 			case 'l':
 				opts.longListing = true
 			case 'v':
@@ -202,9 +189,6 @@ func parseArgs(args []string) (options, error) {
 				opts.showModels = true
 			default:
 				return opts, fmt.Errorf("unknown option \"-%c\"", ch)
-			}
-			if ch != 'h' && ch != 'E' && ch != 'U' {
-				seenOther = true
 			}
 		}
 	}
@@ -295,6 +279,9 @@ func listDevices(client *cupsclient.Client, opts options) error {
 	if err != nil {
 		return err
 	}
+	if status := goipp.Status(resp.Code); status > goipp.StatusOkConflicting {
+		return fmt.Errorf("%s", status)
+	}
 	type deviceRow struct {
 		class    string
 		uri      string
@@ -344,21 +331,9 @@ func listDevices(client *cupsclient.Client, opts options) error {
 			info = row.uri
 		}
 		if opts.longListing {
-			fmt.Printf("device-class %s\n", class)
-			fmt.Printf("device-uri %s\n", row.uri)
-			fmt.Printf("device-info %s\n", info)
-			if row.make != "" {
-				fmt.Printf("device-make-and-model %s\n", row.make)
-			}
-			if row.deviceID != "" {
-				fmt.Printf("device-id %s\n", row.deviceID)
-			}
-			if row.location != "" {
-				fmt.Printf("device-location %s\n", row.location)
-			}
-			fmt.Println()
+			fmt.Print(formatDeviceLong(class, row.uri, info, row.make, row.deviceID, row.location))
 		} else {
-			fmt.Printf("%s %s \"%s\" (%s)\n", class, row.uri, info, row.make)
+			fmt.Print(formatDeviceShort(class, row.uri))
 		}
 	}
 	return nil
@@ -397,6 +372,10 @@ func listModels(client *cupsclient.Client, opts options) error {
 	if err != nil {
 		return err
 	}
+	if status := goipp.Status(resp.Code); status > goipp.StatusOkConflicting {
+		return fmt.Errorf("%s", status)
+	}
+	seenEverywhere := false
 	for _, g := range resp.Groups {
 		if g.Tag != goipp.TagPrinterGroup {
 			continue
@@ -407,42 +386,94 @@ func listModels(client *cupsclient.Client, opts options) error {
 		if name == "" {
 			continue
 		}
+		if strings.EqualFold(strings.TrimSpace(name), "everywhere") {
+			seenEverywhere = true
+		}
 		if opts.longListing {
-			fmt.Printf("ppd-name %s\n", name)
-			if makeName != "" {
-				fmt.Printf("ppd-make %s\n", makeName)
+			lang := findAttr(g.Attrs, "ppd-natural-language")
+			deviceID := findAttr(g.Attrs, "ppd-device-id")
+			if lang == "" {
+				lang = "en"
 			}
-			if makeModel != "" {
-				fmt.Printf("ppd-make-and-model %s\n", makeModel)
+			if deviceID == "" {
+				deviceID = "NONE"
 			}
-			if v := findAttr(g.Attrs, "ppd-device-id"); v != "" {
-				fmt.Printf("ppd-device-id %s\n", v)
-			}
-			if v := findAttr(g.Attrs, "ppd-natural-language"); v != "" {
-				fmt.Printf("ppd-natural-language %s\n", v)
-			}
-			if vals := findAttr(g.Attrs, "ppd-product"); vals != "" {
-				fmt.Printf("ppd-product %s\n", vals)
-			}
-			if vals := findAttr(g.Attrs, "ppd-psversion"); vals != "" {
-				fmt.Printf("ppd-psversion %s\n", vals)
-			}
-			if v := findAttr(g.Attrs, "ppd-type"); v != "" {
-				fmt.Printf("ppd-type %s\n", v)
-			}
-			if v := findAttr(g.Attrs, "ppd-model-number"); v != "" {
-				fmt.Printf("ppd-model-number %s\n", v)
-			}
-			fmt.Println()
+			fmt.Print(formatModelLong(name, lang, makeModel, deviceID))
 		} else {
-			out := fmt.Sprintf("%s %s", name, makeModel)
-			if makeName != "" && makeModel == "" {
-				out = fmt.Sprintf("%s %s", name, makeName)
+			modelText := makeModel
+			if makeName != "" && modelText == "" {
+				modelText = makeName
 			}
-			fmt.Println(strings.TrimSpace(out))
+			fmt.Print(formatModelShort(name, modelText))
+		}
+	}
+	if shouldAppendEverywhere(opts.includeSchemes, opts.excludeSchemes) && !seenEverywhere {
+		if opts.longListing {
+			fmt.Print(formatModelLong("everywhere", "en", "IPP Everywhere", "CMD:PwgRaster"))
+		} else {
+			fmt.Print(formatModelShort("everywhere", "IPP Everywhere"))
 		}
 	}
 	return nil
+}
+
+func formatDeviceShort(class, uri string) string {
+	return fmt.Sprintf("%s %s\n", strings.TrimSpace(class), strings.TrimSpace(uri))
+}
+
+func formatDeviceLong(class, uri, info, makeModel, deviceID, location string) string {
+	return fmt.Sprintf(
+		"Device: uri = %s\n        class = %s\n        info = %s\n        make-and-model = %s\n        device-id = %s\n        location = %s\n",
+		strings.TrimSpace(uri),
+		strings.TrimSpace(class),
+		strings.TrimSpace(info),
+		strings.TrimSpace(makeModel),
+		strings.TrimSpace(deviceID),
+		strings.TrimSpace(location),
+	)
+}
+
+func formatModelShort(name, makeModel string) string {
+	return strings.TrimSpace(fmt.Sprintf("%s %s", strings.TrimSpace(name), strings.TrimSpace(makeModel))) + "\n"
+}
+
+func formatModelLong(name, naturalLanguage, makeModel, deviceID string) string {
+	return fmt.Sprintf(
+		"Model:  name = %s\n        natural_language = %s\n        make-and-model = %s\n        device-id = %s\n",
+		strings.TrimSpace(name),
+		strings.TrimSpace(naturalLanguage),
+		strings.TrimSpace(makeModel),
+		strings.TrimSpace(deviceID),
+	)
+}
+
+func shouldAppendEverywhere(includeSchemes, excludeSchemes []string) bool {
+	return schemeAllowed("everywhere", includeSchemes, excludeSchemes)
+}
+
+func schemeAllowed(name string, includeSchemes, excludeSchemes []string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return false
+	}
+	if len(includeSchemes) > 0 {
+		match := false
+		for _, s := range includeSchemes {
+			if strings.EqualFold(strings.TrimSpace(s), name) {
+				match = true
+				break
+			}
+		}
+		if !match {
+			return false
+		}
+	}
+	for _, s := range excludeSchemes {
+		if strings.EqualFold(strings.TrimSpace(s), name) {
+			return false
+		}
+	}
+	return true
 }
 
 func findAttr(attrs goipp.Attributes, name string) string {

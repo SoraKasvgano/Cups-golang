@@ -9,18 +9,18 @@ import (
 )
 
 type LocationRule struct {
-	Path         string
-	AuthType     string
-	RequireUser  bool
-	RequireAdmin bool
+	Path          string
+	AuthType      string
+	RequireUser   bool
+	RequireAdmin  bool
 	RequireUsers  []string
 	RequireGroups []string
-	Order        string
-	AllowAll     bool
-	DenyAll      bool
-	Allow        []string
-	Deny         []string
-	Limits       map[string]LimitRule
+	Order         string
+	AllowAll      bool
+	DenyAll       bool
+	Allow         []string
+	Deny          []string
+	Limits        map[string]LimitRule
 }
 
 type Policy struct {
@@ -32,18 +32,18 @@ type Policy struct {
 }
 
 type LimitRule struct {
-	Ops          []string
-	AuthType     string
-	RequireUser  bool
-	RequireOwner bool
-	RequireAdmin bool
+	Ops           []string
+	AuthType      string
+	RequireUser   bool
+	RequireOwner  bool
+	RequireAdmin  bool
 	RequireUsers  []string
 	RequireGroups []string
-	Order        string
-	AllowAll     bool
-	DenyAll      bool
-	Allow        []string
-	Deny         []string
+	Order         string
+	AllowAll      bool
+	DenyAll       bool
+	Allow         []string
+	Deny          []string
 }
 
 func LoadPolicy(confDir string) Policy {
@@ -71,9 +71,10 @@ func LoadPolicy(confDir string) Policy {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		lower := strings.ToLower(line)
 
-		if strings.HasPrefix(line, "<Policy ") {
-			name := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "<Policy "), ">"))
+		if strings.HasPrefix(lower, "<policy ") && strings.HasSuffix(lower, ">") {
+			name := strings.TrimSpace(line[len("<Policy ") : len(line)-1])
 			if name != "" {
 				seen := false
 				for _, existing := range policy.Policies {
@@ -93,19 +94,19 @@ func LoadPolicy(confDir string) Policy {
 			}
 			continue
 		}
-		if line == "</Policy>" {
+		if strings.EqualFold(line, "</Policy>") {
 			inPolicy = false
 			curPolicyName = ""
 			curPolicyLimit = nil
 			continue
 		}
 
-		if strings.HasPrefix(line, "<Location ") {
-			p := strings.TrimSuffix(strings.TrimPrefix(line, "<Location "), ">")
+		if strings.HasPrefix(lower, "<location ") && strings.HasSuffix(lower, ">") {
+			p := strings.TrimSpace(line[len("<Location ") : len(line)-1])
 			curLoc = &LocationRule{Path: p, Limits: map[string]LimitRule{}}
 			continue
 		}
-		if line == "</Location>" {
+		if strings.EqualFold(line, "</Location>") {
 			if curLoc != nil {
 				policy.Locations = append(policy.Locations, *curLoc)
 			}
@@ -114,8 +115,8 @@ func LoadPolicy(confDir string) Policy {
 			continue
 		}
 
-		if strings.HasPrefix(line, "<Limit ") && (curLoc != nil || inPolicy) {
-			args := strings.TrimSuffix(strings.TrimPrefix(line, "<Limit "), ">")
+		if strings.HasPrefix(lower, "<limit ") && strings.HasSuffix(lower, ">") && (curLoc != nil || inPolicy) {
+			args := strings.TrimSpace(line[len("<Limit ") : len(line)-1])
 			ops := strings.Fields(args)
 			if inPolicy {
 				curPolicyLimit = &LimitRule{Ops: ops}
@@ -124,7 +125,7 @@ func LoadPolicy(confDir string) Policy {
 			}
 			continue
 		}
-		if line == "</Limit>" {
+		if strings.EqualFold(line, "</Limit>") {
 			if inPolicy && curPolicyName != "" && curPolicyLimit != nil {
 				pkey := strings.ToLower(curPolicyName)
 				if policy.PolicyLimits[pkey] == nil {
@@ -263,14 +264,14 @@ func applyLocationDirective(target *LocationRule, parts []string) {
 	if target == nil || len(parts) == 0 {
 		return
 	}
-	switch parts[0] {
-	case "AuthType":
+	switch strings.ToLower(parts[0]) {
+	case "authtype":
 		if len(parts) > 1 {
 			target.AuthType = parts[1]
 		}
-	case "Require":
+	case "require":
 		if len(parts) > 1 {
-			switch parts[1] {
+			switch strings.ToLower(parts[1]) {
 			case "valid-user":
 				target.RequireUser = true
 			case "user":
@@ -280,8 +281,8 @@ func applyLocationDirective(target *LocationRule, parts []string) {
 					if token == "" {
 						continue
 					}
-					switch token {
-					case "@SYSTEM", "admin":
+					switch strings.ToLower(token) {
+					case "@system", "admin", "@admin", "lpadmin", "@lpadmin":
 						target.RequireAdmin = true
 					default:
 						target.RequireUsers = append(target.RequireUsers, token)
@@ -294,30 +295,42 @@ func applyLocationDirective(target *LocationRule, parts []string) {
 					if token == "" {
 						continue
 					}
-					switch token {
-					case "@SYSTEM", "admin":
+					switch strings.ToLower(token) {
+					case "@system", "admin", "@admin", "lpadmin", "@lpadmin":
 						target.RequireAdmin = true
 					default:
 						target.RequireGroups = append(target.RequireGroups, token)
 					}
 				}
+			case "all":
+				if len(parts) > 2 {
+					switch strings.ToLower(parts[2]) {
+					case "granted", "allow", "allowed":
+						target.RequireUser = false
+						target.RequireAdmin = false
+						target.RequireUsers = nil
+						target.RequireGroups = nil
+					case "denied", "deny":
+						target.DenyAll = true
+					}
+				}
 			}
 		}
-	case "Order":
+	case "order":
 		if len(parts) > 1 {
 			target.Order = parts[1]
 		}
-	case "Allow":
-		if len(parts) > 2 && parts[1] == "from" {
-			if parts[2] == "all" {
+	case "allow":
+		if len(parts) > 2 && strings.EqualFold(parts[1], "from") {
+			if strings.EqualFold(parts[2], "all") {
 				target.AllowAll = true
 			} else {
 				target.Allow = append(target.Allow, parts[2:]...)
 			}
 		}
-	case "Deny":
-		if len(parts) > 2 && parts[1] == "from" {
-			if parts[2] == "all" {
+	case "deny":
+		if len(parts) > 2 && strings.EqualFold(parts[1], "from") {
+			if strings.EqualFold(parts[2], "all") {
 				target.DenyAll = true
 			} else {
 				target.Deny = append(target.Deny, parts[2:]...)
@@ -330,14 +343,14 @@ func applyLimitDirective(target *LimitRule, parts []string) {
 	if target == nil || len(parts) == 0 {
 		return
 	}
-	switch parts[0] {
-	case "AuthType":
+	switch strings.ToLower(parts[0]) {
+	case "authtype":
 		if len(parts) > 1 {
 			target.AuthType = parts[1]
 		}
-	case "Require":
+	case "require":
 		if len(parts) > 1 {
-			switch parts[1] {
+			switch strings.ToLower(parts[1]) {
 			case "valid-user":
 				target.RequireUser = true
 			case "user":
@@ -347,10 +360,10 @@ func applyLimitDirective(target *LimitRule, parts []string) {
 					if token == "" {
 						continue
 					}
-					switch token {
-					case "@OWNER":
+					switch strings.ToLower(token) {
+					case "@owner":
 						target.RequireOwner = true
-					case "@SYSTEM", "admin":
+					case "@system", "admin", "@admin", "lpadmin", "@lpadmin":
 						target.RequireAdmin = true
 					default:
 						target.RequireUsers = append(target.RequireUsers, token)
@@ -363,30 +376,43 @@ func applyLimitDirective(target *LimitRule, parts []string) {
 					if token == "" {
 						continue
 					}
-					switch token {
-					case "@SYSTEM", "admin":
+					switch strings.ToLower(token) {
+					case "@system", "admin", "@admin", "lpadmin", "@lpadmin":
 						target.RequireAdmin = true
 					default:
 						target.RequireGroups = append(target.RequireGroups, token)
 					}
 				}
+			case "all":
+				if len(parts) > 2 {
+					switch strings.ToLower(parts[2]) {
+					case "granted", "allow", "allowed":
+						target.RequireUser = false
+						target.RequireOwner = false
+						target.RequireAdmin = false
+						target.RequireUsers = nil
+						target.RequireGroups = nil
+					case "denied", "deny":
+						target.DenyAll = true
+					}
+				}
 			}
 		}
-	case "Order":
+	case "order":
 		if len(parts) > 1 {
 			target.Order = parts[1]
 		}
-	case "Allow":
-		if len(parts) > 2 && parts[1] == "from" {
-			if parts[2] == "all" {
+	case "allow":
+		if len(parts) > 2 && strings.EqualFold(parts[1], "from") {
+			if strings.EqualFold(parts[2], "all") {
 				target.AllowAll = true
 			} else {
 				target.Allow = append(target.Allow, parts[2:]...)
 			}
 		}
-	case "Deny":
-		if len(parts) > 2 && parts[1] == "from" {
-			if parts[2] == "all" {
+	case "deny":
+		if len(parts) > 2 && strings.EqualFold(parts[1], "from") {
+			if strings.EqualFold(parts[2], "all") {
 				target.DenyAll = true
 			} else {
 				target.Deny = append(target.Deny, parts[2:]...)

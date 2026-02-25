@@ -95,30 +95,15 @@ func (ippBackend) SubmitJob(ctx context.Context, printer model.Printer, job mode
 		return WrapTemporary("ipp-submit", printer.URI, err)
 	}
 	if resp.StatusCode/100 != 2 {
-		if resp.StatusCode >= 500 {
-			return WrapTemporary("ipp-submit", printer.URI, errors.New(resp.Status))
-		}
-		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusNotImplemented {
-			return WrapUnsupported("ipp-submit", printer.URI, errors.New(resp.Status))
-		}
-		return WrapPermanent("ipp-submit", printer.URI, errors.New(resp.Status))
+		return classifyIPPHTTPStatus("ipp-submit", printer.URI, resp.StatusCode, resp.Status)
 	}
 	ippResp := &goipp.Message{}
 	if err := ippResp.Decode(resp.Body); err != nil {
 		return WrapPermanent("ipp-decode", printer.URI, err)
 	}
 	status := goipp.Status(ippResp.Code)
-	if status >= goipp.StatusRedirectionOtherSite {
-		s := int(status)
-		err := errors.New(status.String())
-		switch {
-		case s >= int(goipp.StatusErrorInternal):
-			return WrapTemporary("ipp-submit", printer.URI, err)
-		case status == goipp.StatusErrorDocumentFormatNotSupported || status == goipp.StatusErrorDocumentUnprintable || status == goipp.StatusErrorAttributesOrValues:
-			return WrapUnsupported("ipp-submit", printer.URI, err)
-		default:
-			return WrapPermanent("ipp-submit", printer.URI, err)
-		}
+	if err := classifyIPPStatus("ipp-submit", printer.URI, status); err != nil {
+		return err
 	}
 	return nil
 }
@@ -168,13 +153,7 @@ func (ippBackend) QuerySupplies(ctx context.Context, printer model.Printer) (Sup
 	defer resp.Body.Close()
 
 	if resp.StatusCode/100 != 2 {
-		if resp.StatusCode >= 500 {
-			return SupplyStatus{State: "unknown"}, WrapTemporary("ipp-supplies", printer.URI, errors.New(resp.Status))
-		}
-		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusNotImplemented {
-			return SupplyStatus{State: "unknown"}, WrapUnsupported("ipp-supplies", printer.URI, errors.New(resp.Status))
-		}
-		return SupplyStatus{State: "unknown"}, WrapPermanent("ipp-supplies", printer.URI, errors.New(resp.Status))
+		return SupplyStatus{State: "unknown"}, classifyIPPHTTPStatus("ipp-supplies", printer.URI, resp.StatusCode, resp.Status)
 	}
 
 	ippResp := &goipp.Message{}
@@ -182,17 +161,8 @@ func (ippBackend) QuerySupplies(ctx context.Context, printer model.Printer) (Sup
 		return SupplyStatus{State: "unknown"}, WrapPermanent("ipp-supplies", printer.URI, err)
 	}
 	status := goipp.Status(ippResp.Code)
-	if status >= goipp.StatusRedirectionOtherSite {
-		s := int(status)
-		err := errors.New(status.String())
-		switch {
-		case s >= int(goipp.StatusErrorInternal):
-			return SupplyStatus{State: "unknown"}, WrapTemporary("ipp-supplies", printer.URI, err)
-		case status == goipp.StatusErrorAttributesOrValues || status == goipp.StatusErrorOperationNotSupported:
-			return SupplyStatus{State: "unknown"}, WrapUnsupported("ipp-supplies", printer.URI, err)
-		default:
-			return SupplyStatus{State: "unknown"}, WrapPermanent("ipp-supplies", printer.URI, err)
-		}
+	if err := classifyIPPStatus("ipp-supplies", printer.URI, status); err != nil {
+		return SupplyStatus{State: "unknown"}, err
 	}
 
 	attrs := ippResp.Printer
@@ -541,6 +511,52 @@ func ippTransportURL(uri string) (string, error) {
 		return "", fmt.Errorf("unsupported IPP scheme %q", u.Scheme)
 	}
 	return u.String(), nil
+}
+
+func classifyIPPHTTPStatus(op, uri string, code int, statusText string) error {
+	if code/100 == 2 {
+		return nil
+	}
+	err := errors.New(strings.TrimSpace(statusText))
+	switch {
+	case code >= 500, code == http.StatusRequestTimeout, code == http.StatusTooManyRequests:
+		return WrapTemporary(op, uri, err)
+	case code == http.StatusNotFound || code == http.StatusGone || code == http.StatusNotImplemented:
+		return WrapUnsupported(op, uri, err)
+	default:
+		return WrapPermanent(op, uri, err)
+	}
+}
+
+func classifyIPPStatus(op, uri string, status goipp.Status) error {
+	if status < goipp.StatusRedirectionOtherSite {
+		return nil
+	}
+	err := errors.New(status.String())
+	switch status {
+	case goipp.StatusErrorOperationNotSupported,
+		goipp.StatusErrorDocumentFormatNotSupported,
+		goipp.StatusErrorDocumentUnprintable,
+		goipp.StatusErrorDocumentFormatError,
+		goipp.StatusErrorAttributesOrValues,
+		goipp.StatusErrorURIScheme:
+		return WrapUnsupported(op, uri, err)
+
+	case goipp.StatusErrorTemporary,
+		goipp.StatusErrorServiceUnavailable,
+		goipp.StatusErrorNotAcceptingJobs,
+		goipp.StatusErrorBusy,
+		goipp.StatusErrorDevice,
+		goipp.StatusErrorPrinterIsDeactivated,
+		goipp.StatusErrorTimeout,
+		goipp.StatusErrorTooManyJobs,
+		goipp.StatusErrorTooManyDocuments:
+		return WrapTemporary(op, uri, err)
+	}
+	if int(status) >= int(goipp.StatusErrorInternal) {
+		return WrapTemporary(op, uri, err)
+	}
+	return WrapPermanent(op, uri, err)
 }
 
 func buildJobAttributesFromOptions(optionsJSON string) []goipp.Attribute {
